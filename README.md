@@ -35,20 +35,37 @@ A visual progress bar with a dot showing position between the all-time low and h
 LOW / AVG / HIGH prices from your personal history
 How many days of data you have
 
+***This part of the script takes time to gather price info. the more you view these pages the better the script becomes. I recommend visiting pages you buy from a few times before fully trusting the data!***
+
 How they work together?
 
-What you see
-You browse the item market
-Script 1 calculates today's sell baseline. Script 2 records today's price into your 30-day history
-You open someone's bazaar
-Script 2 shows you instantly whether their price is a deal or overpriced based on your history
-You go to sell your items
-Script 1 fills in the optimal sell price and max quantity automatically
-Prices are stale
-Script 1 turns amber and warns you — browse the market again to refresh
-The key insight: Script 2 builds up your price history passively just by browsing — the more you play, the smarter both scripts get. Script 1 uses live market data for sell decisions while Script 2 gives you the longer-term context for buy decisions.
-Setup
+What you see:
+You browse the item market:
 
+Script 1 calculates today's sell baseline. Script 2 records today's price into your 30-day history.
+
+
+You open someone's bazaar:
+
+Script 2 shows you instantly whether their price is a deal or overpriced based on your history.
+
+
+You go to sell your items:
+
+Script 1 fills in the optimal sell price and max quantity automatically
+
+
+Prices are stale:
+
+Script 1 turns amber and warns you — browse the market again to refresh
+
+
+***The key insight: Script 2 builds up your price history passively just by browsing — the more you play, the smarter both scripts get. Script 1 uses live market data for sell decisions while Script 2 gives you the longer-term context for buy decisions.***
+
+
+
+
+Setup-
 
 Install both scripts in Torn PDA → Settings → Scripts
 
