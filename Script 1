@@ -1,0 +1,686 @@
+
+
+
+// ==UserScript==
+// @name         Torn PDA Market Base Stable V10.1
+// @namespace    torn-market-base-stable-v101
+// @version      1.01
+// @match        https://www.torn.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const BOX_ID = 'tpda-market-box';
+  const BADGE_CLASS = 'tpda-spread-badge';
+  const HILITE_CLASS = 'tpda-row-hilite';
+
+  const SELL_HELPER_CLASS = 'tpda-sell-helper';
+  const FILL_BTN_ID       = 'tpda-fill-all-btn';
+  const STORAGE_KEY       = 'tpda_item_baselines_by_id_v2';
+
+  const SETTINGS = {
+    minProfit: 10000,
+    minROI: 0.25,
+    buffer: 0,
+    baselinePercentile: 75,
+    wallQty: 200          // sellers with this many+ units are treated as a price wall
+  };
+
+  const STALENESS = {
+    freshMs:  12 * 60 * 60 * 1000,  // under 12h  → green, no label
+    agingMs:  24 * 60 * 60 * 1000,  // 12–24h     → amber + age label
+    // older than 24h → not shown at all
+  };
+
+  function getAgeLabel(updatedAt) {
+    const ms = Date.now() - (updatedAt || 0);
+    const h  = Math.floor(ms / (60 * 60 * 1000));
+    const m  = Math.floor((ms % (60 * 60 * 1000)) / (60 * 1000));
+    return h > 0 ? `${h}h ago` : `${m}m ago`;
+  }
+
+  function clean(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function parsePrice(text) {
+    const n = String(text || '').replace(/[^\d]/g, '');
+    return n ? parseInt(n, 10) : 0;
+  }
+
+  function money(n) {
+    return '$' + Math.round(n || 0).toLocaleString();
+  }
+
+  function pct(n) {
+    return ((n || 0) * 100).toFixed(1) + '%';
+  }
+
+  function percentile(arr, p) {
+    if (!arr.length) return 0;
+    const a = [...arr].sort((x, y) => x - y);
+    const idx = Math.max(0, Math.min(a.length - 1, Math.ceil((p / 100) * a.length) - 1));
+    return a[idx];
+  }
+
+  function getStore() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveStore(store) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  }
+
+  function saveItemBaseline(itemId, itemName, baseline) {
+    if (!itemId || !baseline) return;
+
+    const store = getStore();
+    store[String(itemId)] = {
+      itemId: String(itemId),
+      itemName: clean(itemName || ''),
+      baseline: Math.round(baseline),
+      updatedAt: Date.now()
+    };
+    saveStore(store);
+  }
+
+  function getBaselineByItemId(itemId) {
+    const store = getStore();
+    return store[String(itemId)] || null;
+  }
+
+  function extractItemIdFromImageSrc(src) {
+    const match = String(src || '').match(/\/images\/items\/(\d+)\//);
+    return match ? match[1] : null;
+  }
+
+  function isCorrectMarketPage() {
+    if (!window.location.href.includes('sid=ItemMarket')) return false;
+
+    return Array.from(document.querySelectorAll('*'))
+      .some(el => clean(el.textContent) === 'Owner');
+  }
+
+  function removeOldMarketUI() {
+    const old = document.getElementById(BOX_ID);
+    if (old) old.remove();
+
+    document.querySelectorAll('.' + BADGE_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.' + HILITE_CLASS).forEach(el => {
+      el.classList.remove(HILITE_CLASS);
+      el.style.background = '';
+      el.style.outline = '';
+    });
+  }
+
+  function removeOldSellUI() {
+    document.querySelectorAll('.' + SELL_HELPER_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.tpda-helper-added').forEach(el => el.classList.remove('tpda-helper-added'));
+    const fillBtn = document.getElementById(FILL_BTN_ID);
+    if (fillBtn) fillBtn.remove();
+  }
+
+  function getHeader() {
+    return document.querySelector('h4');
+  }
+
+  function getMarketItemName() {
+    const headers = Array.from(document.querySelectorAll('*'));
+
+    for (const el of headers) {
+      const text = clean(el.textContent);
+
+      if (
+        text &&
+        text.length < 40 &&
+        !text.includes('$') &&
+        !text.includes('Owner') &&
+        !text.includes('Search') &&
+        el.nextElementSibling &&
+        clean(el.nextElementSibling.textContent).includes('Owner')
+      ) {
+        return text;
+      }
+    }
+
+    return 'Unknown Item';
+  }
+
+  // Multi-strategy item ID extraction for Torn PDA compatibility
+  function getMarketItemId() {
+    // Strategy 1: URL hash or query string contains itemID (most reliable)
+    const url = window.location.href;
+    const urlMatch = url.match(/[?&#](?:item[_\-]?id|itemID)=(\d+)/i);
+    if (urlMatch) return urlMatch[1];
+
+    // Strategy 2: data attributes on any DOM element
+    const dataAttrEls = document.querySelectorAll(
+      '[data-item-id],[data-itemid],[data-id],[data-item]'
+    );
+    for (const el of dataAttrEls) {
+      const id =
+        el.dataset.itemId || el.dataset.itemid ||
+        el.dataset.id    || el.dataset.item;
+      if (id && /^\d{1,6}$/.test(id)) return id;
+    }
+
+    // Strategy 3: item image in the header/detail area, NOT inside a seller row
+    const allItemImgs = Array.from(
+      document.querySelectorAll('img[src*="/images/items/"]')
+    );
+    for (const img of allItemImgs) {
+      const inRow =
+        img.closest('tr') ||
+        img.closest('li') ||
+        img.closest('[class*="Row"]') ||
+        img.closest('[class*="row"]');
+      if (!inRow) {
+        const m = (img.getAttribute('src') || '').match(/\/images\/items\/(\d+)\//);
+        if (m) return m[1];
+      }
+    }
+
+    // Strategy 4: any item image as a last-resort fallback
+    for (const img of allItemImgs) {
+      const m = (img.getAttribute('src') || '').match(/\/images\/items\/(\d+)\//);
+      if (m) return m[1];
+    }
+
+    // Strategy 5: inline <script> JSON blobs that embed itemID
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const m = (s.textContent || '').match(/['""]?itemID['""]?\s*:\s*['"]?(\d+)/i);
+      if (m) return m[1];
+    }
+
+    // Strategy 6: anchor hrefs that reference imarket with an item ID
+    for (const a of document.querySelectorAll('a[href*="imarket"]')) {
+      const m = (a.getAttribute('href') || '').match(
+        /[?&#](?:item[_\-]?id|itemID)=(\d+)/i
+      );
+      if (m) return m[1];
+    }
+
+    return null;
+  }
+
+  function getRows() {
+    const rows = [];
+    const nodes = Array.from(document.querySelectorAll('tr, li, div'));
+
+    for (const node of nodes) {
+      const kids = node.children || [];
+      if (kids.length < 4) continue;
+
+      const priceText = kids[1]?.textContent || '';
+      if (!/\$\d/.test(priceText)) continue;
+
+      const maybePrice = parsePrice(priceText);
+      if (maybePrice <= 0) continue;
+      if (maybePrice > 100000000) continue;
+
+      rows.push(node);
+    }
+
+    return rows;
+  }
+
+  // Returns [{price, qty, node}] for every visible listing
+  function getListings() {
+    return getRows().map(row => {
+      const kids = row.children || [];
+      const price = parsePrice(kids[1]?.textContent || '');
+      const qty   = parseInt(String(kids[2]?.textContent || '0').replace(/[^\d]/g, ''), 10) || 0;
+      return { price, qty, node: row };
+    }).filter(l => l.price > 0);
+  }
+
+  function getPrices() {
+    return getListings().map(l => l.price);
+  }
+
+  // Returns { baseline, wall }
+  // wall = { price, qty } if a large-stock seller caps the market, else null
+  function calcBaseline(listings) {
+    if (!listings.length) return { baseline: 0, wall: null };
+
+    const prices = listings.map(l => l.price);
+    const sorted = [...prices].sort((a, b) => a - b);
+
+    // Percentile baseline (existing logic)
+    let percentileBaseline;
+    if (sorted.length >= 15) percentileBaseline = percentile(sorted, SETTINGS.baselinePercentile);
+    else if (sorted.length >= 8) percentileBaseline = percentile(sorted, 70);
+    else percentileBaseline = percentile(sorted, 65);
+
+    // Find the lowest wall: a seller with wallQty+ units whose price is below
+    // the percentile baseline (meaning buyers will hit them before the baseline).
+    const walls = listings
+      .filter(l => l.qty >= SETTINGS.wallQty && l.price < percentileBaseline)
+      .sort((a, b) => a.price - b.price);
+
+    if (walls.length) {
+      const wall = walls[0];
+      // Sell just below the wall so listings clear before it
+      return { baseline: wall.price - 1, wall };
+    }
+
+    return { baseline: percentileBaseline, wall: null };
+  }
+
+  function insertBox(h4, itemName, itemId, listings, baseline, wall) {
+    const box = document.createElement('div');
+    box.id = BOX_ID;
+
+    // Sticky banner pinned below the page top so it stays visible while scrolling
+    box.style.position   = 'sticky';
+    box.style.top        = '0';
+    box.style.zIndex     = '9999';
+    box.style.margin     = '0 0 6px 0';
+    box.style.padding    = '7px 12px';
+    box.style.background = 'rgba(15,15,15,0.97)';
+    box.style.borderBottom = wall
+      ? '2px solid rgba(250,204,21,0.7)'
+      : '2px solid rgba(34,197,94,0.5)';
+    box.style.borderRadius = '0 0 8px 8px';
+    box.style.fontSize   = '12px';
+    box.style.lineHeight = '1.6';
+
+    // Line 1: item name + ID + price count
+    const line1 = document.createElement('div');
+    line1.style.color       = '#e5e7eb';
+    line1.style.fontWeight  = '600';
+    const idText = itemId ? `ID ${itemId}` : 'ID missing';
+    line1.textContent = `${itemName}  ·  ${idText}  ·  ${listings.length} listings`;
+    box.appendChild(line1);
+
+    // Line 2: suggested sell price
+    const line2 = document.createElement('div');
+    line2.style.marginTop  = '1px';
+    line2.style.color      = wall ? '#fde68a' : '#86efac';
+    line2.style.fontWeight = '700';
+    line2.style.fontSize   = '13px';
+    line2.textContent      = `Sell price: ${money(baseline)}`;
+    box.appendChild(line2);
+
+    // Line 3 (only if wall): wall warning
+    if (wall) {
+      const line3 = document.createElement('div');
+      line3.style.marginTop  = '1px';
+      line3.style.color      = '#fbbf24';
+      line3.style.fontSize   = '11px';
+      line3.textContent      = `⚠ Price wall: ${wall.qty.toLocaleString()} units @ ${money(wall.price)} — baseline capped below wall`;
+      box.appendChild(line3);
+    }
+
+    // Insert before the search bar / table, not inside the tiny header
+    const searchBar = document.querySelector('input[placeholder*="Search"]');
+    const anchor = searchBar ? searchBar.closest('div') || searchBar : h4;
+    anchor.insertAdjacentElement('beforebegin', box);
+  }
+
+  function addBadge(cell, profit, roi, strong) {
+    const badge = document.createElement('span');
+    badge.className = BADGE_CLASS;
+    badge.style.marginLeft = '6px';
+    badge.style.fontSize = '11px';
+    badge.style.fontWeight = '700';
+    badge.style.padding = '2px 6px';
+    badge.style.borderRadius = '999px';
+    badge.style.whiteSpace = 'nowrap';
+
+    if (strong) {
+      badge.style.background = 'rgba(34,197,94,0.18)';
+      badge.style.color = '#86efac';
+      badge.style.border = '1px solid rgba(134,239,172,0.35)';
+    } else {
+      badge.style.background = 'rgba(250,204,21,0.15)';
+      badge.style.color = '#fde68a';
+      badge.style.border = '1px solid rgba(253,230,138,0.25)';
+    }
+
+    badge.textContent = `+${money(profit)} • ${pct(roi)}`;
+    cell.appendChild(badge);
+  }
+
+  function highlightRows(baseline) {
+    const listings = getListings();
+
+    // Track two winners separately:
+    //   bestUnitRow  — highest per-unit profit (original logic)
+    //   bestBulkRow  — highest qty-weighted score (profit × available units, capped at 500)
+    //                  so a 9,994-unit wall at decent profit beats a 1-unit bargain
+    let bestUnitRow   = null;
+    let bestUnitProfit = -Infinity;
+    let bestBulkRow   = null;
+    let bestBulkScore = -Infinity;
+
+    for (const { price, qty, node: row } of listings) {
+      const kids = row.children || [];
+      const costCell = kids[1];
+      if (!costCell) continue;
+
+      const profit = baseline - price - SETTINGS.buffer;
+      const roi    = profit / price;
+      if (profit <= 0) continue;
+
+      const strong = profit >= SETTINGS.minProfit && roi >= SETTINGS.minROI;
+
+      addBadge(costCell, profit, roi, strong);
+
+      if (strong) {
+        row.classList.add(HILITE_CLASS);
+        row.style.background = 'rgba(34,197,94,0.12)';
+      } else {
+        row.style.background = 'rgba(250,204,21,0.06)';
+      }
+
+      // Best per-unit deal
+      if (strong && profit > bestUnitProfit) {
+        bestUnitProfit = profit;
+        bestUnitRow    = row;
+      }
+
+      // Best bulk deal: weight by qty (cap at 500 so a 9,999-wall doesn't
+      // mask a genuinely better mid-size opportunity)
+      if (strong) {
+        const bulkScore = profit * Math.min(qty || 1, 500);
+        if (bulkScore > bestBulkScore) {
+          bestBulkScore = bulkScore;
+          bestBulkRow   = row;
+        }
+      }
+    }
+
+    // Green outline = best per-unit profit (good for buying 1)
+    if (bestUnitRow) {
+      bestUnitRow.style.outline = '2px solid rgba(34,197,94,0.9)';
+    }
+
+    // Gold outline = best bulk buy (different row only — avoids double-outline clutter)
+    if (bestBulkRow && bestBulkRow !== bestUnitRow) {
+      bestBulkRow.style.outline = '2px solid rgba(251,191,36,0.95)';
+
+      // Add a small 📦 badge to the qty cell so it's obvious why it's highlighted
+      const kids = bestBulkRow.children || [];
+      const qtyCell = kids[2];
+      if (qtyCell && !qtyCell.querySelector('.tpda-bulk-tag')) {
+        const tag = document.createElement('span');
+        tag.className = 'tpda-bulk-tag';
+        tag.style.marginLeft  = '4px';
+        tag.style.fontSize    = '10px';
+        tag.style.fontWeight  = '700';
+        tag.style.color       = '#fbbf24';
+        tag.style.background  = 'rgba(251,191,36,0.15)';
+        tag.style.border      = '1px solid rgba(251,191,36,0.35)';
+        tag.style.borderRadius = '4px';
+        tag.style.padding     = '1px 4px';
+        tag.style.whiteSpace  = 'nowrap';
+        tag.textContent       = '📦 bulk';
+        qtyCell.appendChild(tag);
+      }
+    }
+  }
+
+  function runMarketPage() {
+    removeOldMarketUI();
+
+    if (!isCorrectMarketPage()) return;
+
+    const h4 = getHeader();
+    if (!h4) return;
+
+    const listings = getListings();
+    if (listings.length < 5) return;
+
+    const { baseline, wall } = calcBaseline(listings);
+    const itemName = getMarketItemName();
+    const itemId = getMarketItemId();
+
+    saveItemBaseline(itemId, itemName, baseline);
+    insertBox(h4, itemName, itemId, listings, baseline, wall);
+    highlightRows(baseline);
+  }
+
+  // SELL PAGE HELPERS
+
+  function isLikelySellPage() {
+    return document.querySelectorAll('div[class*=itemRowWrapper]').length > 0 && !isCorrectMarketPage();
+  }
+
+  function getSellRows() {
+    return Array.from(document.querySelectorAll('div[class*=itemRowWrapper]'));
+  }
+
+  function getSellRowQtyInput(row) {
+    // Qty input is always the FIRST input.input-money in the row
+    const byWrapper = row.querySelector(
+      'div[class*=amountInputWrapper] input.input-money:not([type=hidden])'
+    );
+    if (byWrapper) return byWrapper;
+    const allInputs = Array.from(row.querySelectorAll('input.input-money:not([type=hidden])'));
+    return allInputs.length ? allInputs[0] : null;
+  }
+
+  function getSellRowPriceInput(row) {
+    // Primary: explicit price wrapper
+    const byWrapper = row.querySelector(
+      'div[class*=priceInputWrapper] input.input-money:not([type=hidden])'
+    );
+    if (byWrapper) return byWrapper;
+
+    // Fallback: price input is always the LAST input.input-money in the row
+    // (qty comes first, price comes second)
+    const allInputs = Array.from(row.querySelectorAll('input.input-money:not([type=hidden])'));
+    return allInputs.length ? allInputs[allInputs.length - 1] : null;
+  }
+
+  function getSellRowItemId(row) {
+    const image = row.querySelector('img[src*="/images/items/"]');
+    if (!image) return null;
+    return extractItemIdFromImageSrc(image.getAttribute('src') || '');
+  }
+
+  function insertSellHelperForInput(input, baseline, row, updatedAt) {
+    if (!input) return;
+    if (input.classList.contains('tpda-helper-added')) return;
+
+    const suggestedSell = Math.max(1, baseline - 1);
+    const age = Date.now() - (updatedAt || 0);
+    const isAging = age > STALENESS.freshMs;
+
+    const helper = document.createElement('span');
+    helper.className = SELL_HELPER_CLASS;
+    helper.style.display = 'inline-flex';
+    helper.style.alignItems = 'center';
+    helper.style.flexShrink = '0';
+    helper.style.marginLeft = '6px';
+    helper.style.fontSize = '11px';
+    helper.style.fontWeight = '700';
+    helper.style.whiteSpace = 'nowrap';
+    helper.style.borderRadius = '6px';
+    helper.style.padding = '2px 7px';
+
+    if (isAging) {
+      // Amber: price data is 12–24h old
+      helper.style.color = '#fde68a';
+      helper.style.background = 'rgba(250,204,21,0.13)';
+      helper.style.border = '1px solid rgba(253,230,138,0.3)';
+      helper.textContent = `${suggestedSell.toLocaleString()} · ${getAgeLabel(updatedAt)}`;
+    } else {
+      // Green: price data is fresh (under 12h)
+      helper.style.color = '#86efac';
+      helper.style.background = 'rgba(34,197,94,0.13)';
+      helper.style.border = '1px solid rgba(134,239,172,0.3)';
+      helper.textContent = suggestedSell.toLocaleString();
+    }
+
+    if (row) {
+      row.appendChild(helper);
+    } else {
+      input.insertAdjacentElement('afterend', helper);
+    }
+
+    input.classList.add('tpda-helper-added');
+  }
+
+  // React controlled inputs ignore direct .value assignment.
+  // Using the native setter + dispatching input/change events forces React to sync.
+  function fillInput(input, value) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, String(value));
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function insertFillAllButton() {
+    if (document.getElementById(FILL_BTN_ID)) return;
+
+    const btn = document.createElement('button');
+    btn.id = FILL_BTN_ID;
+    btn.textContent = '⚡ Auto-fill prices';
+    btn.style.position      = 'fixed';
+    btn.style.bottom        = '80px';
+    btn.style.right         = '16px';
+    btn.style.zIndex        = '99999';
+    btn.style.padding       = '10px 16px';
+    btn.style.borderRadius  = '10px';
+    btn.style.background    = 'rgba(34,197,94,0.92)';
+    btn.style.color         = '#000';
+    btn.style.fontWeight    = '700';
+    btn.style.fontSize      = '13px';
+    btn.style.border        = 'none';
+    btn.style.boxShadow     = '0 2px 12px rgba(0,0,0,0.5)';
+    btn.style.cursor        = 'pointer';
+
+    btn.addEventListener('click', () => {
+      const rows = getSellRows();
+      let filled = 0;
+      for (const row of rows) {
+        const itemId = getSellRowItemId(row);
+        if (!itemId) continue;
+
+        const saved = getBaselineByItemId(itemId);
+        if (!saved || !saved.baseline) continue;
+
+        // Only fill if data is fresh (green, under 12h)
+        const age = Date.now() - (saved.updatedAt || 0);
+        if (age > STALENESS.freshMs) continue;
+
+        const priceInput = getSellRowPriceInput(row);
+        if (!priceInput) continue;
+
+        // Fill price with baseline - 1
+        fillInput(priceInput, Math.max(1, saved.baseline - 1));
+
+        // Fill qty with its max allowed value
+        const qtyInput = getSellRowQtyInput(row);
+        if (qtyInput) {
+          const maxQty = parseInt(qtyInput.max || qtyInput.getAttribute('max') || '0', 10);
+          fillInput(qtyInput, maxQty > 0 ? maxQty : 99999);
+        }
+
+        filled++;
+      }
+
+      btn.textContent = filled ? `✓ Filled ${filled} item${filled > 1 ? 's' : ''}` : '⚠ No fresh data';
+      btn.style.background = filled ? 'rgba(34,197,94,0.92)' : 'rgba(250,204,21,0.92)';
+      setTimeout(() => {
+        btn.textContent = '⚡ Auto-fill prices';
+        btn.style.background = 'rgba(34,197,94,0.92)';
+      }, 2500);
+    });
+
+    document.body.appendChild(btn);
+  }
+
+  function runSellHelper() {
+    removeOldSellUI();
+
+    if (!isLikelySellPage()) return;
+
+    const rows = getSellRows();
+    if (!rows.length) return;
+
+    let hasFreshData = false;
+
+    for (const row of rows) {
+      const itemId = getSellRowItemId(row);
+      if (!itemId) continue;
+
+      const saved = getBaselineByItemId(itemId);
+      if (!saved || !saved.baseline) continue;
+
+      const age = Date.now() - (saved.updatedAt || 0);
+      if (age > STALENESS.agingMs) continue;
+
+      const input = getSellRowPriceInput(row);
+      if (!input) continue;
+
+      if (age <= STALENESS.freshMs) hasFreshData = true;
+
+      insertSellHelperForInput(input, saved.baseline, row, saved.updatedAt);
+    }
+
+    if (hasFreshData) insertFillAllButton();
+  }
+
+  function run() {
+    runMarketPage();
+    runSellHelper();
+  }
+
+  let sellObserver = null;
+  let sellObserverDebounce = null;
+  let sellRunning = false;
+
+  function runSellHelperSafe() {
+    // Re-entrancy guard: skip if already running
+    if (sellRunning) return;
+    sellRunning = true;
+
+    // Pause observer so our own DOM writes don't retrigger it
+    if (sellObserver) sellObserver.disconnect();
+
+    try {
+      runSellHelper();
+    } finally {
+      sellRunning = false;
+      // Resume observer only if we're still on the sell page
+      if (sellObserver && isLikelySellPage()) {
+        sellObserver.observe(document.body, { childList: true, subtree: true });
+      }
+    }
+  }
+
+  function startSellObserver() {
+    if (sellObserver) return;
+
+    sellObserver = new MutationObserver(() => {
+      // Debounce: wait 300ms of quiet before acting
+      clearTimeout(sellObserverDebounce);
+      sellObserverDebounce = setTimeout(() => {
+        if (isLikelySellPage()) {
+          runSellHelperSafe();
+        }
+      }, 300);
+    });
+
+    sellObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  setTimeout(run, 1200);
+  setTimeout(runSellHelperSafe, 2200);
+  setTimeout(runSellHelperSafe, 3500);
+  setTimeout(runSellHelperSafe, 5000);
+  startSellObserver();
+})();
