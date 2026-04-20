@@ -63,6 +63,8 @@ Script 1 turns amber and warns you — browse the market again to refresh
 ***The key insight: Script 2 builds up your price history passively just by browsing — the more you play, the smarter both scripts get. Script 1 uses live market data for sell decisions while Script 2 gives you the longer-term context for buy decisions.***
 
 
+***WARNING!!!! Using autofill button will auto fill all items that you have recently viewed. Always double check that you are only selling intended items! Example: you have an item you want to keep, but you have recently viewed it and the script has a baseline for the item. Clicking autofill will post that item....***
+
 
 
 Setup-
