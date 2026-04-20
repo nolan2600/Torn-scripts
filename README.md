@@ -71,6 +71,8 @@ Setup-
 
 Install both scripts in Torn PDA → Main Settings → Advanced browser settings → Manage Scripts
 
+After adding, refresh script list to initiate.
+
 Browse the item market for items you trade regularly to seed your baseline data
 
 When selling, tap ⚡ Auto-fill to price everything in one go
