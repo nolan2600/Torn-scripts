@@ -67,7 +67,7 @@ Script 1 turns amber and warns you — browse the market again to refresh
 
 Setup-
 
-Install both scripts in Torn PDA → Settings → Scripts
+Install both scripts in Torn PDA → Main Settings → Advanced browser settings → Manage Scripts
 
 Browse the item market for items you trade regularly to seed your baseline data
 
