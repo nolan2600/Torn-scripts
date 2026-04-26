@@ -292,26 +292,6 @@
             appearance: none;
             cursor: pointer;
         }
-        .bazaar-profit-tooltip {
-            position: fixed;
-            background: #fff;
-            color: #333;
-            border: 1px solid #ddd;
-            padding: 8px 12px;
-            border-radius: 4px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-            z-index: 99999;
-            min-width: 200px;
-            max-width: 280px;
-            width: auto;
-            pointer-events: none;
-            transition: opacity 0.2s ease;
-        }
-        .dark-mode .bazaar-profit-tooltip {
-            background: #333;
-            color: #fff;
-            border: 1px solid #555;
-        }
         .dark-mode .bazaar-sort-select {
             border: 1px solid #444;
             background-color: #1a1a1a;
@@ -1268,10 +1248,6 @@
                       buffer = Math.max(2, Math.floor(visibleCards / 3));
                 const totalItems = filteredListings.length;
 
-                if (infoContainer.lastRenderScrollLeft !== undefined &&
-                    Math.abs(infoContainer.lastRenderScrollLeft - scrollLeft) < CARD_WIDTH * 0.3) {
-
-                }
                 infoContainer.lastRenderScrollLeft = scrollLeft;
 
                 let startIndex = Math.max(0, Math.floor(scrollLeft / CARD_WIDTH) - buffer),
@@ -1793,7 +1769,8 @@
                         } else {
                             GM_deleteValue(key);
                         }
-                        if (ts !== null && (now - ts) > sevenDays) {
+                        const tsMs = key.startsWith("visited_") ? ts * 1000 : ts;
+                        if (ts !== null && (now - tsMs) > sevenDays) {
                             GM_deleteValue(key);
                         }
                     } catch (e) {
