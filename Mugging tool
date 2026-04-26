@@ -1,0 +1,669 @@
+// ==UserScript==
+// @name         Torn City - Local Profit Hunter (PDA)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Torn PDA compatible. No external server. Hit list from profiles you visit.
+// @author       Rebuilt for Torn PDA
+// @match        https://www.torn.com/profiles.php*
+// @match        https://www.torn.com/loader.php?sid=attack*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─── CONFIG ───────────────────────────────────────────────────────────────
+    const TARGETS_PER_PAGE   = 5;
+    const PROFILE_COOLDOWN_MS = 60000;
+    const MAX_STORED_TARGETS  = 200;
+
+    // ─── API KEY ──────────────────────────────────────────────────────────────
+    let apiKey = localStorage.getItem('lph_apikey') || "";
+
+    // ─── FETCH WRAPPER (plain fetch, works in Torn PDA) ──────────────────────
+    const apiFetch = async (url) => {
+        try {
+            const res = await fetch(url, { headers: { "Content-Type": "application/json" } });
+            return await res.json();
+        } catch (e) {
+            return { error: true };
+        }
+    };
+
+    // ─── LOCAL DATABASE ───────────────────────────────────────────────────────
+    const DB_KEY = 'lph_targets';
+
+    const dbLoad = () => {
+        try { return JSON.parse(localStorage.getItem(DB_KEY) || "{}"); }
+        catch { return {}; }
+    };
+
+    const dbSave = (data) => localStorage.setItem(DB_KEY, JSON.stringify(data));
+
+    const dbUpsert = (tid, record) => {
+        const db = dbLoad();
+        db[tid] = { ...record, last_updated: new Date().toISOString() };
+        const entries = Object.entries(db);
+        if (entries.length > MAX_STORED_TARGETS) {
+            entries.sort((a, b) => (a[1].last_updated || "").localeCompare(b[1].last_updated || ""));
+            dbSave(Object.fromEntries(entries.slice(-MAX_STORED_TARGETS)));
+        } else {
+            dbSave(db);
+        }
+    };
+
+    const dbGetAll = () => Object.values(dbLoad());
+
+    const dbDelete = (tid) => {
+        const db = dbLoad();
+        delete db[tid];
+        dbSave(db);
+    };
+
+    // ─── FORMAT HELPERS ───────────────────────────────────────────────────────
+    const fmt = (val, money = false) => {
+        const num = parseInt(val);
+        if (isNaN(num) || num <= 0) return '<span style="color:#777;">N/A</span>';
+        const p = money ? '$' : '';
+        if (num >= 1e9) return p + (num / 1e9).toFixed(2) + 'B';
+        if (num >= 1e6) return p + (num / 1e6).toFixed(1) + 'M';
+        if (num >= 1e3) return p + (num / 1e3).toFixed(1) + 'k';
+        return p + num.toLocaleString();
+    };
+
+    // ─── FIND BEST CONTAINER ──────────────────────────────────────────────────
+    const getContainer = () =>
+        document.querySelector('.profile-right-wrapper') ||
+        document.querySelector('.profile-wrapper')       ||
+        document.querySelector('.content-wrapper')       ||
+        document.body;
+
+    // ─── SCRAPE STAT FROM PAGE ────────────────────────────────────────────────
+    const scrapeStats = () => {
+        const text = document.body.innerText;
+        // Matches: "Est. Stats: 6.41k" or "Est Stats: 1.2M"
+        const m = text.match(/Est\.?\s*Stats?:?\s*([\d.,]+\s*[kmb]?)/i);
+        if (!m) return 0;
+        let raw = m[1].trim().toLowerCase().replace(/,/g, '');
+        let val = parseFloat(raw);
+        if (raw.includes('k')) val *= 1e3;
+        if (raw.includes('m')) val *= 1e6;
+        if (raw.includes('b')) val *= 1e9;
+        return isNaN(val) ? 0 : Math.floor(val);
+    };
+
+    // ─── API KEY SETUP UI ─────────────────────────────────────────────────────
+    const renderApiSetup = () => {
+        const container = getContainer();
+        if (!container) return;
+
+        let box = document.getElementById('lph-api-box');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'lph-api-box';
+            box.style.cssText = "background:#1a1a1a;color:#ddd;padding:15px;margin-bottom:15px;" +
+                                "border-radius:5px;border:1px solid #ff9800;font-family:Arial;" +
+                                "position:relative;z-index:9999;";
+            container.prepend(box);
+        }
+
+        box.innerHTML = `
+            <div style="border-bottom:1px solid #333;padding-bottom:8px;margin-bottom:12px;">
+                <b style="color:#ff9800;font-size:16px;">⚙️ Local Profit Hunter – Setup</b>
+            </div>
+            <p style="font-size:14px;color:#bbb;margin:0 0 12px;">
+                Enter your Torn <b>Limited Access API Key</b>.<br>
+                <span style="color:#4caf50;font-size:12px;">
+                    ✅ Stored locally only — never sent anywhere.
+                </span>
+            </p>
+            <div style="display:flex;gap:10px;">
+                <input id="lph-api-input" type="text" placeholder="Paste API key here…"
+                    style="flex:1;padding:8px;background:#222;border:1px solid #444;
+                           color:#fff;border-radius:3px;font-size:14px;">
+                <button id="lph-api-save"
+                    style="background:#4caf50;color:#fff;border:none;padding:8px 15px;
+                           border-radius:3px;cursor:pointer;font-weight:bold;font-size:14px;">
+                    Save & Start
+                </button>
+            </div>`;
+
+        document.getElementById('lph-api-save').addEventListener('click', () => {
+            const val = document.getElementById('lph-api-input').value.trim();
+            if (val) { localStorage.setItem('lph_apikey', val); location.reload(); }
+        });
+    };
+
+    // ─── MUG SCORE CALCULATOR ─────────────────────────────────────────────────
+    const calcMug = (pStats, profile) => {
+        let score = 0;
+        const reasons = [];
+
+        const bz        = pStats.bazaarsales  || 0;
+        const pts       = pStats.pointsbought || 0;
+        const nw        = pStats.networth     || 0;
+        const trades    = pStats.trades       || 0;
+        const auctions  = pStats.auctionsells || 0;
+        const dividends = pStats.stockpayouts || 0;
+        const property  = profile.property    || "Unknown";
+        const isDonator = profile.donator === 1;
+
+        if      (nw > 10e9) { score += 20; reasons.push("💎 Ultra Wealthy (10b+ NW)"); }
+        else if (nw >  2e9) { score += 10; reasons.push("💰 Wealthy (2b+ NW)"); }
+
+        if      (bz > 100e6) { score += 35; reasons.push("🏪 Massive Bazaar Vendor"); }
+        else if (bz >  20e6) { score += 20; reasons.push("🏪 Active Bazaar Vendor"); }
+
+        if      (trades > 5000) { score += 25; reasons.push("🤝 Heavy Trader"); }
+        else if (trades > 1000) { score += 15; reasons.push("🤝 Active Trader"); }
+
+        if (pts > 5000)      { score += 15; reasons.push("🔵 Massive Point Broker"); }
+        if (auctions > 100)  { score += 10; reasons.push("⚖️ Active Auctioneer"); }
+        if (dividends > 100) { score += 10; reasons.push("📈 Frequent Stock Dividends"); }
+        if (property === "Private Island") { score += 5; reasons.push("🏝️ Private Island Owner"); }
+        if (isDonator)       { score += 5;  reasons.push("⭐ Donator/Subscriber"); }
+
+        const status   = profile?.last_action?.status   || "";
+        const relative = profile?.last_action?.relative || "";
+
+        if (status === "Online") {
+            score = Math.floor(score * 0.3);
+            reasons.push("⚠️ Currently ONLINE (cash likely banked)");
+        } else if (relative.includes('day')) {
+            score = Math.floor(score * 0.6);
+            reasons.push("💤 Inactive for days");
+        } else if (relative.includes('hour')) {
+            const hrs = parseInt(relative);
+            score += hrs < 4 ? 30 : 10;
+            reasons.push(hrs < 4 ? "✅ Recently offline (good timing)" : "⏳ Offline for hours");
+        } else if (relative.includes('minute')) {
+            const mins = parseInt(relative);
+            if (mins < 15) { score = Math.floor(score * 0.5); reasons.push("⚠️ Active just minutes ago (risky)"); }
+            else           { score += 25; reasons.push("✅ Idle >15 mins"); }
+        }
+
+        score = Math.min(100, Math.max(0, score));
+
+        let rating = "POOR";  let color = "#ff5252";
+        if (score >= 30) { rating = "AVERAGE";     color = "#ffeb3b"; }
+        if (score >= 65) { rating = "GOOD";        color = "#4caf50"; }
+        if (score >= 85) { rating = "JACKPOT 💰";  color = "#dfb300"; }
+
+        return { score, rating, color, reasons, bz, pts, nw, trades, auctions, dividends };
+    };
+
+    // ─── PROFILE DOSSIER UI ───────────────────────────────────────────────────
+    const renderDossier = (mugData, totalStats, sourceText, pData) => {
+        const container = getContainer();
+        if (!container) return;
+
+        let box = document.getElementById('lph-dossier');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'lph-dossier';
+            box.style.cssText = "background:#1a1a1a;color:#ddd;padding:15px;margin-bottom:15px;" +
+                                "border-radius:5px;border:1px solid #dfb300;font-family:Arial;" +
+                                "position:relative;z-index:9999;";
+            container.prepend(box);
+        }
+
+        const hpMax   = pData?.life?.maximum || 1;
+        const hpCur   = pData?.life?.current || 0;
+        const hpPct   = Math.floor((hpCur / hpMax) * 100);
+        const hpColor = hpPct > 50 ? '#4caf50' : (hpPct > 0 ? '#ff9800' : '#ff5252');
+
+        const travelHtml = pData?.status?.state === 'Traveling'
+            ? `<div style="margin-bottom:10px;padding:8px;background:rgba(33,150,243,.15);
+                           border-left:4px solid #2196f3;font-size:14px;">
+                   ✈️ <b>Flying:</b> <span style="color:#6fb6ff;">${pData.status.description}</span>
+               </div>` : '';
+
+        const hospHtml = pData?.status?.state === 'In hospital'
+            ? `<div style="margin-bottom:10px;padding:8px;background:rgba(244,67,54,.15);
+                           border-left:4px solid #f44336;font-size:14px;">
+                   🏥 <b>Hospital:</b> <span style="color:#ff6961;">${pData.status.description}</span>
+               </div>` : '';
+
+        const factionHtml = pData?.faction?.faction_name
+            ? `<span style="color:#b388ff;">[${pData.faction.faction_name}]</span>`
+            : `<span style="color:#888;">No Faction</span>`;
+
+        const reasonHtml = mugData.reasons
+            .map(r => `<li style="margin-bottom:4px;">${r}</li>`).join('');
+
+        box.innerHTML = `
+            <div style="border-bottom:1px solid #333;padding-bottom:8px;margin-bottom:12px;
+                        display:flex;justify-content:space-between;align-items:center;">
+                <b style="color:#dfb300;font-size:16px;">👁️ Profit Hunter Dossier</b>
+                <span style="font-size:12px;color:${hpColor};font-weight:bold;">❤️ ${hpPct}% HP</span>
+            </div>
+            ${travelHtml}${hospHtml}
+            <div style="font-size:14px;margin-bottom:12px;background:#222;padding:10px;
+                        border-radius:3px;border-left:3px solid #6fb6ff;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                    <span><b>Battle Stats:</b>
+                        <span style="color:#fff;">${totalStats > 0 ? totalStats.toLocaleString() : 'Unknown'}</span>
+                    </span>
+                    <span style="font-size:11px;color:#888;">${sourceText}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aaa;
+                            padding-top:6px;border-top:1px dashed #444;margin-bottom:4px;">
+                    <span>Networth: <b style="color:#fff;">${fmt(mugData.nw, true)}</b></span>
+                    <span>Bazaar:   <b style="color:#fff;">${fmt(mugData.bz, true)}</b></span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aaa;
+                            padding-top:4px;margin-bottom:4px;">
+                    <span>Trades: <b style="color:#fff;">${fmt(mugData.trades)}</b></span>
+                    <span>Points: <b style="color:#fff;">${fmt(mugData.pts)}</b></span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aaa;
+                            padding-top:4px;margin-bottom:8px;">
+                    <span>Auctions:  <b style="color:#fff;">${fmt(mugData.auctions)}</b></span>
+                    <span>Dividends: <b style="color:#fff;">${fmt(mugData.dividends)}</b></span>
+                </div>
+                <div style="font-size:12px;color:#aaa;padding-top:6px;border-top:1px dashed #444;
+                            display:flex;justify-content:space-between;">
+                    <span>Faction: ${factionHtml}</span>
+                    <span style="color:#4caf50;font-size:11px;">✅ Saved locally</span>
+                </div>
+            </div>
+            <div style="font-size:15px;border-top:1px solid #333;padding-top:12px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
+                    <span>Mug Rating: <b style="color:${mugData.color};font-size:17px;">${mugData.rating}</b></span>
+                    <span>Score: <b style="color:${mugData.color};">${mugData.score}/100</b></span>
+                </div>
+                <ul style="margin:0 0 0 20px;padding:0;font-size:13px;color:#bbb;line-height:1.6;">
+                    ${reasonHtml || "<li>No notable wealth indicators.</li>"}
+                </ul>
+            </div>`;
+    };
+
+    // ─── HIT LIST UI ──────────────────────────────────────────────────────────
+    const renderHitList = (myTotal, myFactionMembers) => {
+        const container = getContainer();
+        if (!container) return;
+
+        let box = document.getElementById('lph-hitlist');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'lph-hitlist';
+            box.style.cssText = "background:#242424;color:#ddd;padding:15px;margin-bottom:15px;" +
+                                "border-radius:5px;border:1px solid #4caf50;font-family:Arial;" +
+                                "position:relative;z-index:9999;";
+            box.innerHTML = `
+                <div style="border-bottom:1px solid #555;padding-bottom:12px;margin-bottom:12px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h4 style="margin:0;color:#4caf50;font-size:17px;">🎯 Local Hit List</h4>
+                        <div style="display:flex;gap:5px;">
+                            <button id="lph-settings"
+                                style="background:#333;color:#aaa;border:1px solid #666;border-radius:3px;
+                                       padding:3px 8px;cursor:pointer;font-size:14px;" title="Change API Key">⚙️</button>
+                            <button id="lph-clear"
+                                style="background:#333;color:#ff5252;border:1px solid #666;border-radius:3px;
+                                       padding:3px 8px;cursor:pointer;font-size:13px;font-weight:bold;">🗑️ Clear</button>
+                        </div>
+                    </div>
+                    <p style="font-size:12px;color:#888;margin:0 0 8px;">
+                        Targets are added as you browse profiles. Browse a few, then come back here.
+                    </p>
+                    <div style="display:flex;gap:8px;">
+                        <select id="lph-ff-filter"
+                            style="flex:1;background:#333;color:#fff;font-size:13px;
+                                   padding:4px;border:1px solid #666;border-radius:3px;">
+                            <option value="all">All FF</option>
+                            <option value="easy">Easy (FF &lt; 1.5)</option>
+                            <option value="normal">Normal (1.5 – 2.5)</option>
+                            <option value="hard">Hard (FF &gt; 2.5)</option>
+                        </select>
+                        <select id="lph-mug-filter"
+                            style="flex:1;background:#333;color:#fff;font-size:13px;
+                                   padding:4px;border:1px solid #666;border-radius:3px;">
+                            <option value="all">All Mug Ratings</option>
+                            <option value="poor">Poor</option>
+                            <option value="average">Average</option>
+                            <option value="good">Good</option>
+                            <option value="jackpot">Jackpot 💰</option>
+                        </select>
+                    </div>
+                </div>
+                <ul id="lph-list" style="list-style:none;padding:0;margin:0;"></ul>
+                <div style="display:flex;justify-content:space-between;align-items:center;
+                            margin-top:15px;border-top:1px solid #444;padding-top:12px;">
+                    <button id="lph-prev"
+                        style="background:#333;color:#fff;border:1px solid #666;border-radius:4px;
+                               padding:6px 15px;cursor:pointer;font-size:14px;font-weight:bold;">◀ Prev</button>
+                    <span id="lph-page-info" style="font-size:13px;color:#bbb;font-weight:bold;text-align:center;"></span>
+                    <button id="lph-next"
+                        style="background:#333;color:#fff;border:1px solid #666;border-radius:4px;
+                               padding:6px 15px;cursor:pointer;font-size:14px;font-weight:bold;">Next ▶</button>
+                </div>`;
+            container.prepend(box);
+        }
+
+        const state = { filtered: [], page: 1 };
+
+        const calcFF = (s) => Math.min(3.0, Math.max(1.0, 1 + (8 / 3) * ((s || 0) / myTotal)));
+
+        const renderPage = () => {
+            const ul = document.getElementById('lph-list');
+            if (!ul) return;
+            ul.innerHTML = "";
+
+            const totalPages = Math.max(1, Math.ceil(state.filtered.length / TARGETS_PER_PAGE));
+            state.page = Math.min(Math.max(1, state.page), totalPages);
+
+            document.getElementById('lph-page-info').textContent =
+                `Page ${state.page} / ${totalPages}  •  ${state.filtered.length} targets`;
+
+            const prev = document.getElementById('lph-prev');
+            const next = document.getElementById('lph-next');
+            prev.disabled = state.page <= 1;
+            next.disabled = state.page >= totalPages;
+            prev.style.opacity = prev.disabled ? "0.4" : "1";
+            next.style.opacity = next.disabled ? "0.4" : "1";
+
+            if (state.filtered.length === 0) {
+                ul.innerHTML = `<li style="color:#aaa;text-align:center;font-size:14px;padding:20px;">
+                    No targets yet.<br>
+                    <span style="font-size:12px;color:#666;">
+                        Browse other players' profiles and they'll appear here.
+                    </span></li>`;
+                return;
+            }
+
+            const start = (state.page - 1) * TARGETS_PER_PAGE;
+            state.filtered.slice(start, start + TARGETS_PER_PAGE).forEach(t => {
+                const ff      = calcFF(t.total_stats);
+                const ffColor = ff >= 2.5 ? '#4caf50' : (ff < 1.5 ? '#aaa' : '#ff9800');
+                const statStr = t.total_stats >= 1e6
+                    ? (t.total_stats / 1e6).toFixed(2) + 'M'
+                    : (t.total_stats / 1e3).toFixed(1) + 'k';
+                const rating   = t.mug_rating || 'UNKNOWN';
+                const mugColor = rating.includes('JACKPOT') ? '#dfb300'
+                    : rating.includes('GOOD')    ? '#4caf50'
+                    : rating.includes('AVERAGE') ? '#ffeb3b' : '#ff5252';
+                const hpPct  = t.life_max > 0 ? Math.floor((t.life_current / t.life_max) * 100) : 100;
+                const hpIcon = hpPct > 50 ? '💚' : (hpPct > 0 ? '💛' : '💀');
+                const upd    = t.last_updated ? t.last_updated.substring(5, 16).replace('-', '/') : 'N/A';
+                const lastHit = t.last_hit_result
+                    ? `<span style="color:#4caf50;">${t.last_hit_result} (${t.last_ff}x)</span>`
+                    : `<span style="color:#666;">No attack logged</span>`;
+
+                const li = document.createElement('li');
+                li.style.cssText = "padding:12px 0;border-bottom:1px solid #333;";
+                li.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <a href="/profiles.php?XID=${t.torn_id}" target="_blank"
+                            style="color:#6fb6ff;font-weight:bold;text-decoration:none;font-size:16px;">
+                            ${t.name || 'Unknown'}
+                            <span style="color:#888;font-size:12px;">[Lvl ${t.level || '?'}]</span>
+                        </a>
+                        <b style="color:${ffColor};font-size:16px;">${ff.toFixed(2)}x</b>
+                    </div>
+                    <div style="font-size:13px;color:#aaa;display:flex;justify-content:space-between;margin-bottom:5px;">
+                        <span>Stats: <b style="color:#fff;">${statStr}</b></span>
+                        <span>Mug: <b style="color:${mugColor};">${rating}</b></span>
+                    </div>
+                    <div style="font-size:12px;color:#888;display:flex;justify-content:space-between;margin-bottom:5px;">
+                        <span>Last seen: <span style="color:#ccc;">${t.last_action || '?'}</span></span>
+                        <span>HP: ${hpIcon} <b style="color:#fff;">${hpPct}%</b></span>
+                    </div>
+                    <div style="font-size:11px;color:#888;display:flex;justify-content:space-between;align-items:center;">
+                        <span>Last attack: ${lastHit}</span>
+                        <span style="background:#1a1a1a;padding:2px 6px;border-radius:3px;border:1px solid #333;">
+                            Saved: <b style="color:#4caf50;">${upd}</b>
+                        </span>
+                    </div>
+                    <div style="text-align:right;margin-top:4px;">
+                        <button data-del="${t.torn_id}"
+                            style="font-size:11px;background:transparent;color:#ff5252;
+                                   border:none;cursor:pointer;padding:2px;">✕ Remove</button>
+                    </div>`;
+                ul.appendChild(li);
+            });
+
+            ul.querySelectorAll('[data-del]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    dbDelete(btn.dataset.del);
+                    applyFilters();
+                });
+            });
+        };
+
+        const applyFilters = () => {
+            const ffF  = document.getElementById('lph-ff-filter').value;
+            const mugF = document.getElementById('lph-mug-filter').value;
+
+            state.filtered = dbGetAll().filter(t => {
+                if (myFactionMembers.includes(parseInt(t.torn_id))) return false;
+                if (t.status_state === 'Traveling' || t.status_state === 'In hospital') return false;
+
+                const ff = calcFF(t.total_stats);
+                if (ffF === 'easy'   && ff >= 1.5)               return false;
+                if (ffF === 'normal' && (ff < 1.5 || ff >= 2.5)) return false;
+                if (ffF === 'hard'   && ff < 2.5)                return false;
+
+                const r = (t.mug_rating || '').toUpperCase();
+                if (mugF === 'poor'    && !r.includes('POOR'))    return false;
+                if (mugF === 'average' && !r.includes('AVERAGE')) return false;
+                if (mugF === 'good'    && !r.includes('GOOD'))    return false;
+                if (mugF === 'jackpot' && !r.includes('JACKPOT')) return false;
+
+                return true;
+            }).sort((a, b) =>
+                (b.mug_score || 0) - (a.mug_score || 0) ||
+                (b.last_updated || "").localeCompare(a.last_updated || "")
+            );
+
+            state.page = 1;
+            renderPage();
+        };
+
+        if (!document.getElementById('lph-ff-filter').dataset.bound) {
+            document.getElementById('lph-ff-filter').dataset.bound = "1";
+            document.getElementById('lph-ff-filter').addEventListener('change', applyFilters);
+            document.getElementById('lph-mug-filter').addEventListener('change', applyFilters);
+            document.getElementById('lph-prev').addEventListener('click', () => {
+                if (state.page > 1) { state.page--; renderPage(); }
+            });
+            document.getElementById('lph-next').addEventListener('click', () => {
+                const max = Math.ceil(state.filtered.length / TARGETS_PER_PAGE);
+                if (state.page < max) { state.page++; renderPage(); }
+            });
+            document.getElementById('lph-settings').addEventListener('click', () => {
+                const cur  = localStorage.getItem('lph_apikey') || "";
+                const next = prompt("Change Torn Limited Access API Key:", cur);
+                if (next && next.trim() && next !== cur) {
+                    localStorage.setItem('lph_apikey', next.trim());
+                    location.reload();
+                }
+            });
+            document.getElementById('lph-clear').addEventListener('click', () => {
+                if (confirm("Clear ALL saved targets? Cannot be undone.")) {
+                    localStorage.removeItem(DB_KEY);
+                    applyFilters();
+                }
+            });
+        }
+
+        applyFilters();
+    };
+
+    // ─── COMBAT LOGGER ────────────────────────────────────────────────────────
+    const observeAttacks = () => {
+        const targetId = new URLSearchParams(window.location.search).get('user2ID');
+        if (!targetId) return;
+
+        let logged = false;
+        const poll = setInterval(() => {
+            if (logged) return;
+            const text = document.body.innerText;
+
+            if (text.includes("You won the fight")  || text.includes("You hospitalized") ||
+                text.includes("You mugged")          || text.includes("You left")) {
+
+                const ffMatch = text.match(/Fair fight:\s*x([\d.]+)/i);
+                if (!ffMatch) return;
+
+                logged = true;
+                clearInterval(poll);
+
+                const ff     = parseFloat(ffMatch[1]);
+                const mugM   = text.match(/mugged\s*\$([\d,]+)/i);
+                const mugAmt = mugM ? parseInt(mugM[1].replace(/,/g, '')) : 0;
+                const result = text.includes("hospitalized") ? "Hospitalized"
+                             : text.includes("mugged")       ? "Mugged" : "Left";
+
+                // Update local record
+                const db = dbLoad();
+                if (db[targetId]) {
+                    db[targetId].last_hit_result = result;
+                    db[targetId].last_ff         = ff;
+                    db[targetId].last_hit_time   = new Date().toISOString();
+                    dbSave(db);
+                }
+
+                const toast = document.createElement('div');
+                toast.style.cssText = "position:fixed;bottom:20px;right:20px;background:#2e7d32;color:#fff;" +
+                                      "padding:15px 20px;border-radius:5px;z-index:99999;font-family:Arial;" +
+                                      "box-shadow:0 4px 10px rgba(0,0,0,.4);font-size:15px;font-weight:bold;";
+                toast.innerText = `💰 ${result}! FF: ${ff}x` + (mugAmt ? ` | Mug: $${mugAmt.toLocaleString()}` : '');
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 4000);
+            }
+        }, 500);
+    };
+
+    // ─── MAIN INIT ────────────────────────────────────────────────────────────
+    const init = async () => {
+        // Attack page
+        if (window.location.href.includes("loader.php?sid=attack")) {
+            observeAttacks();
+            return;
+        }
+
+        // No API key yet
+        if (!apiKey) {
+            renderApiSetup();
+            return;
+        }
+
+        const tid = new URLSearchParams(window.location.search).get('XID');
+
+        // Fetch our own data
+        const myData = await apiFetch(
+            `https://api.torn.com/user/?selections=battlestats,profile&key=${apiKey}`
+        );
+
+        if (!myData || myData.error) {
+            // Show error inline instead of silently failing
+            const container = getContainer();
+            if (container) {
+                const errBox = document.createElement('div');
+                errBox.style.cssText = "background:#1a1a1a;color:#ff5252;padding:12px;margin-bottom:10px;" +
+                                       "border-radius:5px;border:1px solid #ff5252;font-family:Arial;font-size:14px;";
+                errBox.innerHTML = `⚠️ <b>Profit Hunter:</b> API error — 
+                    <span style="text-decoration:underline;cursor:pointer;" id="lph-rekey">tap here to re-enter your API key</span>`;
+                container.prepend(errBox);
+                document.getElementById('lph-rekey').addEventListener('click', () => {
+                    localStorage.removeItem('lph_apikey');
+                    location.reload();
+                });
+            }
+            return;
+        }
+
+        const myTotal = (myData.strength  || 0) + (myData.defense    || 0) +
+                        (myData.speed     || 0) + (myData.dexterity  || 0);
+        localStorage.setItem('lph_my_total', myTotal);
+
+        // Faction list (async background refresh)
+        let myFactionMembers = JSON.parse(localStorage.getItem('lph_faction') || "[]");
+        if (myData.faction?.faction_id) {
+            apiFetch(`https://api.torn.com/faction/?selections=basic&key=${apiKey}`).then(fac => {
+                if (fac?.members) {
+                    localStorage.setItem('lph_faction',
+                        JSON.stringify(Object.keys(fac.members).map(Number)));
+                }
+            });
+        }
+
+        // ── Someone else's profile ──
+        if (tid && parseInt(tid) !== myData.player_id) {
+
+            const pData = await apiFetch(
+                `https://api.torn.com/user/${tid}?selections=personalstats,profile&key=${apiKey}`
+            );
+
+            let totalStats = 0, sourceText = "";
+
+            // 1. Check local DB first (from a previous visit)
+            const db = dbLoad();
+            if (db[tid]?.total_stats > 0) {
+                totalStats = parseInt(db[tid].total_stats);
+                sourceText = "Local DB";
+            }
+
+            // 2. Screen scrape (always try — may be more current)
+            const scraped = scrapeStats();
+            if (scraped > 0) {
+                totalStats = scraped;
+                sourceText = "Screen Scrape (Est.)";
+            }
+
+            if (totalStats > 0 && pData && !pData.error) {
+                const mugData = calcMug(pData.personalstats || {}, pData);
+                renderDossier(mugData, totalStats, sourceText, pData);
+
+                // Save to local DB (rate-limited per target)
+                const lastSave = parseInt(localStorage.getItem(`lph_last_${tid}`) || "0");
+                if (!myFactionMembers.includes(parseInt(tid)) &&
+                    Date.now() - lastSave > PROFILE_COOLDOWN_MS) {
+
+                    dbUpsert(tid, {
+                        torn_id:      tid,
+                        name:         pData.name,
+                        level:        pData.level                          || 0,
+                        total_stats:  totalStats,
+                        mug_score:    mugData.score,
+                        mug_rating:   mugData.rating,
+                        last_action:  pData.last_action?.relative          || "Unknown",
+                        status_state: pData.status?.state                  || "Okay",
+                        life_current: pData.life?.current                  || 0,
+                        life_max:     pData.life?.maximum                  || 0,
+                        faction_name: pData.faction?.faction_name          || "None",
+                        networth:     pData.personalstats?.networth        || 0,
+                        bazaar_sales: pData.personalstats?.bazaarsales     || 0,
+                        trades:       pData.personalstats?.trades          || 0,
+                    });
+                    localStorage.setItem(`lph_last_${tid}`, Date.now());
+                }
+            } else if (!totalStats) {
+                // Nothing to show — still show a minimal notice
+                const container = getContainer();
+                if (container && !document.getElementById('lph-no-stats')) {
+                    const note = document.createElement('div');
+                    note.id = 'lph-no-stats';
+                    note.style.cssText = "background:#1a1a1a;color:#888;padding:10px;margin-bottom:10px;" +
+                                         "border-radius:5px;border:1px solid #333;font-family:Arial;font-size:13px;";
+                    note.innerText = "👁️ Profit Hunter: No stats visible for this player yet.";
+                    container.prepend(note);
+                }
+            }
+        }
+
+        // ── Own profile — show hit list ──
+        else {
+            renderHitList(myTotal, myFactionMembers);
+        }
+    };
+
+    // Torn PDA may fire load late or not at all — try both
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        init();
+    } else {
+        document.addEventListener('DOMContentLoaded', init);
+        window.addEventListener('load', init);
+    }
+
+})();
