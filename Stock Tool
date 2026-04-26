@@ -1,0 +1,981 @@
+// ==UserScript==
+// @name         Torn Stock Investment Advisor (Open) v3
+// @namespace    http://tampermonkey.net/
+// @version      3.00
+// @description  Stock advisor with color-coded performance, short-term momentum & long-term ROI recommendations
+// @author       Reverse engineered + enhanced (original by ShAdOwCrEsT [3929345])
+// @match        https://www.torn.com/page.php?sid=stocks*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─── Original Investment Priority Order (recovered from v0.1 source) ──────
+    const ORIGINAL_ORDER = [
+        'MCS-1','SYM-1','CBD-1','FHG-1','MCS-2','TCT-1','PRN-1','GRN-1','SYM-2','MUN-1',
+        'THS-1','IOU-1','CBD-2','FHG-2','MCS-3','PTS-1','TMI-1','EWM-1','HRG-1','TCT-2',
+        'PRN-2','TSB-1','LSC-1','GRN-2','SYM-3','ASS-1','CNC-1','MUN-2','THS-2','TCI-1',
+        'IOU-2','CBD-3','FHG-3','MCS-4','PTS-2','TMI-2','EWM-2','HRG-2','TCT-3','LAG-1',
+        'PRN-3','TSB-2','TCI-2','TCI-3','LSC-2','GRN-3','SYM-4','ASS-2','CNC-2','MUN-3',
+        'THS-3','IOU-3','CBD-4','FHG-4','PTS-3','TMI-3','EWM-3','HRG-3','TCT-4','PRN-4',
+        'TSB-3','LSC-3','GRN-4','ASS-3','CNC-3','MUN-4','THS-4','IOU-4','PTS-4','TMI-4',
+        'EWM-4','HRG-4','LAG-2','TSB-4','LSC-4','ASS-4','CNC-4','LAG-3','TCC-1','LAG-4',
+        'TCC-2','TCC-3','TCC-4'
+    ];
+
+    // Stocks the original author excluded (poor bonus ROI)
+    const EXCLUDED_STOCKS = new Set(['SYS','YAZ','MSG','TCP','IIL','TCM','ELT','TGP','WSU','IST','BAG','EVL','WLT','LOS']);
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const STOCK_MAP = {
+        1:'TSB',2:'TCI',3:'SYS',4:'LAG',5:'IOU',6:'GRN',7:'THS',8:'YAZ',9:'TCT',10:'CNC',
+        11:'MSG',12:'TMI',13:'TCP',14:'IIL',15:'FHG',16:'SYM',17:'LSC',18:'PRN',19:'EWM',20:'TCM',
+        21:'ELT',22:'HRG',23:'TGP',24:'MUN',25:'WSU',26:'IST',27:'BAG',28:'EVL',29:'MCS',30:'WLT',
+        31:'TCC',32:'ASS',33:'CBD',34:'LOS',35:'PTS'
+    };
+
+    const STOCK_IMAGES = {};
+    Object.values(STOCK_MAP).forEach(a => { STOCK_IMAGES[a] = `https://www.torn.com/images/v2/stock-market/dark-mode/logos/${a}.svg`; });
+
+    const STORAGE_KEY           = 'torn_stock_advisor_api_key';
+    const SETTINGS_KEY          = 'torn_stock_advisor_settings';
+    const INVESTMENTS_KEY       = 'torn_stock_advisor_investments';
+    const EXTRA_STOCKS_KEY      = 'torn_stock_advisor_extra_stocks';
+    const COMPANY_ESCROW_KEY    = 'torn_stock_advisor_company_escrow';
+    const INVESTMENT_TABLE_KEY  = 'torn_stock_advisor_investment_table_session';
+    const PRICE_HISTORY_KEY     = 'torn_stock_price_history';
+
+    let apiKey = localStorage.getItem(STORAGE_KEY) || '';
+    let INVESTMENT_TABLE = null;
+
+    let settings = {
+        pending:true,wallet:true,bank:true,cayman:true,vault:true,piggybank:true,
+        items:true,displaycase:true,bazaar:true,trade:true,itemmarket:true,
+        properties:true,auctionhouse:true,bookie:true,enlistedcars:true,loan:true,
+        unpaidfees:true,points:true,factionMoney:true,company:true,
+        companyEscrow:true,extraStockShares:true
+    };
+    const savedSettings = localStorage.getItem(SETTINGS_KEY);
+    if (savedSettings) settings = {...settings, ...JSON.parse(savedSettings)};
+
+    let investmentPreferences = {};
+    const savedInvestments = localStorage.getItem(INVESTMENTS_KEY);
+    if (savedInvestments) {
+        const saved = JSON.parse(savedInvestments);
+        investmentPreferences = Object.keys(saved).some(k => !isNaN(k)) ? {} : saved;
+    }
+
+    let extraStockPreferences = {};
+    const sx = localStorage.getItem(EXTRA_STOCKS_KEY);
+    if (sx) extraStockPreferences = JSON.parse(sx);
+
+    let companyEscrowPreferences = {weeklyAdBudget:true,weeklyWageBudget:true};
+    const cx = localStorage.getItem(COMPANY_ESCROW_KEY);
+    if (cx) companyEscrowPreferences = JSON.parse(cx);
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    function getInvestmentKey(a, i) { return `${a}-${i}`; }
+    function formatMoney(n) { return '$' + Math.round(n).toLocaleString('en-US'); }
+    function saveApiKey(k)  { localStorage.setItem(STORAGE_KEY, k); apiKey = k; }
+    function clearApiKey()  { localStorage.removeItem(STORAGE_KEY); apiKey = ''; }
+    function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+    function saveInvestmentPreferences() { localStorage.setItem(INVESTMENTS_KEY, JSON.stringify(investmentPreferences)); }
+    function saveExtraStockPreferences() { localStorage.setItem(EXTRA_STOCKS_KEY, JSON.stringify(extraStockPreferences)); }
+    function saveCompanyEscrowPreferences() { localStorage.setItem(COMPANY_ESCROW_KEY, JSON.stringify(companyEscrowPreferences)); }
+    async function fetchAPI(url) {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('API request failed');
+        return r.json();
+    }
+
+    // ─── Price History System ─────────────────────────────────────────────────
+    function loadPriceHistory() {
+        try { return JSON.parse(localStorage.getItem(PRICE_HISTORY_KEY) || '{}'); }
+        catch { return {}; }
+    }
+
+    function recordPrices(stockPriceMap) {
+        const history = loadPriceHistory();
+        const now = Date.now();
+        for (const [acronym, price] of Object.entries(stockPriceMap)) {
+            if (!history[acronym]) history[acronym] = [];
+            // Don't spam — only record if >30 min since last entry
+            const last = history[acronym][history[acronym].length - 1];
+            if (!last || now - last.t > 30 * 60 * 1000) {
+                history[acronym].push({ t: now, p: price });
+            }
+            if (history[acronym].length > 200) history[acronym] = history[acronym].slice(-200);
+        }
+        localStorage.setItem(PRICE_HISTORY_KEY, JSON.stringify(history));
+        return history;
+    }
+
+    // Returns % change over the given number of hours (or null if no data)
+    function getPctChange(history, acronym, hoursBack) {
+        const data = history[acronym];
+        if (!data || data.length < 2) return null;
+        const now = Date.now();
+        const cutoff = now - hoursBack * 3600000;
+        const past = data.filter(d => d.t <= cutoff);
+        if (!past.length) return null;
+        const oldPrice = past[past.length - 1].p;
+        const curPrice = data[data.length - 1].p;
+        if (!oldPrice) return null;
+        return ((curPrice - oldPrice) / oldPrice) * 100;
+    }
+
+    // Returns how many hours of history we have for a stock
+    function historyAgeHours(history, acronym) {
+        const data = history[acronym];
+        if (!data || data.length < 2) return 0;
+        return (Date.now() - data[0].t) / 3600000;
+    }
+
+    // Performance tier → color scheme
+    function perf(pct) {
+        if (pct === null)  return { bg:'#444',    border:'#666',    badge:'⚪', label:'No data', textColor:'#aaa' };
+        if (pct >= 5)      return { bg:'#0a3d0a', border:'#00e676', badge:'🟢', label:`+${pct.toFixed(2)}%`, textColor:'#00e676' };
+        if (pct >= 1)      return { bg:'#1b3a1b', border:'#4caf50', badge:'🟢', label:`+${pct.toFixed(2)}%`, textColor:'#4caf50' };
+        if (pct >= -1)     return { bg:'#3a3200', border:'#ffc107', badge:'🟡', label:`${pct.toFixed(2)}%`,  textColor:'#ffc107' };
+        if (pct >= -5)     return { bg:'#3a1500', border:'#ff5722', badge:'🔴', label:`${pct.toFixed(2)}%`,  textColor:'#ff5722' };
+        return             { bg:'#3a0a0a', border:'#f44336', badge:'🔴', label:`${pct.toFixed(2)}%`,  textColor:'#f44336' };
+    }
+
+    function trendArrow(pct) {
+        if (pct === null) return '–';
+        if (pct >= 2)  return '↑↑';
+        if (pct >= 0.5) return '↑';
+        if (pct >= -0.5) return '→';
+        if (pct >= -2) return '↓';
+        return '↓↓';
+    }
+
+    // ─── Investment Table ─────────────────────────────────────────────────────
+    async function buildInvestmentTable(key) {
+        const cached = sessionStorage.getItem(INVESTMENT_TABLE_KEY);
+        if (cached) { INVESTMENT_TABLE = JSON.parse(cached); return INVESTMENT_TABLE; }
+
+        const tornData = await fetchAPI(`https://api.torn.com/v2/torn/stocks?key=${key}`);
+        const lookup = {};
+        for (const s of (tornData.stocks || [])) {
+            const a = STOCK_MAP[s.id];
+            if (a) lookup[a] = s;
+        }
+
+        const table = [];
+        for (const key of ORIGINAL_ORDER) {
+            const [acronym, incStr] = key.split('-');
+            const increment = parseInt(incStr);
+            const stock = lookup[acronym];
+            if (!stock) continue;
+            const baseReq = stock.bonus?.requirement || 0;
+            const currentPrice = stock.market?.price || 0;
+            if (!baseReq || !currentPrice) continue;
+            const sharesToBuy = baseReq * Math.pow(2, increment - 1);
+            table.push({
+                acronym, increment,
+                shares_to_buy: sharesToBuy,
+                cost: sharesToBuy * currentPrice,
+                current_price: currentPrice,
+                description: stock.bonus?.description || '',
+                monthlyMult: (stock.bonus?.frequency || 7) <= 7 ? 4 : 1
+            });
+        }
+
+        sessionStorage.setItem(INVESTMENT_TABLE_KEY, JSON.stringify(table));
+        INVESTMENT_TABLE = table;
+        return table;
+    }
+
+    // ─── Auth ─────────────────────────────────────────────────────────────────
+    async function checkAuthorization(key) {
+        try {
+            const data = await fetchAPI(`https://api.torn.com/v2/user?selections=&key=${key}`);
+            if (data.error) return { authorized:false, error:`Invalid API key: ${data.error.error}` };
+            await buildInvestmentTable(key);
+            return { authorized:true };
+        } catch(e) {
+            return { authorized:false, error:'Failed to reach Torn API: ' + e.message };
+        }
+    }
+
+    // ─── Fetch all stock prices + record history ───────────────────────────────
+    async function fetchAndRecordPrices() {
+        const tornData = await fetchAPI(`https://api.torn.com/v2/torn/stocks?key=${apiKey}`);
+        const prices = {};
+        for (const s of (tornData.stocks || [])) {
+            const a = STOCK_MAP[s.id];
+            if (a && s.market?.price) prices[a] = s.market.price;
+        }
+        const history = recordPrices(prices);
+        return { prices, history, tornData };
+    }
+
+    // ─── DOM injection: color badges on Torn's stock page ────────────────────
+    function injectPageBadges(prices, history) {
+        // We look for elements containing just the ticker acronym text.
+        // Torn's stock page often has spans/divs with the ticker symbol.
+        // We inject a small colored pill after each match we find.
+        const allText = document.querySelectorAll('span, div, td, th, li, a, button, h3, h4');
+        const inserted = new Set();
+
+        allText.forEach(el => {
+            const txt = el.textContent.trim();
+            const acronym = Object.values(STOCK_MAP).find(a => txt === a);
+            if (!acronym || inserted.has(el)) return;
+            if (el.querySelector('.sadv-badge')) return; // already injected
+            if (el.children.length > 0 && !Array.from(el.children).every(c => c.childElementCount === 0)) return; // skip complex nodes
+
+            const pct24 = getPctChange(history, acronym, 24);
+            const { border, label, textColor } = perf(pct24);
+            const badge = document.createElement('span');
+            badge.className = 'sadv-badge';
+            badge.textContent = pct24 !== null ? label : '';
+            badge.title = `${acronym} 24h performance`;
+            badge.style.cssText = `
+                display:inline-block;margin-left:5px;padding:1px 5px;
+                border-radius:4px;font-size:10px;font-weight:bold;
+                border:1px solid ${border};color:${textColor};
+                background:rgba(0,0,0,0.3);vertical-align:middle;
+                font-family:monospace;
+            `;
+            el.appendChild(badge);
+            inserted.add(el);
+        });
+    }
+
+    // ─── UI Shell ─────────────────────────────────────────────────────────────
+    function createButton() {
+        const isPDA = /android|iphone|ipad|mobile/i.test(navigator.userAgent) || window.innerWidth <= 768;
+        const container = document.createElement('div');
+        container.id = 'sadv-container';
+        container.style.cssText = `position:fixed;top:${isPDA?'35px':'50px'};right:${isPDA?'10px':'20px'};z-index:99999;display:flex;gap:6px;align-items:center;`;
+
+        const toggleBtn = mkBtn('📊', isPDA);
+        const expanded = document.createElement('div');
+        expanded.style.cssText = 'display:none;flex-direction:column;gap:6px;align-items:flex-end;';
+
+        const advisorBtn  = mkBtn('📊 Next Investment', isPDA);
+        const shortBtn    = mkBtn('📈 Short-Term',      isPDA, '#e67e22', '#d35400');
+        const longBtn     = mkBtn('🏆 Long-Term',        isPDA, '#27ae60', '#1e8449');
+        const settingsBtn = mkBtn('⚙️ Settings',         isPDA, '#8e44ad', '#7d3c98');
+
+        advisorBtn.onclick  = calculateRecommendation;
+        shortBtn.onclick    = showShortTermAnalysis;
+        longBtn.onclick     = showLongTermAnalysis;
+        settingsBtn.onclick = openSettings;
+
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:6px;';
+        row.appendChild(advisorBtn); row.appendChild(shortBtn);
+        row.appendChild(longBtn);    row.appendChild(settingsBtn);
+        expanded.appendChild(row);
+
+        toggleBtn.onclick = () => {
+            expanded.style.display = expanded.style.display === 'none' ? 'flex' : 'none';
+        };
+
+        container.appendChild(expanded);
+        container.appendChild(toggleBtn);
+        document.body.appendChild(container);
+
+        // Inject page badges asynchronously if we have a key
+        if (apiKey) {
+            fetchAndRecordPrices().then(({ prices, history }) => {
+                injectPageBadges(prices, history);
+            }).catch(() => {});
+        }
+    }
+
+    function mkBtn(label, isPDA, bg1='#667eea', bg2='#764ba2') {
+        const b = document.createElement('button');
+        b.innerHTML = label;
+        b.style.cssText = `padding:${isPDA?'7px 10px':'9px 14px'};background:linear-gradient(135deg,${bg1} 0%,${bg2} 100%);color:white;border:none;border-radius:8px;font-weight:bold;cursor:pointer;box-shadow:0 4px 6px rgba(0,0,0,.3);font-size:${isPDA?'12px':'13px'};transition:all .3s ease;white-space:nowrap;`;
+        b.onmouseover = () => { b.style.transform='translateY(-2px)'; b.style.boxShadow='0 6px 10px rgba(0,0,0,.4)'; };
+        b.onmouseout  = () => { b.style.transform='translateY(0)';    b.style.boxShadow='0 4px 6px rgba(0,0,0,.3)'; };
+        return b;
+    }
+
+    // ─── Notification ─────────────────────────────────────────────────────────
+    function showNotification(message, type='info') {
+        const bg = type==='error'?'#c0392b':type==='success'?'#27ae60':'#2980b9';
+        const n = document.createElement('div');
+        n.style.cssText = `position:fixed;top:80px;right:20px;z-index:100000;padding:20px 25px 20px 20px;background:${bg};color:white;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.4);max-width:420px;font-size:14px;line-height:1.6;display:flex;gap:15px;align-items:flex-start;`;
+        const msg = document.createElement('div'); msg.innerHTML = message; msg.style.flex='1';
+        const x = document.createElement('button');
+        x.innerHTML='✕'; x.style.cssText='background:rgba(255,255,255,.2);border:none;color:white;width:24px;height:24px;border-radius:4px;cursor:pointer;font-size:16px;line-height:1;padding:0;flex-shrink:0;';
+        x.onclick=()=>n.remove();
+        n.appendChild(msg); n.appendChild(x);
+        ensureStyle();
+        document.body.appendChild(n);
+        setTimeout(()=>n.remove(), 8000);
+    }
+
+    function ensureStyle() {
+        if (document.getElementById('sadv-css')) return;
+        const s = document.createElement('style'); s.id='sadv-css';
+        s.textContent = `
+            .sadv-modal { background:#1a1a2e; border-radius:16px; padding:28px; max-width:560px; width:94%; max-height:85vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,.8); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+            .sadv-backdrop { position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:100001;display:flex;justify-content:center;align-items:center; }
+            .sadv-card { background:#16213e; border-radius:12px; padding:16px; margin-bottom:14px; border-left:4px solid #667eea; display:flex; gap:14px; align-items:center; }
+            .sadv-card-body { flex:1; }
+            .sadv-rank { width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:15px;flex-shrink:0; }
+            .sadv-logo { width:52px;height:52px;border-radius:10px;padding:6px;background:rgba(255,255,255,.05);flex-shrink:0; }
+            .sadv-ticker { font-size:20px;font-weight:900;letter-spacing:1px;color:#e0e0ff; }
+            .sadv-perf-pill { display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:bold;font-family:monospace;margin-left:8px; }
+            .sadv-metric { font-size:12px;color:#aab;margin-top:3px; }
+            .sadv-desc { font-size:12px;color:#8892b0;margin-top:5px;font-style:italic; }
+            .sadv-section-title { color:#a0aec0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;margin:0 0 12px 0; }
+            .sadv-h { color:#e0e0ff;font-size:18px;font-weight:bold;margin:0 0 6px 0; }
+            .sadv-sub { color:#8892b0;font-size:13px;margin:0 0 20px 0; }
+            .sadv-close { float:right;background:rgba(255,255,255,.1);border:none;color:#aaa;width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:18px;line-height:1; }
+            .sadv-close:hover { background:rgba(255,255,255,.2);color:white; }
+            .sadv-warn { background:#2d2200;border:1px solid #ffc107;border-radius:8px;padding:10px 14px;color:#ffc107;font-size:12px;margin-bottom:16px; }
+            .sadv-link { display:inline-block;margin-top:8px;padding:6px 14px;background:rgba(102,126,234,.2);border:1px solid #667eea;border-radius:6px;color:#a0b4ff;font-size:12px;text-decoration:none; }
+            .sadv-link:hover { background:rgba(102,126,234,.4); }
+            .sadv-no-data { text-align:center;padding:30px;color:#555; }
+            .sadv-bars { display:flex;gap:2px;align-items:flex-end;height:24px;margin-top:6px; }
+            .sadv-bar { width:6px;border-radius:2px 2px 0 0; }
+        `;
+        document.head.appendChild(s);
+    }
+
+    function openModal(contentEl) {
+        ensureStyle();
+        const backdrop = document.createElement('div');
+        backdrop.className = 'sadv-backdrop';
+        const modal = document.createElement('div');
+        modal.className = 'sadv-modal';
+        modal.appendChild(contentEl);
+        backdrop.appendChild(modal);
+        backdrop.onclick = e => { if (e.target === backdrop) backdrop.remove(); };
+        document.body.appendChild(backdrop);
+        return backdrop;
+    }
+
+    // ─── Mini sparkline from history ──────────────────────────────────────────
+    function sparklineHTML(history, acronym) {
+        const data = history[acronym];
+        if (!data || data.length < 3) return '';
+        // Take last 14 points
+        const points = data.slice(-14).map(d => d.p);
+        const min = Math.min(...points);
+        const max = Math.max(...points);
+        const range = max - min || 1;
+        const bars = points.map(p => {
+            const h = Math.max(3, Math.round(((p - min) / range) * 20));
+            const pct = ((p - min) / range) * 100;
+            const col = pct > 60 ? '#4caf50' : pct > 35 ? '#ffc107' : '#f44336';
+            return `<div class="sadv-bar" style="height:${h}px;background:${col};"></div>`;
+        }).join('');
+        return `<div class="sadv-bars">${bars}</div>`;
+    }
+
+    // ─── Short-Term Analysis ──────────────────────────────────────────────────
+    async function showShortTermAnalysis() {
+        ensureStyle();
+        if (!apiKey) {
+            const k = prompt('Enter your Torn API key:');
+            if (!k) return;
+            saveApiKey(k);
+        }
+
+        const auth = await checkAuthorization(apiKey);
+        if (!auth.authorized) { showNotification(auth.error, 'error'); return; }
+
+        showNotification('Fetching live market data…', 'info');
+
+        let prices, history, tornData;
+        try {
+            ({ prices, history, tornData } = await fetchAndRecordPrices());
+        } catch(e) { showNotification('Failed to fetch market data: ' + e.message, 'error'); return; }
+
+        // Build performance table for all stocks
+        const allStocks = (tornData.stocks || []).map(s => {
+            const acronym = STOCK_MAP[s.id];
+            if (!acronym) return null;
+            const pct24  = getPctChange(history, acronym, 24);
+            const pct7d  = getPctChange(history, acronym, 168);
+            const ageH   = historyAgeHours(history, acronym);
+            return { acronym, price: s.market?.price || 0, pct24, pct7d, ageH, stockData: s };
+        }).filter(Boolean);
+
+        // Short-term ranking: sort by 24h performance (stocks we actually have history for first)
+        const withData    = allStocks.filter(s => s.pct24 !== null).sort((a,b) => b.pct24 - a.pct24);
+        const withoutData = allStocks.filter(s => s.pct24 === null);
+        const sorted = [...withData, ...withoutData];
+
+        const top3 = withData.filter(s => s.pct24 > 0).slice(0, 3);
+        const hasEnoughHistory = allStocks.filter(s => s.ageH >= 24).length >= 5;
+
+        const content = document.createElement('div');
+
+        // Header
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;';
+        hdr.innerHTML = `<h2 class="sadv-h">📈 Short-Term Analysis</h2>`;
+        const closeBtn = document.createElement('button');
+        closeBtn.className='sadv-close'; closeBtn.innerHTML='✕';
+        closeBtn.onclick=()=>backdrop.remove();
+        hdr.appendChild(closeBtn);
+        content.appendChild(hdr);
+
+        const sub = document.createElement('p');
+        sub.className = 'sadv-sub';
+        sub.textContent = 'Stocks ranked by recent price momentum. Best for overnight or short holds.';
+        content.appendChild(sub);
+
+        if (!hasEnoughHistory) {
+            const warn = document.createElement('div');
+            warn.className = 'sadv-warn';
+            warn.innerHTML = `⚠️ <strong>Building price history…</strong> Come back after a few sessions for accurate 24h trends. Showing live prices for now.`;
+            content.appendChild(warn);
+        }
+
+        // Top 3 recommendations
+        if (top3.length) {
+            const secTitle = document.createElement('p');
+            secTitle.className = 'sadv-section-title';
+            secTitle.textContent = '🔥 Top Momentum Picks';
+            content.appendChild(secTitle);
+
+            const medals = ['🥇','🥈','🥉'];
+            top3.forEach((s, i) => {
+                const p = perf(s.pct24);
+                const p7 = perf(s.pct7d);
+                const arrow = trendArrow(s.pct24);
+                const stockId = Object.keys(STOCK_MAP).find(k => STOCK_MAP[k] === s.acronym);
+
+                const card = document.createElement('div');
+                card.className = 'sadv-card';
+                card.style.borderLeftColor = p.border;
+                card.style.background = p.bg.replace('0.3','0.15');
+
+                card.innerHTML = `
+                    <div class="sadv-rank" style="background:${p.border}22;color:${p.border};">${medals[i]}</div>
+                    <img class="sadv-logo" src="${STOCK_IMAGES[s.acronym]}" alt="${s.acronym}">
+                    <div class="sadv-card-body">
+                        <div>
+                            <span class="sadv-ticker">${s.acronym}</span>
+                            <span class="sadv-perf-pill" style="background:${p.bg};border:1px solid ${p.border};color:${p.textColor};">${arrow} ${p.label}</span>
+                        </div>
+                        <div class="sadv-metric">
+                            Price: <strong style="color:#e0e0ff;">${formatMoney(s.price)}</strong>
+                            ${s.pct7d !== null ? `&nbsp;·&nbsp; 7d: <span style="color:${p7.textColor};">${p7.label}</span>` : ''}
+                        </div>
+                        ${sparklineHTML(history, s.acronym)}
+                        <div style="margin-top:8px;">
+                            <a class="sadv-link" href="https://www.torn.com/page.php?sid=stocks&stockID=${stockId}&tab=owned">Buy ${s.acronym} →</a>
+                        </div>
+                    </div>`;
+                content.appendChild(card);
+            });
+        } else {
+            const nd = document.createElement('div');
+            nd.className = 'sadv-no-data';
+            nd.innerHTML = `<div style="font-size:36px;margin-bottom:10px;">📊</div><div style="color:#667;">No upward momentum detected yet.<br>Data is being collected.</div>`;
+            content.appendChild(nd);
+        }
+
+        // Full market table
+        const secTitle2 = document.createElement('p');
+        secTitle2.className = 'sadv-section-title';
+        secTitle2.style.marginTop = '20px';
+        secTitle2.textContent = 'All Stocks — 24h Performance';
+        content.appendChild(secTitle2);
+
+        const table = document.createElement('div');
+        table.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;';
+
+        sorted.forEach(s => {
+            const p = perf(s.pct24);
+            const arrow = trendArrow(s.pct24);
+            const pill = document.createElement('div');
+            pill.style.cssText = `background:${p.bg};border:1px solid ${p.border};border-radius:8px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center;cursor:default;`;
+            pill.title = `${s.acronym}: ${p.label}`;
+            pill.innerHTML = `
+                <span style="font-weight:bold;color:#e0e0ff;font-size:13px;">${s.acronym}</span>
+                <span style="color:${p.textColor};font-size:12px;font-family:monospace;">${s.pct24 !== null ? p.label : '–'} ${arrow}</span>
+            `;
+            table.appendChild(pill);
+        });
+        content.appendChild(table);
+
+        const backdrop = openModal(content);
+    }
+
+    // ─── Long-Term Analysis ───────────────────────────────────────────────────
+    async function showLongTermAnalysis() {
+        ensureStyle();
+        if (!apiKey) {
+            const k = prompt('Enter your Torn API key:');
+            if (!k) return;
+            saveApiKey(k);
+        }
+
+        const auth = await checkAuthorization(apiKey);
+        if (!auth.authorized) { showNotification(auth.error, 'error'); return; }
+
+        showNotification('Fetching your portfolio data…', 'info');
+
+        let prices, history, tornData;
+        try {
+            ({ prices, history, tornData } = await fetchAndRecordPrices());
+        } catch(e) { showNotification('API error: ' + e.message, 'error'); return; }
+
+        // Get user's current stock increments
+        const sd = await fetchAPI(`https://api.torn.com/v2/user/stocks?key=${apiKey}`);
+        const userStocks = {};
+        for (const si of (sd.stocks || [])) {
+            const acronym = STOCK_MAP[si.id]; if (!acronym) continue;
+            const ts = tornData.stocks?.find(s => s.id === si.id);
+            const base = ts?.bonus?.requirement || 0;
+            if (si.bonus?.increment > 0) {
+                let actual = 0;
+                for (let i=1;i<=4;i++){const need=i===1?base:(base*Math.pow(2,i))-base;if(si.shares>=need) actual=i; else break;}
+                userStocks[acronym] = actual;
+            } else { userStocks[acronym] = 0; }
+        }
+
+        // Refresh investment table costs with live prices
+        if (INVESTMENT_TABLE) {
+            INVESTMENT_TABLE = INVESTMENT_TABLE.map(inv => {
+                const id = Object.keys(STOCK_MAP).find(k => STOCK_MAP[k] === inv.acronym);
+                const ts = tornData.stocks?.find(s => s.id == id);
+                const price = ts?.market?.price || inv.current_price || 0;
+                return {...inv, cost: inv.shares_to_buy * price, current_price: price};
+            });
+        }
+
+        // Find next 3 investments the user needs to make
+        const savedInv = localStorage.getItem(INVESTMENTS_KEY);
+        if (savedInv) investmentPreferences = {...investmentPreferences, ...JSON.parse(savedInv)};
+
+        const nextInvestments = [];
+        for (const inv of (INVESTMENT_TABLE || [])) {
+            if (nextInvestments.length >= 3) break;
+            const k = getInvestmentKey(inv.acronym, inv.increment);
+            if (investmentPreferences[k] === false) continue;
+            if ((userStocks[inv.acronym] || 0) < inv.increment) nextInvestments.push(inv);
+        }
+
+        // For each next investment, get 7d performance
+        const content = document.createElement('div');
+
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;';
+        hdr.innerHTML = `<h2 class="sadv-h">🏆 Long-Term Investment Plan</h2>`;
+        const closeBtn = document.createElement('button');
+        closeBtn.className='sadv-close'; closeBtn.innerHTML='✕';
+        closeBtn.onclick=()=>backdrop.remove();
+        hdr.appendChild(closeBtn);
+        content.appendChild(hdr);
+
+        const sub = document.createElement('p');
+        sub.className='sadv-sub';
+        sub.textContent = 'Your next 3 bonus investments ranked by ROI. Sorted using the original author\'s priority list.';
+        content.appendChild(sub);
+
+        if (!nextInvestments.length) {
+            const nd = document.createElement('div');
+            nd.className='sadv-no-data';
+            nd.innerHTML='<div style="font-size:36px;margin-bottom:10px;">🎉</div><div style="color:#4caf50;font-size:16px;font-weight:bold;">All investments complete!</div>';
+            content.appendChild(nd);
+        } else {
+            const medals = ['🥇','🥈','🥉'];
+            nextInvestments.forEach((inv, i) => {
+                const pct7d  = getPctChange(history, inv.acronym, 168);
+                const pct24  = getPctChange(history, inv.acronym, 24);
+                const p7  = perf(pct7d);
+                const p24 = perf(pct24);
+                const stockId = Object.keys(STOCK_MAP).find(k => STOCK_MAP[k] === inv.acronym);
+                const rankInOrder = ORIGINAL_ORDER.indexOf(getInvestmentKey(inv.acronym, inv.increment)) + 1;
+
+                // Estimate value
+                const benefitStr = inv.description || '';
+
+                const card = document.createElement('div');
+                card.className = 'sadv-card';
+                card.style.borderLeftColor = '#667eea';
+
+                card.innerHTML = `
+                    <div class="sadv-rank" style="background:#667eea22;color:#a0b4ff;">${medals[i]}</div>
+                    <img class="sadv-logo" src="${STOCK_IMAGES[inv.acronym]}" alt="${inv.acronym}">
+                    <div class="sadv-card-body">
+                        <div>
+                            <span class="sadv-ticker">${inv.acronym}</span>
+                            <span style="color:#8892b0;font-size:13px;margin-left:6px;">Inc ${inv.increment}</span>
+                            ${pct24 !== null ? `<span class="sadv-perf-pill" style="background:${p24.bg};border:1px solid ${p24.border};color:${p24.textColor};">${trendArrow(pct24)} ${p24.label}</span>` : ''}
+                        </div>
+                        <div class="sadv-metric">
+                            Cost: <strong style="color:#e0e0ff;">${formatMoney(inv.cost)}</strong>
+                            &nbsp;·&nbsp; Shares: <strong style="color:#e0e0ff;">${inv.shares_to_buy.toLocaleString()}</strong>
+                        </div>
+                        <div class="sadv-metric">
+                            Priority rank: <strong style="color:#a0b4ff;">#${rankInOrder}</strong>
+                            ${pct7d !== null ? `&nbsp;·&nbsp; 7d trend: <span style="color:${p7.textColor};">${p7.label}</span>` : ''}
+                        </div>
+                        <div class="sadv-desc">Benefit: ${benefitStr} × ${inv.monthlyMult}/mo</div>
+                        ${sparklineHTML(history, inv.acronym)}
+                        <div style="margin-top:8px;">
+                            <a class="sadv-link" href="https://www.torn.com/page.php?sid=stocks&stockID=${stockId}&tab=owned">Invest in ${inv.acronym} →</a>
+                        </div>
+                    </div>`;
+                content.appendChild(card);
+            });
+        }
+
+        // "What you're excluding" section — stocks already done
+        const doneStocks = Object.entries(userStocks).filter(([,v]) => v > 0);
+        if (doneStocks.length) {
+            const secTitle = document.createElement('p');
+            secTitle.className='sadv-section-title';
+            secTitle.style.marginTop='22px';
+            secTitle.textContent = 'Your Current Bonus Holdings';
+            content.appendChild(secTitle);
+
+            const grid = document.createElement('div');
+            grid.style.cssText='display:flex;flex-wrap:wrap;gap:8px;';
+            doneStocks.forEach(([acronym, inc]) => {
+                const pct = getPctChange(history, acronym, 24);
+                const p = perf(pct);
+                const chip = document.createElement('div');
+                chip.style.cssText=`background:#0f3460;border:1px solid #1a5276;border-radius:20px;padding:4px 12px;font-size:12px;color:#a0b4ff;display:flex;align-items:center;gap:6px;`;
+                chip.innerHTML=`<img src="${STOCK_IMAGES[acronym]}" style="width:16px;height:16px;"> ${acronym} Inc ${inc} <span style="color:${p.textColor};">${pct!==null?p.label:''}</span>`;
+                grid.appendChild(chip);
+            });
+            content.appendChild(grid);
+        }
+
+        // Excluded stocks note
+        const excNote = document.createElement('p');
+        excNote.style.cssText='font-size:11px;color:#555;margin-top:18px;';
+        excNote.textContent = `Note: ${[...EXCLUDED_STOCKS].join(', ')} are excluded from the long-term plan (poor bonus ROI per the original author's analysis).`;
+        content.appendChild(excNote);
+
+        const backdrop = openModal(content);
+    }
+
+    // ─── Original "Next Investment" button ────────────────────────────────────
+    async function calculateRecommendation() {
+        if (!apiKey) {
+            const k = prompt('Enter your Torn API key (Limited or Full access):');
+            if (!k) { showNotification('API key required.','error'); return; }
+            saveApiKey(k);
+        }
+
+        showNotification('Loading…','info');
+        const auth = await checkAuthorization(apiKey);
+        if (!auth.authorized) { if (auth.error?.includes('Invalid')) clearApiKey(); showNotification(auth.error,'error'); return; }
+        if (!INVESTMENT_TABLE?.length) { showNotification('Failed to load investment data.','error'); return; }
+
+        const savedInv = localStorage.getItem(INVESTMENTS_KEY);
+        if (savedInv) investmentPreferences = {...investmentPreferences, ...JSON.parse(savedInv)};
+
+        showNotification('Calculating…','info');
+
+        try {
+            const moneyData    = await fetchAPI(`https://api.torn.com/v2/user/money?key=${apiKey}`);
+            const networthData = await fetchAPI(`https://api.torn.com/v2/user?selections=networth&key=${apiKey}`);
+            const money = moneyData.money; const nw = networthData.networth;
+
+            let balance = 0;
+            if (settings.wallet)       balance += money.wallet||0;
+            if (settings.bank)         balance += money.city_bank?.amount||0;
+            if (settings.cayman)       balance += money.cayman_bank||0;
+            if (settings.vault)        balance += money.vault||0;
+            if (settings.factionMoney) balance += money.faction?.money||0;
+            if (settings.company)      balance += money.company||0;
+            if (settings.pending)      balance += nw.pending||0;
+            if (settings.points)       balance += nw.points||0;
+            if (settings.piggybank)    balance += nw.piggybank||0;
+            if (settings.items)        balance += nw.items||0;
+            if (settings.displaycase)  balance += nw.displaycase||0;
+            if (settings.bazaar)       balance += nw.bazaar||0;
+            if (settings.trade)        balance += nw.trade||0;
+            if (settings.itemmarket)   balance += nw.itemmarket||0;
+            if (settings.properties)   balance += nw.properties||0;
+            if (settings.auctionhouse) balance += nw.auctionhouse||0;
+            if (settings.bookie)       balance += nw.bookie||0;
+            if (settings.enlistedcars) balance += nw.enlistedcars||0;
+            if (settings.loan)         balance += nw.loan||0;
+            if (settings.unpaidfees)   balance += nw.unpaidfees||0;
+
+            if (settings.companyEscrow) {
+                try {
+                    const cd = await fetchAPI(`https://api.torn.com/v2/company?selections=detailed,employees&key=${apiKey}`);
+                    if (!cd.error && cd.company_detailed) {
+                        const weeklyAd=(cd.company_detailed.advertising_budget||0)*7;
+                        let wages=0; for(const[,e] of Object.entries(cd.company_employees||{})) wages+=e.wage||0;
+                        if (companyEscrowPreferences.weeklyAdBudget)  balance-=weeklyAd;
+                        if (companyEscrowPreferences.weeklyWageBudget) balance-=wages*7;
+                    }
+                } catch(_){}
+            }
+
+            const sd = await fetchAPI(`https://api.torn.com/v2/user/stocks?key=${apiKey}`);
+            const { prices, history, tornData } = await fetchAndRecordPrices();
+
+            // Refresh costs
+            INVESTMENT_TABLE = INVESTMENT_TABLE.map(inv => {
+                const id = Object.keys(STOCK_MAP).find(k => STOCK_MAP[k] === inv.acronym);
+                const ts  = tornData.stocks?.find(s => s.id == id);
+                const price = ts?.market?.price || inv.current_price || 0;
+                return {...inv, cost: inv.shares_to_buy * price, current_price: price};
+            });
+
+            const userStocks = {}; let stockTotal = 0;
+            for (const si of (sd.stocks||[])) {
+                const acronym=STOCK_MAP[si.id]; if (!acronym) continue;
+                const ts=tornData.stocks?.find(s=>s.id===si.id);
+                const price=ts?.market?.price||0; const base=ts?.bonus?.requirement||0;
+                if (si.bonus?.increment>0) {
+                    let actual=0;
+                    for(let i=1;i<=4;i++){const need=i===1?base:(base*Math.pow(2,i))-base;if(si.shares>=need) actual=i; else break;}
+                    userStocks[acronym]=actual;
+                    if (settings.extraStockShares) {
+                        const needed=actual===1?base:(base*Math.pow(2,actual))-base;
+                        const extra=si.shares-needed;
+                        if (extra>0 && extraStockPreferences[acronym]!==false) stockTotal+=extra*price;
+                    }
+                } else {
+                    userStocks[acronym]=0;
+                    if (settings.extraStockShares && extraStockPreferences[acronym]!==false) stockTotal+=si.shares*price;
+                }
+            }
+            if (settings.extraStockShares) balance+=stockTotal;
+
+            let next=null;
+            for (const inv of INVESTMENT_TABLE) {
+                const k=getInvestmentKey(inv.acronym,inv.increment);
+                if (investmentPreferences[k]===false) continue;
+                if ((userStocks[inv.acronym]||0)<inv.increment){next=inv;break;}
+            }
+
+            if (!next){showNotification('🎉 All recommended investments complete!','success');return;}
+
+            const canAfford = balance >= next.cost;
+            const shortfall = canAfford ? 0 : next.cost - balance;
+            const stockId   = Object.keys(STOCK_MAP).find(k => STOCK_MAP[k] === next.acronym);
+            const pct24 = getPctChange(history, next.acronym, 24);
+            const p24 = perf(pct24);
+
+            showNotification(`
+                <div style="font-weight:bold;font-size:16px;margin-bottom:10px;">📈 Next Investment</div>
+                <div style="text-align:center;margin:10px 0;">
+                    <img src="${STOCK_IMAGES[next.acronym]}" style="width:70px;height:70px;border-radius:10px;background:rgba(255,255,255,.1);padding:8px;">
+                </div>
+                <div style="margin-bottom:6px;"><strong>${next.acronym}</strong> – Increment ${next.increment}
+                    ${pct24!==null?`<span style="margin-left:8px;padding:1px 7px;border-radius:10px;font-size:11px;background:${p24.bg};border:1px solid ${p24.border};color:${p24.textColor};">${trendArrow(pct24)} ${p24.label}</span>`:''}
+                </div>
+                <div style="margin-bottom:4px;font-size:13px;"><strong>Benefit:</strong> ${next.description}</div>
+                <div style="margin-bottom:4px;font-size:13px;"><strong>Shares:</strong> ${next.shares_to_buy.toLocaleString()}</div>
+                <div style="margin-bottom:4px;font-size:13px;"><strong>Cost:</strong> ${formatMoney(next.cost)}</div>
+                <div style="margin-bottom:8px;font-size:13px;"><strong>Balance:</strong> ${formatMoney(balance)}</div>
+                <div style="padding-top:10px;border-top:1px solid rgba(255,255,255,.2);">
+                    ${canAfford
+                        ? `✅ <strong>You can invest now!</strong><br><a href="https://www.torn.com/page.php?sid=stocks&stockID=${stockId}&tab=owned" style="color:white;text-decoration:underline;">Take me there →</a>`
+                        : `❌ Need ${formatMoney(shortfall)} more.`}
+                </div>`, canAfford ? 'success' : 'info');
+
+            // Inject badges after every calculation
+            injectPageBadges(prices, history);
+
+        } catch(e) { showNotification(`Error: ${e.message}`,'error'); clearApiKey(); }
+    }
+
+    // ─── Settings modal ───────────────────────────────────────────────────────
+    async function openSettings() {
+        ensureStyle();
+        if (!INVESTMENT_TABLE) {
+            const cached = sessionStorage.getItem(INVESTMENT_TABLE_KEY);
+            if (cached) INVESTMENT_TABLE = JSON.parse(cached);
+        }
+
+        const history = loadPriceHistory();
+        const historyCount = Object.keys(history).length;
+        const maxAge = historyCount > 0
+            ? Math.max(...Object.keys(history).map(a => historyAgeHours(history, a)))
+            : 0;
+
+        const content = document.createElement('div');
+
+        const hdr = document.createElement('div');
+        hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;';
+        hdr.innerHTML='<h2 style="margin:0;color:#e0e0ff;font-size:18px;">⚙️ Settings</h2>';
+        const closeBtn = document.createElement('button');
+        closeBtn.className='sadv-close'; closeBtn.innerHTML='✕';
+        closeBtn.onclick=()=>backdrop.remove();
+        hdr.appendChild(closeBtn);
+        content.appendChild(hdr);
+
+        // History status
+        const histInfo = document.createElement('div');
+        histInfo.className='sadv-warn';
+        histInfo.style.marginBottom='16px';
+        if (historyCount === 0) {
+            histInfo.innerHTML='📊 <strong>Price History:</strong> No history yet. Open the Short-Term view or run a calculation to start collecting data.';
+        } else {
+            histInfo.innerHTML=`📊 <strong>Price History:</strong> Tracking ${historyCount} stocks. Oldest data: ~${Math.round(maxAge)}h ago. <button id="clear-history-btn" style="margin-left:8px;padding:2px 8px;background:#c0392b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;">Clear History</button>`;
+        }
+        content.appendChild(histInfo);
+
+        // API key
+        const apiSec = sdiv('margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid #2a2a4a;');
+        apiSec.appendChild(sel('h3','API Key','margin:0 0 8px 0;color:#a0aec0;font-size:14px;font-weight:600;letter-spacing:1px;text-transform:uppercase;'));
+        const apiInput = document.createElement('input');
+        apiInput.type='text'; apiInput.value=apiKey;
+        apiInput.placeholder='Enter your Torn API key';
+        apiInput.style.cssText='width:100%;padding:10px;background:#0f3460;border:1px solid #1a5276;border-radius:8px;font-size:14px;color:#e0e0ff;box-sizing:border-box;';
+        apiSec.appendChild(apiInput);
+        content.appendChild(apiSec);
+
+        // Balance settings
+        const balSec = sdiv('margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid #2a2a4a;');
+        balSec.appendChild(sel('h3','Balance Components','margin:0 0 12px 0;color:#a0aec0;font-size:14px;font-weight:600;letter-spacing:1px;text-transform:uppercase;'));
+
+        const settingsOptions = [
+            {key:'pending',label:'Pending'},{key:'wallet',label:'Wallet'},{key:'bank',label:'Bank'},
+            {key:'cayman',label:'Cayman'},{key:'vault',label:'Vault'},{key:'piggybank',label:'Piggy Bank'},
+            {key:'items',label:'Items'},{key:'displaycase',label:'Display Case'},{key:'bazaar',label:'Bazaar'},
+            {key:'trade',label:'Trade'},{key:'itemmarket',label:'Item Market'},{key:'properties',label:'Properties'},
+            {key:'auctionhouse',label:'Auction House'},{key:'bookie',label:'Bookie'},{key:'enlistedcars',label:'Enlisted Cars'},
+            {key:'loan',label:'Loan'},{key:'unpaidfees',label:'Unpaid Fees'},{key:'points',label:'Points'},
+            {key:'factionMoney',label:'Faction Money'},{key:'company',label:'Company Money'},
+            {key:'companyEscrow',label:'Company Escrow'},{key:'extraStockShares',label:'Extra Stock Shares'}
+        ];
+
+        const grid = sdiv('display:grid;grid-template-columns:repeat(2,1fr);gap:8px;');
+        settingsOptions.forEach(opt => {
+            const row = sdiv('display:flex;align-items:center;gap:8px;padding:6px 8px;background:#0f3460;border-radius:6px;');
+            const cb = document.createElement('input');
+            cb.type='checkbox'; cb.checked=settings[opt.key];
+            cb.style.cssText='width:16px;height:16px;cursor:pointer;accent-color:#667eea;';
+            cb.onchange=e=>{settings[opt.key]=e.target.checked;};
+            const lbl = document.createElement('label');
+            lbl.textContent=opt.label; lbl.style.cssText='color:#c0c8e0;font-size:13px;cursor:pointer;';
+            lbl.onclick=()=>{cb.checked=!cb.checked;settings[opt.key]=cb.checked;};
+            row.appendChild(cb); row.appendChild(lbl);
+            grid.appendChild(row);
+        });
+        balSec.appendChild(grid);
+        content.appendChild(balSec);
+
+        // Investment rankings
+        const invSec = sdiv('margin-bottom:18px;');
+        invSec.appendChild(sel('h3','Investment Rankings','margin:0 0 6px 0;color:#a0aec0;font-size:14px;font-weight:600;letter-spacing:1px;text-transform:uppercase;'));
+        invSec.appendChild(sel('p','Uncheck to skip specific investments:','margin:0 0 12px 0;color:#555;font-size:12px;'));
+
+        if (!INVESTMENT_TABLE?.length) {
+            invSec.appendChild(sel('div','Run a calculation first to load data.','padding:12px;background:#0f3460;border-radius:8px;color:#555;text-align:center;font-size:13px;'));
+        } else {
+            const trow = sdiv('margin-bottom:10px;display:flex;gap:8px;');
+            const selAll = sBtn('Select All','#1a5276');
+            const deselAll = sBtn('Deselect All','#4a2020');
+            selAll.onclick=()=>INVESTMENT_TABLE.forEach(inv=>{
+                const k=getInvestmentKey(inv.acronym,inv.increment); investmentPreferences[k]=true;
+                const cb=document.getElementById(`inv_${k}`); if(cb) cb.checked=true;
+            });
+            deselAll.onclick=()=>INVESTMENT_TABLE.forEach(inv=>{
+                const k=getInvestmentKey(inv.acronym,inv.increment); investmentPreferences[k]=false;
+                const cb=document.getElementById(`inv_${k}`); if(cb) cb.checked=false;
+            });
+            trow.appendChild(selAll); trow.appendChild(deselAll); invSec.appendChild(trow);
+
+            const list = sdiv('max-height:220px;overflow-y:auto;border:1px solid #2a2a4a;border-radius:8px;padding:8px;background:#0a0a1a;');
+            INVESTMENT_TABLE.forEach((inv,idx)=>{
+                const k=getInvestmentKey(inv.acronym,inv.increment);
+                if(investmentPreferences[k]===undefined) investmentPreferences[k]=true;
+                const row=sdiv('margin-bottom:6px;display:flex;align-items:center;gap:8px;padding:5px 8px;background:#0f1930;border-radius:5px;');
+                const cb=document.createElement('input');
+                cb.type='checkbox'; cb.id=`inv_${k}`; cb.checked=investmentPreferences[k];
+                cb.style.cssText='width:14px;height:14px;cursor:pointer;accent-color:#667eea;flex-shrink:0;';
+                cb.onchange=e=>{investmentPreferences[k]=e.target.checked;};
+                const lbl=document.createElement('label');
+                lbl.htmlFor=`inv_${k}`;
+                lbl.textContent=`${idx+1}. ${inv.acronym} Inc${inv.increment} · ${inv.shares_to_buy.toLocaleString()} shares`;
+                lbl.style.cssText='color:#8892b0;font-size:12px;cursor:pointer;font-family:monospace;';
+                row.appendChild(cb); row.appendChild(lbl); list.appendChild(row);
+            });
+            invSec.appendChild(list);
+        }
+        content.appendChild(invSec);
+
+        // Save row
+        const btnRow = sdiv('display:flex;gap:10px;justify-content:flex-end;padding-top:16px;border-top:1px solid #2a2a4a;');
+        const cancelBtn = sBtn('Cancel','#2a2a4a');
+        const saveBtn   = sBtn('💾 Save Settings','#667eea');
+        cancelBtn.onclick=()=>backdrop.remove();
+        saveBtn.onclick=()=>{
+            const nk=apiInput.value.trim();
+            if(nk&&nk!==apiKey) saveApiKey(nk);
+            saveSettings(); saveInvestmentPreferences(); saveExtraStockPreferences(); saveCompanyEscrowPreferences();
+            sessionStorage.removeItem(INVESTMENT_TABLE_KEY); INVESTMENT_TABLE=null;
+            backdrop.remove();
+            showNotification('Settings saved!','success');
+        };
+        btnRow.appendChild(cancelBtn); btnRow.appendChild(saveBtn);
+        content.appendChild(btnRow);
+
+        const backdrop = openModal(content);
+
+        // Wire clear history button
+        const clrBtn = document.getElementById('clear-history-btn');
+        if (clrBtn) clrBtn.onclick=()=>{
+            if (confirm('Clear all price history? This resets color coding.')) {
+                localStorage.removeItem(PRICE_HISTORY_KEY);
+                backdrop.remove();
+                showNotification('Price history cleared.','info');
+            }
+        };
+    }
+
+    // ─── Settings DOM helpers ─────────────────────────────────────────────────
+    function sdiv(css) { const d=document.createElement('div'); d.style.cssText=css; return d; }
+    function sel(tag,text,css) { const e=document.createElement(tag); e.textContent=text; e.style.cssText=css; return e; }
+    function sBtn(label,bg) {
+        const b=document.createElement('button');
+        b.textContent=label;
+        b.style.cssText=`padding:8px 16px;background:${bg};color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;`;
+        return b;
+    }
+
+    // ─── Balance HTML (for settings) ──────────────────────────────────────────
+    async function buildBalanceHTML() {
+        const moneyData    = await fetchAPI(`https://api.torn.com/v2/user/money?key=${apiKey}`);
+        const networthData = await fetchAPI(`https://api.torn.com/v2/user?selections=networth&key=${apiKey}`);
+        const money=moneyData.money; const nw=networthData.networth;
+        let html=''; let total=0;
+        const items=[
+            {key:'wallet',label:'Wallet',value:money.wallet||0},
+            {key:'bank',label:'Bank',value:money.city_bank?.amount||0},
+            {key:'cayman',label:'Cayman',value:money.cayman_bank||0},
+            {key:'vault',label:'Vault',value:money.vault||0},
+            {key:'pending',label:'Pending',value:nw.pending||0},
+            {key:'points',label:'Points',value:nw.points||0},
+            {key:'piggybank',label:'Piggy Bank',value:nw.piggybank||0},
+            {key:'items',label:'Items',value:nw.items||0},
+            {key:'displaycase',label:'Display Case',value:nw.displaycase||0},
+            {key:'bazaar',label:'Bazaar',value:nw.bazaar||0},
+            {key:'trade',label:'Trade',value:nw.trade||0},
+            {key:'itemmarket',label:'Item Market',value:nw.itemmarket||0},
+            {key:'properties',label:'Properties',value:nw.properties||0},
+            {key:'auctionhouse',label:'Auction House',value:nw.auctionhouse||0},
+            {key:'bookie',label:'Bookie',value:nw.bookie||0},
+            {key:'enlistedcars',label:'Enlisted Cars',value:nw.enlistedcars||0},
+            {key:'loan',label:'Loan',value:nw.loan||0},
+            {key:'unpaidfees',label:'Unpaid Fees',value:nw.unpaidfees||0},
+        ];
+        items.forEach(c=>{if(settings[c.key]&&c.value){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>${c.label}:</strong> ${formatMoney(c.value)}</div>`;total+=c.value;}});
+        if(settings.factionMoney){const v=money.faction?.money||0;if(v){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>Faction Money:</strong> ${formatMoney(v)}</div>`;total+=v;}}
+        if(settings.company){const v=money.company||0;if(v){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>Company Money:</strong> ${formatMoney(v)}</div>`;total+=v;}}
+        html+=`<div style="margin-top:12px;padding-top:10px;border-top:1px solid #2a2a4a;font-weight:bold;color:#e0e0ff;">Total: ${formatMoney(total)}</div>`;
+        return html;
+    }
+
+    // ─── Init ─────────────────────────────────────────────────────────────────
+    if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', createButton);
+    else createButton();
+
+})();
