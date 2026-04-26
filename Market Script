@@ -291,7 +291,11 @@
 
   function isCorrectMarketPage() {
     if (!window.location.href.includes('sid=ItemMarket')) return false;
-    return Array.from(document.querySelectorAll('*')).some(el => clean(el.textContent) === 'Owner');
+    const els = document.querySelectorAll('th, td, span, div');
+    for (const el of els) {
+      if (el.childElementCount === 0 && clean(el.textContent) === 'Owner') return true;
+    }
+    return false;
   }
 
   // ── UI cleanup ────────────────────────────────────────────────
@@ -318,7 +322,7 @@
   function getHeader() { return document.querySelector('h4'); }
 
   function getMarketItemName() {
-    for (const el of document.querySelectorAll('*')) {
+    for (const el of document.querySelectorAll('h4, h3, h2, span, div')) {
       const text = clean(el.textContent);
       if (text && text.length < 40 && !text.includes('$') && !text.includes('Owner') && !text.includes('Search') &&
           el.nextElementSibling && clean(el.nextElementSibling.textContent).includes('Owner'))
@@ -559,10 +563,10 @@
   //  SCRIPT 2 — PRICE TRACKER (browse/bazaar)
   // ─────────────────────────────────────────────
 
-  var TRACKER_DONE = 'data-tpda';
-  var TRACKER_KEY  = 'TPDA_v5';
-  var TRACKER_MAX  = 30;
-  var PRUNE_KEY    = 'TPDA_last_prune';
+  const TRACKER_DONE = 'data-tpda';
+  const TRACKER_KEY  = 'TPDA_v5';
+  const TRACKER_MAX  = 30;
+  const PRUNE_KEY    = 'TPDA_last_prune';
 
   ['v3','v4','v5','v6','v7','v8'].forEach(function(v) {
     document.querySelectorAll('[data-tpda-'+v+']').forEach(function(el) { el.remove(); });
@@ -572,40 +576,40 @@
   function trackerSave(d) { try { localStorage.setItem(TRACKER_KEY,JSON.stringify(d)); } catch(e) {} }
 
   function pad(n) { return ('0'+n).slice(-2); }
-  function todayStr() { var d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function todayStr() { const d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
 
   function record(h, name, price) {
     if (!h[name]) h[name]={};
-    var k=todayStr(), e=h[name][k]||{hi:price,lo:price};
+    const k=todayStr(), e=h[name][k]||{hi:price,lo:price};
     if (price>e.hi) e.hi=price;
     if (price<e.lo) e.lo=price;
     h[name][k]=e;
-    var cut=new Date(); cut.setDate(cut.getDate()-TRACKER_MAX);
-    var cs=cut.getFullYear()+'-'+pad(cut.getMonth()+1)+'-'+pad(cut.getDate());
+    const cut=new Date(); cut.setDate(cut.getDate()-TRACKER_MAX);
+    const cs=cut.getFullYear()+'-'+pad(cut.getMonth()+1)+'-'+pad(cut.getDate());
     Object.keys(h[name]).forEach(function(k){ if(k<cs) delete h[name][k]; });
   }
 
   function trackerStats(h, name) {
-    var v=Object.values(h[name]||{}); if(!v.length) return null;
-    var lo=Infinity, hi=-Infinity;
+    const v=Object.values(h[name]||{}); if(!v.length) return null;
+    let lo=Infinity, hi=-Infinity;
     v.forEach(function(e){ if(e.lo<lo)lo=e.lo; if(e.hi>hi)hi=e.hi; });
     return {lo:lo,hi:hi,avg:(lo+hi)/2,days:v.length};
   }
 
   function pruneLowest() {
-    var now=Date.now(), last=parseInt(localStorage.getItem(PRUNE_KEY)||'0',10);
+    const now=Date.now(), last=parseInt(localStorage.getItem(PRUNE_KEY)||'0',10);
     if(now-last<3600000) return;
     localStorage.setItem(PRUNE_KEY,String(now));
-    var h=trackerLoad(), changed=false;
+    const h=trackerLoad(); let changed=false;
     Object.keys(h).forEach(function(name) {
-      var days=h[name], dates=Object.keys(days);
+      const days=h[name], dates=Object.keys(days);
       if(dates.length<2) return;
-      var lowestDate=null, lowestVal=Infinity;
+      let lowestDate=null, lowestVal=Infinity;
       dates.forEach(function(d){ if(days[d].lo<lowestVal){lowestVal=days[d].lo;lowestDate=d;} });
       if(!lowestDate) return;
-      var otherLos=dates.filter(function(d){return d!==lowestDate;}).map(function(d){return days[d].lo;});
+      const otherLos=dates.filter(function(d){return d!==lowestDate;}).map(function(d){return days[d].lo;});
       if(!otherLos.length) return;
-      var otherAvg=otherLos.reduce(function(a,b){return a+b;},0)/otherLos.length;
+      const otherAvg=otherLos.reduce(function(a,b){return a+b;},0)/otherLos.length;
       if(lowestVal<otherAvg*0.5){ days[lowestDate].lo=Math.min.apply(null,otherLos); h[name]=days; changed=true; }
     });
     if(changed) trackerSave(h);
@@ -617,19 +621,19 @@
     return '$'+Math.round(n);
   }
   function parseDollar(s) {
-    s=s.replace(/[$,\s]/g,'');
-    if(/k$/i.test(s)) return parseFloat(s)*1e3;
-    if(/m$/i.test(s)) return parseFloat(s)*1e6;
-    return parseFloat(s);
+    const n=s.replace(/[$,\s]/g,'');
+    if(/k$/i.test(n)) return parseFloat(n)*1e3;
+    if(/m$/i.test(n)) return parseFloat(n)*1e6;
+    return parseFloat(n);
   }
   function getTrackerPrice(text) {
-    var m=text.match(/\$([\d,]+(?:\.\d+)?[km]?)/i); if(!m) return 0;
-    var p=parseDollar(m[0]); return(isNaN(p)||p<=0||p>1e9)?0:p;
+    const m=text.match(/\$([\d,]+(?:\.\d+)?[km]?)/i); if(!m) return 0;
+    const p=parseDollar(m[0]); return(isNaN(p)||p<=0||p>1e9)?0:p;
   }
   function getTrackerName(text) {
-    var lines=text.split(/[\n\r\t]+/);
-    for(var i=0;i<lines.length;i++){
-      var l=lines[i].trim();
+    const lines=text.split(/[\n\r\t]+/);
+    for(let i=0;i<lines.length;i++){
+      const l=lines[i].trim();
       if(l.length>=2&&l.length<=55&&/^[A-Za-z]/.test(l)&&!/^\$/.test(l)&&!/^\(?\d[\d,]*\)?$/.test(l)) return l;
     }
     return null;
@@ -637,11 +641,11 @@
   function isItemCard(text) { return /\$[\d,]+(?:\.\d+)?[km]?\s*\([\d,]+\)/i.test(text); }
 
   function findCard(img) {
-    var el=img.parentElement;
-    for(var i=0;i<12;i++){
+    let el=img.parentElement;
+    for(let i=0;i<12;i++){
       if(!el||el===document.body) return null;
       if(el.hasAttribute(TRACKER_DONE)) return null;
-      var t=el.innerText||'';
+      const t=el.innerText||'';
       if(t.length>=10&&t.length<=180&&isItemCard(t)) return el;
       el=el.parentElement;
     }
@@ -650,9 +654,9 @@
 
   function dealInfo(price, st) {
     if(!st) return{color:'#444',label:'—',pct:2};
-    var range=st.hi-st.lo;
+    const range=st.hi-st.lo;
     if(range<1) return{color:'#666',label:'Flat',pct:50};
-    var p=Math.min(1,Math.max(0,(price-st.lo)/range)), pct=p*100;
+    const p=Math.min(1,Math.max(0,(price-st.lo)/range)), pct=p*100;
     if(p<=0.20) return{color:'#2ecc71',label:'🔥 Great',pct:pct};
     if(p<=0.40) return{color:'#58d68d',label:'✅ Good', pct:pct};
     if(p>=0.80) return{color:'#e74c3c',label:'🚫 Pricey',pct:pct};
@@ -661,8 +665,8 @@
   }
 
   function buildBar(price, st) {
-    var d=dealInfo(price,st), color=d.color, label=d.label, pct=d.pct, hasData=st&&st.days>=1;
-    var bar=document.createElement('div');
+    const d=dealInfo(price,st), color=d.color, label=d.label, pct=d.pct, hasData=st&&st.days>=1;
+    const bar=document.createElement('div');
     bar.setAttribute(TRACKER_DONE+'-bar','1');
     bar.style.cssText='display:block;width:100%;box-sizing:border-box;padding:6px 10px 7px;background:#111;border-top:1px solid '+color+'33;font-family:-apple-system,Helvetica Neue,sans-serif;pointer-events:none;user-select:none;';
     if(!hasData){ bar.innerHTML='<div style="text-align:center;color:#333;font-size:9px;letter-spacing:.08em;">TRACKING</div>'; return bar; }
@@ -685,14 +689,14 @@
 
   function scan() {
     if(document.hidden) return;
-    var hist=trackerLoad(), changed=false, imgs=document.querySelectorAll('img');
-    for(var i=0;i<imgs.length;i++){
+    const hist=trackerLoad(), imgs=document.querySelectorAll('img'); let changed=false;
+    for(let i=0;i<imgs.length;i++){
       try{
-        var card=findCard(imgs[i]);
+        const card=findCard(imgs[i]);
         if(!card||card.hasAttribute(TRACKER_DONE)) continue;
-        var text=card.innerText||'';
-        var price=getTrackerPrice(text); if(!price) continue;
-        var name=getTrackerName(text);   if(!name)  continue;
+        const text=card.innerText||'';
+        const price=getTrackerPrice(text); if(!price) continue;
+        const name=getTrackerName(text);   if(!name)  continue;
         card.setAttribute(TRACKER_DONE,'1');
         card.style.overflow='visible'; card.style.height='auto';
         record(hist,name,price); changed=true;
