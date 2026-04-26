@@ -1,0 +1,757 @@
+// ==UserScript==
+// @name         Torn PDA Market Suite
+// @namespace    torn-market-suite-v1
+// @version      1.1
+// @match        https://www.torn.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ─────────────────────────────────────────────
+  //  SCRIPT 1 — MARKET BASE & SELL PAGE HELPERS
+  // ─────────────────────────────────────────────
+
+  const BOX_ID          = 'tpda-market-box';
+  const BADGE_CLASS     = 'tpda-spread-badge';
+  const HILITE_CLASS    = 'tpda-row-hilite';
+  const SELL_HELPER_CLASS  = 'tpda-sell-helper';
+  const ROW_FILL_BTN_CLASS = 'tpda-row-fill-btn';
+  const STORAGE_KEY        = 'tpda_item_baselines_by_id_v2';
+  const SETTINGS_KEY       = 'tpda_settings_v1';
+  const SETTINGS_BTN_ID    = 'tpda-settings-btn';
+  const SETTINGS_MODAL_ID  = 'tpda-settings-modal';
+
+  // ── Settings (loaded from localStorage, overridable via UI) ──
+  const DEFAULT_SETTINGS = {
+    minProfit:          10000,
+    minROI:             0.25,
+    buffer:             0,
+    baselinePercentile: 75,
+    wallQty:            200,
+    freshMs:            12,   // hours
+    agingMs:            24,   // hours
+  };
+
+  function loadSettings() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+      return Object.assign({}, DEFAULT_SETTINGS, s);
+    } catch { return Object.assign({}, DEFAULT_SETTINGS); }
+  }
+  function persistSettings(s) {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  }
+
+  let SETTINGS = loadSettings();
+
+  const STALENESS = {
+    get freshMs() { return SETTINGS.freshMs * 3600000; },
+    get agingMs()  { return SETTINGS.agingMs  * 3600000; },
+  };
+
+  // ── Settings UI ──────────────────────────────────────────────
+
+  function removeSettingsModal() {
+    const m = document.getElementById(SETTINGS_MODAL_ID);
+    if (m) m.remove();
+  }
+
+  function openSettingsModal() {
+    removeSettingsModal();
+    const s = loadSettings();
+
+    const overlay = document.createElement('div');
+    overlay.id = SETTINGS_MODAL_ID;
+    overlay.style.cssText = `
+      position:fixed;inset:0;z-index:999999;
+      background:rgba(0,0,0,0.75);
+      display:flex;align-items:center;justify-content:center;
+      font-family:-apple-system,sans-serif;
+    `;
+
+    const modal = document.createElement('div');
+    modal.style.cssText = `
+      background:#111;border:1px solid rgba(255,255,255,0.1);
+      border-radius:14px;padding:20px;width:310px;max-width:92vw;
+      max-height:88vh;overflow-y:auto;
+      box-shadow:0 8px 40px rgba(0,0,0,0.8);
+    `;
+
+    // Title
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:15px;font-weight:800;color:#e5e7eb;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;';
+    title.innerHTML = '<span>⚙ Market Suite Settings</span>';
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'cursor:pointer;color:#6b7280;font-size:16px;';
+    closeBtn.addEventListener('click', removeSettingsModal);
+    title.appendChild(closeBtn);
+    modal.appendChild(title);
+
+    const divider = () => {
+      const d = document.createElement('div');
+      d.style.cssText = 'height:1px;background:rgba(255,255,255,0.07);margin:10px 0;';
+      return d;
+    };
+
+    const field = (label, key, type, hint) => {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'margin-bottom:12px;';
+
+      const lbl = document.createElement('div');
+      lbl.style.cssText = 'font-size:10px;font-weight:700;color:#9ca3af;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px;';
+      lbl.textContent = label;
+      wrap.appendChild(lbl);
+
+      const inp = document.createElement('input');
+      inp.type = type || 'number';
+      inp.dataset.key = key;
+      inp.value = s[key];
+      inp.style.cssText = `
+        width:100%;box-sizing:border-box;padding:7px 10px;
+        border-radius:8px;border:1px solid rgba(255,255,255,0.12);
+        background:rgba(255,255,255,0.07);color:#fff;font-size:13px;
+      `;
+      wrap.appendChild(inp);
+
+      if (hint) {
+        const h = document.createElement('div');
+        h.style.cssText = 'font-size:10px;color:#4b5563;margin-top:3px;';
+        h.textContent = hint;
+        wrap.appendChild(h);
+      }
+      return wrap;
+    };
+
+    // Section: Buy page
+    const buyHdr = document.createElement('div');
+    buyHdr.style.cssText = 'font-size:11px;font-weight:700;color:#86efac;letter-spacing:.06em;margin-bottom:8px;';
+    buyHdr.textContent = 'BUY PAGE — PROFIT BADGES';
+    modal.appendChild(buyHdr);
+
+    modal.appendChild(field('Min Profit ($)', 'minProfit', 'number', 'Minimum $ profit to show any badge'));
+    modal.appendChild(field('Min ROI (%)', 'minROI_pct', 'number', 'Minimum ROI % to show any badge'));
+    modal.appendChild(field('Price Buffer ($)', 'buffer', 'number', 'Subtract this from profit calc (fees etc.)'));
+    modal.appendChild(divider());
+
+    // Section: Baseline
+    const blHdr = document.createElement('div');
+    blHdr.style.cssText = 'font-size:11px;font-weight:700;color:#93c5fd;letter-spacing:.06em;margin-bottom:8px;';
+    blHdr.textContent = 'BASELINE CALCULATION';
+    modal.appendChild(blHdr);
+
+    modal.appendChild(field('Baseline Percentile (%)', 'baselinePercentile', 'number', 'e.g. 75 = 75th percentile of listing prices'));
+    modal.appendChild(field('Wall Qty (units)', 'wallQty', 'number', 'Sellers with this many+ units trigger wall detection'));
+    modal.appendChild(divider());
+
+    // Section: Staleness
+    const stHdr = document.createElement('div');
+    stHdr.style.cssText = 'font-size:11px;font-weight:700;color:#fde68a;letter-spacing:.06em;margin-bottom:8px;';
+    stHdr.textContent = 'DATA FRESHNESS';
+    modal.appendChild(stHdr);
+
+    modal.appendChild(field('Fresh window (hours)', 'freshMs', 'number', 'Under this → green badge + ⚡ button'));
+    modal.appendChild(field('Aging window (hours)', 'agingMs', 'number', 'Under this → amber badge (over = hidden)'));
+    modal.appendChild(divider());
+
+    // Set ROI field value as percentage
+    const roiInp = modal.querySelector('[data-key="minROI_pct"]');
+    if (roiInp) roiInp.value = (s.minROI * 100).toFixed(1);
+
+    // Reset button
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = 'Reset to defaults';
+    resetBtn.style.cssText = `
+      width:100%;padding:7px;border-radius:8px;cursor:pointer;
+      font-size:12px;font-weight:600;margin-bottom:8px;
+      border:1px solid rgba(255,255,255,0.1);
+      background:rgba(255,255,255,0.05);color:#6b7280;
+    `;
+    resetBtn.addEventListener('click', () => {
+      persistSettings(Object.assign({}, DEFAULT_SETTINGS));
+      SETTINGS = loadSettings();
+      removeSettingsModal();
+      run();
+    });
+    modal.appendChild(resetBtn);
+
+    // Save button
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save & Apply';
+    saveBtn.style.cssText = `
+      width:100%;padding:9px;border-radius:8px;cursor:pointer;
+      font-size:13px;font-weight:800;
+      border:1px solid rgba(134,239,172,0.4);
+      background:rgba(34,197,94,0.2);color:#86efac;
+    `;
+    saveBtn.addEventListener('click', () => {
+      const newS = Object.assign({}, s);
+      modal.querySelectorAll('input[data-key]').forEach(inp => {
+        const k = inp.dataset.key;
+        const v = parseFloat(inp.value);
+        if (isNaN(v)) return;
+        if (k === 'minROI_pct') newS.minROI = v / 100;
+        else newS[k] = v;
+      });
+      // Clamp sensible ranges
+      newS.minProfit          = Math.max(0, newS.minProfit);
+      newS.minROI             = Math.max(0, Math.min(10, newS.minROI));
+      newS.buffer             = Math.max(0, newS.buffer);
+      newS.baselinePercentile = Math.max(1, Math.min(99, newS.baselinePercentile));
+      newS.wallQty            = Math.max(1, newS.wallQty);
+      newS.freshMs            = Math.max(1, newS.freshMs);
+      newS.agingMs            = Math.max(newS.freshMs, newS.agingMs);
+      persistSettings(newS);
+      SETTINGS = newS;
+      removeSettingsModal();
+      run();
+    });
+    modal.appendChild(saveBtn);
+
+    overlay.appendChild(modal);
+    overlay.addEventListener('click', e => { if (e.target === overlay) removeSettingsModal(); });
+    document.body.appendChild(overlay);
+  }
+
+  function ensureSettingsBtn() {
+    if (document.getElementById(SETTINGS_BTN_ID)) return;
+    const btn = document.createElement('button');
+    btn.id = SETTINGS_BTN_ID;
+    btn.textContent = '⚙';
+    btn.style.cssText = `
+      position:fixed;bottom:80px;right:16px;z-index:99998;
+      width:38px;height:38px;border-radius:50%;border:none;
+      background:rgba(55,65,81,0.92);color:#9ca3af;
+      font-size:17px;cursor:pointer;
+      box-shadow:0 2px 12px rgba(0,0,0,0.5);
+      display:flex;align-items:center;justify-content:center;
+    `;
+    btn.addEventListener('click', openSettingsModal);
+    document.body.appendChild(btn);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────
+
+  function getAgeLabel(updatedAt) {
+    const ms = Date.now() - (updatedAt || 0);
+    const h  = Math.floor(ms / 3600000);
+    const m  = Math.floor((ms % 3600000) / 60000);
+    return h > 0 ? `${h}h ago` : `${m}m ago`;
+  }
+
+  function clean(text) { return String(text || '').replace(/\s+/g, ' ').trim(); }
+
+  function parsePrice(text) {
+    const n = String(text || '').replace(/[^\d]/g, '');
+    return n ? parseInt(n, 10) : 0;
+  }
+
+  function money(n) { return '$' + Math.round(n || 0).toLocaleString(); }
+  function pct(n)   { return ((n || 0) * 100).toFixed(1) + '%'; }
+
+  function percentile(arr, p) {
+    if (!arr.length) return 0;
+    const a = [...arr].sort((x, y) => x - y);
+    const idx = Math.max(0, Math.min(a.length - 1, Math.ceil((p / 100) * a.length) - 1));
+    return a[idx];
+  }
+
+  // ── Baseline store ────────────────────────────────────────────
+
+  function getStore() {
+    try {
+      const p = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      return p && typeof p === 'object' ? p : {};
+    } catch { return {}; }
+  }
+  function saveStore(store) { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); }
+
+  function saveItemBaseline(itemId, itemName, baseline) {
+    if (!itemId || !baseline) return;
+    const store = getStore();
+    store[String(itemId)] = {
+      itemId: String(itemId),
+      itemName: clean(itemName || ''),
+      baseline: Math.round(baseline),
+      updatedAt: Date.now()
+    };
+    saveStore(store);
+  }
+
+  function getBaselineByItemId(itemId) { return getStore()[String(itemId)] || null; }
+
+  function extractItemIdFromImageSrc(src) {
+    const m = String(src || '').match(/\/images\/items\/(\d+)\//);
+    return m ? m[1] : null;
+  }
+
+  // ── Page detection ────────────────────────────────────────────
+
+  function isCorrectMarketPage() {
+    if (!window.location.href.includes('sid=ItemMarket')) return false;
+    return Array.from(document.querySelectorAll('*')).some(el => clean(el.textContent) === 'Owner');
+  }
+
+  // ── UI cleanup ────────────────────────────────────────────────
+
+  function removeOldMarketUI() {
+    const old = document.getElementById(BOX_ID);
+    if (old) old.remove();
+    document.querySelectorAll('.' + BADGE_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.' + HILITE_CLASS).forEach(el => {
+      el.classList.remove(HILITE_CLASS);
+      el.style.background = '';
+      el.style.outline = '';
+    });
+  }
+
+  function removeOldSellUI() {
+    document.querySelectorAll('.' + SELL_HELPER_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.' + ROW_FILL_BTN_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.tpda-helper-added').forEach(el => el.classList.remove('tpda-helper-added'));
+  }
+
+  // ── Market page ───────────────────────────────────────────────
+
+  function getHeader() { return document.querySelector('h4'); }
+
+  function getMarketItemName() {
+    for (const el of document.querySelectorAll('*')) {
+      const text = clean(el.textContent);
+      if (text && text.length < 40 && !text.includes('$') && !text.includes('Owner') && !text.includes('Search') &&
+          el.nextElementSibling && clean(el.nextElementSibling.textContent).includes('Owner'))
+        return text;
+    }
+    return 'Unknown Item';
+  }
+
+  function getMarketItemId() {
+    const url = window.location.href;
+    const urlMatch = url.match(/[?&#](?:item[_\-]?id|itemID)=(\d+)/i);
+    if (urlMatch) return urlMatch[1];
+    const dataAttrEls = document.querySelectorAll('[data-item-id],[data-itemid],[data-id],[data-item]');
+    for (const el of dataAttrEls) {
+      const id = el.dataset.itemId || el.dataset.itemid || el.dataset.id || el.dataset.item;
+      if (id && /^\d{1,6}$/.test(id)) return id;
+    }
+    const allImgs = Array.from(document.querySelectorAll('img[src*="/images/items/"]'));
+    for (const img of allImgs) {
+      const inRow = img.closest('tr') || img.closest('li') || img.closest('[class*="Row"]') || img.closest('[class*="row"]');
+      if (!inRow) { const m = (img.getAttribute('src')||'').match(/\/images\/items\/(\d+)\//); if (m) return m[1]; }
+    }
+    for (const img of allImgs) { const m = (img.getAttribute('src')||'').match(/\/images\/items\/(\d+)\//); if (m) return m[1]; }
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const m = (s.textContent||'').match(/['""]?itemID['""]?\s*:\s*['"]?(\d+)/i); if (m) return m[1];
+    }
+    for (const a of document.querySelectorAll('a[href*="imarket"]')) {
+      const m = (a.getAttribute('href')||'').match(/[?&#](?:item[_\-]?id|itemID)=(\d+)/i); if (m) return m[1];
+    }
+    return null;
+  }
+
+  function getRows() {
+    const rows = [];
+    for (const node of document.querySelectorAll('tr, li, div')) {
+      if (node.closest('.bazaar-info-container, [class*="bazaar"], [id*="bazaar"]')) continue;
+      const kids = node.children || [];
+      if (kids.length < 4) continue;
+      const priceText = kids[1]?.textContent || '';
+      if (!/\$\d/.test(priceText)) continue;
+      const maybePrice = parsePrice(priceText);
+      if (maybePrice <= 0 || maybePrice > 100000000) continue;
+      rows.push(node);
+    }
+    return rows;
+  }
+
+  function getListings() {
+    return getRows().map(row => {
+      const kids = row.children || [];
+      const price = parsePrice(kids[1]?.textContent || '');
+      const qty   = parseInt(String(kids[2]?.textContent || '0').replace(/[^\d]/g, ''), 10) || 0;
+      return { price, qty, node: row };
+    }).filter(l => l.price > 0);
+  }
+
+  function calcBaseline(listings) {
+    if (!listings.length) return { baseline: 0, wall: null };
+    const prices = listings.map(l => l.price);
+    const sorted = [...prices].sort((a, b) => a - b);
+    let base;
+    if (sorted.length >= 15)     base = percentile(sorted, SETTINGS.baselinePercentile);
+    else if (sorted.length >= 8) base = percentile(sorted, 70);
+    else                         base = percentile(sorted, 65);
+    const walls = listings.filter(l => l.qty >= SETTINGS.wallQty && l.price < base).sort((a, b) => a.price - b.price);
+    if (walls.length) return { baseline: walls[0].price - 1, wall: walls[0] };
+    return { baseline: base, wall: null };
+  }
+
+  function insertBox(h4, itemName, itemId, listings, baseline, wall) {
+    const box = document.createElement('div');
+    box.id = BOX_ID;
+    box.style.cssText = `
+      position:sticky;top:0;z-index:9999;margin:0 0 6px 0;padding:7px 12px;
+      background:rgba(15,15,15,0.97);font-size:12px;line-height:1.6;
+      border-bottom:${wall ? '2px solid rgba(250,204,21,0.7)' : '2px solid rgba(34,197,94,0.5)'};
+      border-radius:0 0 8px 8px;
+    `;
+    const line1 = document.createElement('div');
+    line1.style.cssText = 'color:#e5e7eb;font-weight:600;';
+    line1.textContent = `${itemName}  ·  ${itemId ? `ID ${itemId}` : 'ID missing'}  ·  ${listings.length} listings`;
+    box.appendChild(line1);
+    const line2 = document.createElement('div');
+    line2.style.cssText = `margin-top:1px;color:${wall ? '#fde68a' : '#86efac'};font-weight:700;font-size:13px;`;
+    line2.textContent = `Sell price: ${money(baseline)}`;
+    box.appendChild(line2);
+    const searchBar = document.querySelector('input[placeholder*="Search"]');
+    const anchor = searchBar ? searchBar.closest('div') || searchBar : h4;
+    anchor.insertAdjacentElement('beforebegin', box);
+  }
+
+  function addBadge(cell, profit, roi, strong) {
+    const badge = document.createElement('span');
+    badge.className = BADGE_CLASS;
+    badge.style.cssText = `
+      margin-left:6px;font-size:11px;font-weight:700;
+      padding:2px 6px;border-radius:999px;white-space:nowrap;
+      background:${strong ? 'rgba(34,197,94,0.18)' : 'rgba(250,204,21,0.15)'};
+      color:${strong ? '#86efac' : '#fde68a'};
+      border:1px solid ${strong ? 'rgba(134,239,172,0.35)' : 'rgba(253,230,138,0.25)'};
+    `;
+    badge.textContent = `+${money(profit)} • ${pct(roi)}`;
+    cell.appendChild(badge);
+  }
+
+  function highlightRows(baseline) {
+    const listings = getListings();
+    let bestUnitRow = null, bestUnitProfit = -Infinity;
+    let bestBulkRow = null, bestBulkScore  = -Infinity;
+    for (const { price, qty, node: row } of listings) {
+      const kids = row.children || [];
+      const costCell = kids[1]; if (!costCell) continue;
+      const profit = baseline - price - SETTINGS.buffer;
+      const roi    = profit / price;
+      if (profit <= 0) continue;
+      const strong = profit >= SETTINGS.minProfit && roi >= SETTINGS.minROI;
+      addBadge(costCell, profit, roi, strong);
+      if (strong) { row.classList.add(HILITE_CLASS); row.style.background = 'rgba(34,197,94,0.12)'; }
+      else { row.style.background = 'rgba(250,204,21,0.06)'; }
+      if (strong && profit > bestUnitProfit) { bestUnitProfit = profit; bestUnitRow = row; }
+      if (strong) { const bs = profit * Math.min(qty||1, 500); if (bs > bestBulkScore) { bestBulkScore = bs; bestBulkRow = row; } }
+    }
+    if (bestUnitRow) bestUnitRow.style.outline = '2px solid rgba(34,197,94,0.9)';
+    if (bestBulkRow && bestBulkRow !== bestUnitRow) {
+      bestBulkRow.style.outline = '2px solid rgba(251,191,36,0.95)';
+      const qtyCell = (bestBulkRow.children||[])[2];
+      if (qtyCell && !qtyCell.querySelector('.tpda-bulk-tag')) {
+        const tag = document.createElement('span');
+        tag.className = 'tpda-bulk-tag';
+        tag.style.cssText = 'margin-left:4px;font-size:10px;font-weight:700;color:#fbbf24;background:rgba(251,191,36,0.15);border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 4px;white-space:nowrap;';
+        tag.textContent = '📦 bulk';
+        qtyCell.appendChild(tag);
+      }
+    }
+  }
+
+  function runMarketPage() {
+    removeOldMarketUI();
+    if (!isCorrectMarketPage()) return;
+    const h4 = getHeader(); if (!h4) return;
+    const listings = getListings(); if (listings.length < 5) return;
+    const { baseline, wall } = calcBaseline(listings);
+    const itemName = getMarketItemName();
+    const itemId   = getMarketItemId();
+    saveItemBaseline(itemId, itemName, baseline);
+    insertBox(h4, itemName, itemId, listings, baseline, wall);
+    highlightRows(baseline);
+    ensureSettingsBtn();
+  }
+
+  // ── Sell page ─────────────────────────────────────────────────
+
+  function isLikelySellPage() {
+    return document.querySelectorAll('div[class*=itemRowWrapper]').length > 0 && !isCorrectMarketPage();
+  }
+  function getSellRows() { return Array.from(document.querySelectorAll('div[class*=itemRowWrapper]')); }
+
+  function getSellRowQtyInput(row) {
+    const b = row.querySelector('div[class*=amountInputWrapper] input.input-money:not([type=hidden])');
+    if (b) return b;
+    const a = Array.from(row.querySelectorAll('input.input-money:not([type=hidden])'));
+    return a.length ? a[0] : null;
+  }
+  function getSellRowPriceInput(row) {
+    const b = row.querySelector('div[class*=priceInputWrapper] input.input-money:not([type=hidden])');
+    if (b) return b;
+    const a = Array.from(row.querySelectorAll('input.input-money:not([type=hidden])'));
+    return a.length ? a[a.length-1] : null;
+  }
+  function getSellRowItemId(row) {
+    const img = row.querySelector('img[src*="/images/items/"]');
+    return img ? extractItemIdFromImageSrc(img.getAttribute('src')||'') : null;
+  }
+
+  function insertSellHelperForInput(input, baseline, row, updatedAt) {
+    if (!input || input.classList.contains('tpda-helper-added')) return;
+    const suggestedSell = Math.max(1, baseline - 1);
+    const isAging = (Date.now() - (updatedAt||0)) > STALENESS.freshMs;
+    const helper = document.createElement('span');
+    helper.className = SELL_HELPER_CLASS;
+    helper.style.cssText = `
+      display:inline-flex;align-items:center;flex-shrink:0;
+      margin-left:6px;font-size:11px;font-weight:700;
+      white-space:nowrap;border-radius:6px;padding:2px 7px;
+      color:${isAging ? '#fde68a' : '#86efac'};
+      background:${isAging ? 'rgba(250,204,21,0.13)' : 'rgba(34,197,94,0.13)'};
+      border:1px solid ${isAging ? 'rgba(253,230,138,0.3)' : 'rgba(134,239,172,0.3)'};
+    `;
+    helper.textContent = isAging ? `${suggestedSell.toLocaleString()} · ${getAgeLabel(updatedAt)}` : suggestedSell.toLocaleString();
+    if (row) row.appendChild(helper);
+    else input.insertAdjacentElement('afterend', helper);
+    input.classList.add('tpda-helper-added');
+  }
+
+  function fillInput(input, value) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, String(value));
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function insertRowFillButton(row, baseline, updatedAt) {
+    if (row.querySelector('.'+ROW_FILL_BTN_CLASS)) return;
+    if ((Date.now() - (updatedAt||0)) > STALENESS.freshMs) return;
+    const btn = document.createElement('button');
+    btn.className = ROW_FILL_BTN_CLASS;
+    btn.textContent = '⚡';
+    btn.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:4px;width:26px;height:26px;font-size:13px;border-radius:6px;background:rgba(34,197,94,0.2);border:1px solid rgba(134,239,172,0.4);cursor:pointer;padding:0;';
+    btn.addEventListener('click', () => {
+      if (document.hidden) return;
+      const pi = getSellRowPriceInput(row);
+      if (pi) fillInput(pi, Math.max(1, baseline-1));
+      const qi = getSellRowQtyInput(row);
+      if (qi) { const mx = parseInt(qi.max||qi.getAttribute('max')||'0',10); fillInput(qi, mx>0?mx:99999); }
+      btn.textContent = '✓'; btn.style.background = 'rgba(34,197,94,0.5)';
+      setTimeout(() => btn.remove(), 1200);
+    });
+    row.appendChild(btn);
+  }
+
+  function runSellHelper() {
+    removeOldSellUI();
+    if (!isLikelySellPage() || document.hidden) return;
+    const rows = getSellRows(); if (!rows.length) return;
+    for (const row of rows) {
+      const itemId = getSellRowItemId(row); if (!itemId) continue;
+      const saved = getBaselineByItemId(itemId); if (!saved||!saved.baseline) continue;
+      const age = Date.now() - (saved.updatedAt||0);
+      if (age > STALENESS.agingMs) continue;
+      const input = getSellRowPriceInput(row); if (!input) continue;
+      insertSellHelperForInput(input, saved.baseline, row, saved.updatedAt);
+      insertRowFillButton(row, saved.baseline, saved.updatedAt);
+    }
+    ensureSettingsBtn();
+  }
+
+  // ─────────────────────────────────────────────
+  //  SCRIPT 2 — PRICE TRACKER (browse/bazaar)
+  // ─────────────────────────────────────────────
+
+  var TRACKER_DONE = 'data-tpda';
+  var TRACKER_KEY  = 'TPDA_v5';
+  var TRACKER_MAX  = 30;
+  var PRUNE_KEY    = 'TPDA_last_prune';
+
+  ['v3','v4','v5','v6','v7','v8'].forEach(function(v) {
+    document.querySelectorAll('[data-tpda-'+v+']').forEach(function(el) { el.remove(); });
+  });
+
+  function trackerLoad() { try { return JSON.parse(localStorage.getItem(TRACKER_KEY)||'{}'); } catch(e) { return {}; } }
+  function trackerSave(d) { try { localStorage.setItem(TRACKER_KEY,JSON.stringify(d)); } catch(e) {} }
+
+  function pad(n) { return ('0'+n).slice(-2); }
+  function todayStr() { var d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+
+  function record(h, name, price) {
+    if (!h[name]) h[name]={};
+    var k=todayStr(), e=h[name][k]||{hi:price,lo:price};
+    if (price>e.hi) e.hi=price;
+    if (price<e.lo) e.lo=price;
+    h[name][k]=e;
+    var cut=new Date(); cut.setDate(cut.getDate()-TRACKER_MAX);
+    var cs=cut.getFullYear()+'-'+pad(cut.getMonth()+1)+'-'+pad(cut.getDate());
+    Object.keys(h[name]).forEach(function(k){ if(k<cs) delete h[name][k]; });
+  }
+
+  function trackerStats(h, name) {
+    var v=Object.values(h[name]||{}); if(!v.length) return null;
+    var lo=Infinity, hi=-Infinity;
+    v.forEach(function(e){ if(e.lo<lo)lo=e.lo; if(e.hi>hi)hi=e.hi; });
+    return {lo:lo,hi:hi,avg:(lo+hi)/2,days:v.length};
+  }
+
+  function pruneLowest() {
+    var now=Date.now(), last=parseInt(localStorage.getItem(PRUNE_KEY)||'0',10);
+    if(now-last<3600000) return;
+    localStorage.setItem(PRUNE_KEY,String(now));
+    var h=trackerLoad(), changed=false;
+    Object.keys(h).forEach(function(name) {
+      var days=h[name], dates=Object.keys(days);
+      if(dates.length<2) return;
+      var lowestDate=null, lowestVal=Infinity;
+      dates.forEach(function(d){ if(days[d].lo<lowestVal){lowestVal=days[d].lo;lowestDate=d;} });
+      if(!lowestDate) return;
+      var otherLos=dates.filter(function(d){return d!==lowestDate;}).map(function(d){return days[d].lo;});
+      if(!otherLos.length) return;
+      var otherAvg=otherLos.reduce(function(a,b){return a+b;},0)/otherLos.length;
+      if(lowestVal<otherAvg*0.5){ days[lowestDate].lo=Math.min.apply(null,otherLos); h[name]=days; changed=true; }
+    });
+    if(changed) trackerSave(h);
+  }
+
+  function fmt(n) {
+    if(n>=1e6) return '$'+(n/1e6).toFixed(2)+'M';
+    if(n>=1e3) return '$'+(n/1e3).toFixed(1)+'k';
+    return '$'+Math.round(n);
+  }
+  function parseDollar(s) {
+    s=s.replace(/[$,\s]/g,'');
+    if(/k$/i.test(s)) return parseFloat(s)*1e3;
+    if(/m$/i.test(s)) return parseFloat(s)*1e6;
+    return parseFloat(s);
+  }
+  function getTrackerPrice(text) {
+    var m=text.match(/\$([\d,]+(?:\.\d+)?[km]?)/i); if(!m) return 0;
+    var p=parseDollar(m[0]); return(isNaN(p)||p<=0||p>1e9)?0:p;
+  }
+  function getTrackerName(text) {
+    var lines=text.split(/[\n\r\t]+/);
+    for(var i=0;i<lines.length;i++){
+      var l=lines[i].trim();
+      if(l.length>=2&&l.length<=55&&/^[A-Za-z]/.test(l)&&!/^\$/.test(l)&&!/^\(?\d[\d,]*\)?$/.test(l)) return l;
+    }
+    return null;
+  }
+  function isItemCard(text) { return /\$[\d,]+(?:\.\d+)?[km]?\s*\([\d,]+\)/i.test(text); }
+
+  function findCard(img) {
+    var el=img.parentElement;
+    for(var i=0;i<12;i++){
+      if(!el||el===document.body) return null;
+      if(el.hasAttribute(TRACKER_DONE)) return null;
+      var t=el.innerText||'';
+      if(t.length>=10&&t.length<=180&&isItemCard(t)) return el;
+      el=el.parentElement;
+    }
+    return null;
+  }
+
+  function dealInfo(price, st) {
+    if(!st) return{color:'#444',label:'—',pct:2};
+    var range=st.hi-st.lo;
+    if(range<1) return{color:'#666',label:'Flat',pct:50};
+    var p=Math.min(1,Math.max(0,(price-st.lo)/range)), pct=p*100;
+    if(p<=0.20) return{color:'#2ecc71',label:'🔥 Great',pct:pct};
+    if(p<=0.40) return{color:'#58d68d',label:'✅ Good', pct:pct};
+    if(p>=0.80) return{color:'#e74c3c',label:'🚫 Pricey',pct:pct};
+    if(p>=0.60) return{color:'#e67e22',label:'⚠️ High', pct:pct};
+    return{color:'#f1c40f',label:'➡️ Fair',pct:pct};
+  }
+
+  function buildBar(price, st) {
+    var d=dealInfo(price,st), color=d.color, label=d.label, pct=d.pct, hasData=st&&st.days>=1;
+    var bar=document.createElement('div');
+    bar.setAttribute(TRACKER_DONE+'-bar','1');
+    bar.style.cssText='display:block;width:100%;box-sizing:border-box;padding:6px 10px 7px;background:#111;border-top:1px solid '+color+'33;font-family:-apple-system,Helvetica Neue,sans-serif;pointer-events:none;user-select:none;';
+    if(!hasData){ bar.innerHTML='<div style="text-align:center;color:#333;font-size:9px;letter-spacing:.08em;">TRACKING</div>'; return bar; }
+    bar.innerHTML=
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">'+
+        '<span style="color:'+color+';font-size:10px;font-weight:700;">'+label+'</span>'+
+        '<span style="color:#333;font-size:8px;">'+st.days+'D</span>'+
+      '</div>'+
+      '<div style="position:relative;height:3px;background:rgba(255,255,255,0.07);border-radius:2px;margin-bottom:7px;">'+
+        '<div style="position:absolute;left:0;top:0;height:100%;width:'+pct.toFixed(1)+'%;background:linear-gradient(90deg,'+color+'55,'+color+');border-radius:2px;"></div>'+
+        '<div style="position:absolute;left:calc('+pct.toFixed(1)+'% - 4px);top:-3px;width:9px;height:9px;background:'+color+';border-radius:50%;box-shadow:0 0 6px '+color+'cc;"></div>'+
+      '</div>'+
+      '<div style="display:flex;justify-content:space-between;">'+
+        '<div><div style="color:#2ecc71;font-size:7px;font-weight:600;letter-spacing:.06em;margin-bottom:1px;">LOW</div><div style="color:#2ecc71;font-size:11px;font-weight:700;">'+fmt(st.lo)+'</div></div>'+
+        '<div style="text-align:center;"><div style="color:#888;font-size:7px;font-weight:600;letter-spacing:.06em;margin-bottom:1px;">AVG</div><div style="color:#ccc;font-size:11px;font-weight:700;">'+fmt(st.avg)+'</div></div>'+
+        '<div style="text-align:right;"><div style="color:#e74c3c;font-size:7px;font-weight:600;letter-spacing:.06em;margin-bottom:1px;">HIGH</div><div style="color:#e74c3c;font-size:11px;font-weight:700;">'+fmt(st.hi)+'</div></div>'+
+      '</div>';
+    return bar;
+  }
+
+  function scan() {
+    if(document.hidden) return;
+    var hist=trackerLoad(), changed=false, imgs=document.querySelectorAll('img');
+    for(var i=0;i<imgs.length;i++){
+      try{
+        var card=findCard(imgs[i]);
+        if(!card||card.hasAttribute(TRACKER_DONE)) continue;
+        var text=card.innerText||'';
+        var price=getTrackerPrice(text); if(!price) continue;
+        var name=getTrackerName(text);   if(!name)  continue;
+        card.setAttribute(TRACKER_DONE,'1');
+        card.style.overflow='visible'; card.style.height='auto';
+        record(hist,name,price); changed=true;
+        card.appendChild(buildBar(price,trackerStats(hist,name)));
+      }catch(e){}
+    }
+    if(changed) trackerSave(hist);
+  }
+
+  // ─────────────────────────────────────────────
+  //  UNIFIED BOOT
+  // ─────────────────────────────────────────────
+
+  let sellObserver = null, sellObserverDebounce = null, sellRunning = false;
+
+  function runSellHelperSafe() {
+    if(sellRunning) return; sellRunning=true;
+    if(sellObserver) sellObserver.disconnect();
+    try { runSellHelper(); }
+    finally {
+      sellRunning=false;
+      if(sellObserver&&isLikelySellPage()) sellObserver.observe(document.body,{childList:true,subtree:true});
+    }
+  }
+
+  function run() { runMarketPage(); runSellHelper(); }
+
+  function startSellObserver() {
+    if(sellObserver) return;
+    sellObserver=new MutationObserver(()=>{
+      clearTimeout(sellObserverDebounce);
+      sellObserverDebounce=setTimeout(()=>{ if(isLikelySellPage()) runSellHelperSafe(); },300);
+    });
+    sellObserver.observe(document.body,{childList:true,subtree:true});
+  }
+
+  function trackerBoot() {
+    pruneLowest(); scan();
+    var t;
+    new MutationObserver(function(){ if(document.hidden) return; clearTimeout(t); t=setTimeout(scan,600); })
+      .observe(document.body,{childList:true,subtree:true});
+    setInterval(function(){ if(!document.hidden) pruneLowest(); },3600000);
+  }
+
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden){ if(sellObserver) sellObserver.disconnect(); }
+    else { if(isLikelySellPage()){ runSellHelperSafe(); if(sellObserver) sellObserver.observe(document.body,{childList:true,subtree:true}); } }
+  });
+
+  setTimeout(run,              1200);
+  setTimeout(runSellHelperSafe,2200);
+  setTimeout(runSellHelperSafe,3500);
+  setTimeout(runSellHelperSafe,5000);
+  startSellObserver();
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',function(){ setTimeout(trackerBoot,900); });
+  } else {
+    setTimeout(trackerBoot,900);
+  }
+
+})();
