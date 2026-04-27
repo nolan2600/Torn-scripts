@@ -658,12 +658,14 @@
         }
     };
 
-    // Torn PDA may fire load late or not at all — try both
+    // Torn PDA may fire load late or not at all — try both, but guard against double execution
+    let _initCalled = false;
+    const initOnce = () => { if (_initCalled) return; _initCalled = true; init(); };
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        init();
+        initOnce();
     } else {
-        document.addEventListener('DOMContentLoaded', init);
-        window.addEventListener('load', init);
+        document.addEventListener('DOMContentLoaded', initOnce);
+        window.addEventListener('load', initOnce);
     }
 
 })();

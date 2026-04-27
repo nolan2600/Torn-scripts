@@ -164,8 +164,8 @@
         }
 
         const table = [];
-        for (const key of ORIGINAL_ORDER) {
-            const [acronym, incStr] = key.split('-');
+        for (const invKey of ORIGINAL_ORDER) {
+            const [acronym, incStr] = invKey.split('-');
             const increment = parseInt(incStr);
             const stock = lookup[acronym];
             if (!stock) continue;
@@ -939,39 +939,6 @@
         b.textContent=label;
         b.style.cssText=`padding:8px 16px;background:${bg};color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;`;
         return b;
-    }
-
-    // ─── Balance HTML (for settings) ──────────────────────────────────────────
-    async function buildBalanceHTML() {
-        const moneyData    = await fetchAPI(`https://api.torn.com/v2/user/money?key=${apiKey}`);
-        const networthData = await fetchAPI(`https://api.torn.com/v2/user?selections=networth&key=${apiKey}`);
-        const money=moneyData.money; const nw=networthData.networth;
-        let html=''; let total=0;
-        const items=[
-            {key:'wallet',label:'Wallet',value:money.wallet||0},
-            {key:'bank',label:'Bank',value:money.city_bank?.amount||0},
-            {key:'cayman',label:'Cayman',value:money.cayman_bank||0},
-            {key:'vault',label:'Vault',value:money.vault||0},
-            {key:'pending',label:'Pending',value:nw.pending||0},
-            {key:'points',label:'Points',value:nw.points||0},
-            {key:'piggybank',label:'Piggy Bank',value:nw.piggybank||0},
-            {key:'items',label:'Items',value:nw.items||0},
-            {key:'displaycase',label:'Display Case',value:nw.displaycase||0},
-            {key:'bazaar',label:'Bazaar',value:nw.bazaar||0},
-            {key:'trade',label:'Trade',value:nw.trade||0},
-            {key:'itemmarket',label:'Item Market',value:nw.itemmarket||0},
-            {key:'properties',label:'Properties',value:nw.properties||0},
-            {key:'auctionhouse',label:'Auction House',value:nw.auctionhouse||0},
-            {key:'bookie',label:'Bookie',value:nw.bookie||0},
-            {key:'enlistedcars',label:'Enlisted Cars',value:nw.enlistedcars||0},
-            {key:'loan',label:'Loan',value:nw.loan||0},
-            {key:'unpaidfees',label:'Unpaid Fees',value:nw.unpaidfees||0},
-        ];
-        items.forEach(c=>{if(settings[c.key]&&c.value){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>${c.label}:</strong> ${formatMoney(c.value)}</div>`;total+=c.value;}});
-        if(settings.factionMoney){const v=money.faction?.money||0;if(v){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>Faction Money:</strong> ${formatMoney(v)}</div>`;total+=v;}}
-        if(settings.company){const v=money.company||0;if(v){html+=`<div style="margin-bottom:5px;color:#c0c8e0;"><strong>Company Money:</strong> ${formatMoney(v)}</div>`;total+=v;}}
-        html+=`<div style="margin-top:12px;padding-top:10px;border-top:1px solid #2a2a4a;font-weight:bold;color:#e0e0ff;">Total: ${formatMoney(total)}</div>`;
-        return html;
     }
 
     // ─── Init ─────────────────────────────────────────────────────────────────
