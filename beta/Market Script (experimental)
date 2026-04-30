@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn PDA Market Suite
 // @namespace    torn-market-suite-v1
-// @version      1.2
+// @version      1.3
 // @match        https://www.torn.com/*
 // @grant        none
 // ==/UserScript==
@@ -27,8 +27,7 @@
   const DEFAULT_SETTINGS = {
     minProfit:          10000,
     minROI:             0.25,
-    buffer:             0,
-    bufferPct:          false,
+    applyFee:           false,
     baselinePercentile: 75,
     wallQty:            200,
     freshMs:            12,   // hours
@@ -134,35 +133,18 @@
 
     modal.appendChild(field('Min Profit ($)', 'minProfit', 'number', 'Minimum $ profit to show any badge'));
     modal.appendChild(field('Min ROI (%)', 'minROI_pct', 'number', 'Minimum ROI % to show any badge'));
-    // Price Buffer field with optional % mode toggle
-    const bufWrap = document.createElement('div');
-    bufWrap.style.cssText = 'margin-bottom:12px;';
-    const bufLbl = document.createElement('div');
-    bufLbl.style.cssText = 'font-size:10px;font-weight:700;color:#9ca3af;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px;';
-    bufLbl.textContent = s.bufferPct ? 'Price Buffer (%)' : 'Price Buffer ($)';
-    bufWrap.appendChild(bufLbl);
-    const bufInp = document.createElement('input');
-    bufInp.type = 'number'; bufInp.dataset.key = 'buffer'; bufInp.value = s.buffer;
-    bufInp.style.cssText = 'width:100%;box-sizing:border-box;padding:7px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);color:#fff;font-size:13px;';
-    bufWrap.appendChild(bufInp);
-    const bufHint = document.createElement('div');
-    bufHint.style.cssText = 'font-size:10px;color:#4b5563;margin-top:3px;';
-    bufHint.textContent = 'Subtract this from profit calc (fees etc.)';
-    bufWrap.appendChild(bufHint);
-    const chkRow = document.createElement('div');
-    chkRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:6px;';
-    const bufChk = document.createElement('input');
-    bufChk.type = 'checkbox'; bufChk.dataset.key = 'bufferPct'; bufChk.checked = !!s.bufferPct;
-    bufChk.style.cssText = 'cursor:pointer;accent-color:#86efac;width:14px;height:14px;';
-    bufChk.addEventListener('change', () => {
-      bufLbl.textContent = bufChk.checked ? 'Price Buffer (%)' : 'Price Buffer ($)';
-    });
-    const chkLbl = document.createElement('label');
-    chkLbl.style.cssText = 'font-size:11px;color:#9ca3af;cursor:pointer;';
-    chkLbl.textContent = 'Use % of item price instead of flat $';
-    chkRow.appendChild(bufChk); chkRow.appendChild(chkLbl);
-    bufWrap.appendChild(chkRow);
-    modal.appendChild(bufWrap);
+    // 5% selling fee checkbox
+    const feeWrap = document.createElement('div');
+    feeWrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:12px;';
+    const feeChk = document.createElement('input');
+    feeChk.type = 'checkbox'; feeChk.dataset.key = 'applyFee'; feeChk.checked = !!s.applyFee;
+    feeChk.style.cssText = 'cursor:pointer;accent-color:#86efac;width:14px;height:14px;flex-shrink:0;';
+    const feeLbl = document.createElement('div');
+    feeLbl.style.cssText = 'font-size:11px;color:#9ca3af;cursor:pointer;';
+    feeLbl.textContent = 'Apply 5% selling fee to profit calculation';
+    feeLbl.addEventListener('click', () => { feeChk.checked = !feeChk.checked; });
+    feeWrap.appendChild(feeChk); feeWrap.appendChild(feeLbl);
+    modal.appendChild(feeWrap);
     modal.appendChild(divider());
 
     // Section: Baseline
@@ -228,7 +210,6 @@
       // Clamp sensible ranges
       newS.minProfit          = Math.max(0, newS.minProfit);
       newS.minROI             = Math.max(0, Math.min(10, newS.minROI));
-      newS.buffer             = newS.bufferPct ? Math.max(0, Math.min(100, newS.buffer)) : Math.max(0, newS.buffer);
       newS.baselinePercentile = Math.max(1, Math.min(99, newS.baselinePercentile));
       newS.wallQty            = Math.max(1, newS.wallQty);
       newS.freshMs            = Math.max(1, newS.freshMs);
@@ -465,8 +446,7 @@
     for (const { price, qty, node: row } of listings) {
       const kids = row.children || [];
       const costCell = kids[1]; if (!costCell) continue;
-      const bufferAmt = SETTINGS.bufferPct ? price * (SETTINGS.buffer / 100) : SETTINGS.buffer;
-      const profit = baseline - price - bufferAmt;
+      const profit = baseline - price - (SETTINGS.applyFee ? price * 0.05 : 0);
       const roi    = profit / price;
       if (profit <= 0) continue;
       const strong = profit >= SETTINGS.minProfit && roi >= SETTINGS.minROI;
