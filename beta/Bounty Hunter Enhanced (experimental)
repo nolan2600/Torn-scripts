@@ -19,7 +19,7 @@
 
     const PDA_API_KEY   = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION = "2.4.6";
+    const VERSION = "2.5.0";
     const LS = { apiKey:"bh_apiKey", ffKey:"bh_ffscouterKey", settings:"bh_settings", shared:"bh_shared", debug:"bh_debug", marked:"bh_marked" };
     const SHARED_FRESH_RATIO = 0.8;
     const SPA_LS_APIKEY = "spa_apiKey";
@@ -69,7 +69,7 @@
     const API_BASE="https://api.torn.com/v2", FF_BASE="https://ffscouter.com/api/v1";
     const API_DELAY_MS=750, ATTACK_URL="https://www.torn.com/page.php?sid=attack&user2ID=", PROFILE_URL="https://www.torn.com/profiles.php?XID=";
     const TOAST_TIMEOUT_MS=15_000, TOAST_MAX_DESKTOP=3, TOAST_MAX_MOBILE=1, MOBILE_MEDIA="(max-width: 768px)";
-    const STATUS_CACHE_MS=20_000, STATUS_CONCURRENCY=3;
+    const STATUS_CACHE_MS=20_000, STATUS_CONCURRENCY=1;
     const FACTION_CACHE_MS=5*60*1000; // 5-minute faction war status cache
 
     // Flight durations in minutes per destination + plane type (from Torn game data)
@@ -289,19 +289,19 @@
         start() { if(this._running)return; this._running=true; this._tick(); }
         async _tick() {
             if(!this._running)return;
-            let waitSec=this.settings.refreshSec;
+            let waitSec=this.settings.refreshSec,rateLimited=false;
             try {
                 const shared=this._readShared(),fresh=shared&&(Date.now()-shared.writtenAt)<(this.settings.refreshSec*1000*SHARED_FRESH_RATIO);
                 if(fresh){logDebug(`free-ride: ${shared.matches?shared.matches.length:0} matches`,"info");this._adoptSharedIdentity(shared);this.lastCounts=shared.lastCounts||null;this.lastError=null;this._applyMatches(shared.matches||[]);if(this.onUpdate)this.onUpdate();}
                 else{const delaySec=await this.refresh();waitSec=Math.max(this.settings.refreshSec,delaySec||0);}
-            } catch(err) { this.lastError=err; logDebug(`refresh ${isRateLimitError(err)?"aborted — rate limit":"failed: "+(err.message||"error")}`,"err"); if(this.onUpdate)this.onUpdate(); waitSec=Math.max(this.settings.refreshSec,30); }
-            await this.refreshMarked().catch(()=>{});
+            } catch(err) { this.lastError=err; rateLimited=isRateLimitError(err); logDebug(`refresh ${rateLimited?"aborted — rate limit":"failed: "+(err.message||"error")}`,"err"); if(this.onUpdate)this.onUpdate(); waitSec=Math.max(this.settings.refreshSec,30); }
+            if(!rateLimited)await this.refreshMarked().catch(()=>{});
             if(this.settings.refreshSec<=0)return;
             this._nextAt=Date.now()+waitSec*1000; this._timer=setTimeout(()=>this._tick(),waitSec*1000);
         }
         async refresh() {
             this.lastError=null; const t0=performance.now(); logDebug("refresh: start","info"); if(this.onUpdate)this.onUpdate({loading:true});
-            try { const profile=await this.api.validateKey(); if(profile){this.myUserId=profile.id||this.myUserId;this.myUserLevel=(typeof profile.level==="number")?profile.level:this.myUserLevel;this.myUserAge=(typeof profile.age==="number")?profile.age:this.myUserAge;this.myCountry=getPlayerCountry(profile.status)||this.myCountry;} } catch{}
+            if(this.myUserId==null){try { const profile=await this.api.validateKey(); if(profile){this.myUserId=profile.id||this.myUserId;this.myUserLevel=(typeof profile.level==="number")?profile.level:this.myUserLevel;this.myUserAge=(typeof profile.age==="number")?profile.age:this.myUserAge;this.myCountry=getPlayerCountry(profile.status)||this.myCountry;} } catch{}}
             const{bounties,delaySec}=await this.api.fetchAllBounties(); logDebug(`fetched ${bounties.length} bounties`,"ok");
             // Deduplicate by target — keep highest-reward bounty per person, sum counts.
             const grouped=new Map();
@@ -384,8 +384,8 @@
             if(this._warCache&&(now-this._warCache.fetchedAt)<FACTION_CACHE_MS)return this._warCache.ids;
             const ids=new Set();
             try{
-                // Fetch both rankedwars and territorywars in one call
-                const data=await this.api._get("https://api.torn.com/torn/?selections=rankedwars,territorywars");
+                // Fetch both rankedwars and territorywars in one v2 call
+                const data=await this.api._get("/torn?selections=rankedwars,territorywars");
                 // Ranked wars — factions keyed by ID
                 for(const war of Object.values(data.rankedwars||{})){
                     for(const fid of Object.keys(war.factions||{})){
@@ -432,8 +432,8 @@
                     if(cached&&cached.desc===desc&&cached.landingTs>nowSec){
                         landingTs=cached.landingTs;
                     } else if(state==="Traveling"){
-                        // Compute fresh from flight table
-                        landingTs=computeLandingTs(desc,p.plane||"airliner");
+                        // Prefer API's until timestamp; fall back to flight table estimate
+                        landingTs=(p.status.until&&p.status.until>nowSec)?p.status.until:computeLandingTs(desc,p.plane||"airliner");
                         if(landingTs>nowSec)this._travelCache.set(cacheKey,{desc,landingTs});
                     } else {
                         // Abroad — clear old cache
@@ -535,7 +535,7 @@
             // 3. In-app banner (primary — guaranteed inside WebView)
             this._showBanner(m,remLabel);
             // 4. Web Notification (bonus)
-            if(HospAlertManager.isSupported()&&HospAlertManager.permission()==="granted"){try{const n=new Notification(`🏥 ${m.target_name} exits hospital ${remLabel}`,{body:[`Reward: ${fmt.money(m.reward)}`,m.ff!=null?`FF: ${m.ff.toFixed(2)}`:null,m.revivable===true?"💚 Revivable":null].filter(Boolean).join(" · "),icon:"https://www.torn.com/favicon.ico",tag:`bh-hosp-${m.target_id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(ATTACK_URL+m.target_id);n.close();});}catch{}}
+            if(HospAlertManager.isSupported()&&HospAlertManager.permission()==="granted"){try{const n=new Notification(`🏥 ${m.target_name} exits hospital ${remLabel}`,{body:[`Reward: ${fmt.money(m.reward)}`,m.ff!=null?`FF: ${m.ff.toFixed(2)}`:null,m.revivable===true?"💚 Revivable":null].filter(Boolean).join(" · "),icon:"https://www.torn.com/favicon.ico",tag:`bh-hosp-${m.target_id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(PROFILE_URL+m.target_id);n.close();});}catch{}}
         }
         _showBanner(m,remLabel){
             const prev=document.getElementById(`bh-alert-${m.target_id}`);if(prev)prev.remove();
@@ -545,7 +545,7 @@
             const dismiss=()=>{el.style.animation="bh-banner-out .25s ease-in forwards";setTimeout(()=>el.remove(),260);};
             const auto=setTimeout(dismiss,30_000);
             el.querySelector(".bh-alert-close").addEventListener("click",(e)=>{e.stopPropagation();clearTimeout(auto);dismiss();});
-            el.querySelector(".bh-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(ATTACK_URL+m.target_id);dismiss();});
+            el.querySelector(".bh-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(PROFILE_URL+m.target_id);dismiss();});
         }
         cancelAll(){for(const{timer}of this._scheduled.values())clearTimeout(timer);this._scheduled.clear();}
         pendingCount(){return this._scheduled.size;}
@@ -595,7 +595,7 @@
             try{if(navigator.vibrate)navigator.vibrate([400,150,400,150,600]);}catch{}
             try{const ACtx=window.AudioContext||window.webkitAudioContext;if(ACtx){const ctx=new ACtx(),beep=(freq,st,dur)=>{const osc=ctx.createOscillator(),g=ctx.createGain();osc.connect(g);g.connect(ctx.destination);osc.type="sine";osc.frequency.value=freq;g.gain.setValueAtTime(0.4,st);g.gain.exponentialRampToValueAtTime(0.001,st+dur);osc.start(st);osc.stop(st+dur);};beep(660,ctx.currentTime,0.18);beep(880,ctx.currentTime+0.22,0.18);beep(1100,ctx.currentTime+0.44,0.30);}}catch{}
             this._showBanner(m,remLabel,isTravel);
-            if(typeof Notification!=="undefined"&&Notification!==null&&Notification.permission==="granted"){try{const n=new Notification(`${isTravel?"✈️":"🏥"} ${m.name} ${isTravel?"landing":"exits hospital"} ${remLabel}`,{body:`L${m.level}${m.inFactionWar?" · ⚔️ War":""}`,icon:"https://www.torn.com/favicon.ico",tag:`bh-target-${m.id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(ATTACK_URL+m.id);n.close();});}catch{}}
+            if(typeof Notification!=="undefined"&&Notification!==null&&Notification.permission==="granted"){try{const n=new Notification(`${isTravel?"✈️":"🏥"} ${m.name} ${isTravel?"landing":"exits hospital"} ${remLabel}`,{body:`L${m.level}${m.inFactionWar?" · ⚔️ War":""}`,icon:"https://www.torn.com/favicon.ico",tag:`bh-target-${m.id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(PROFILE_URL+m.id);n.close();});}catch{}}
         }
         _showBanner(m,remLabel,isTravel){
             const prev=document.getElementById(`bh-ta-${m.id}`);if(prev)prev.remove();
@@ -605,7 +605,7 @@
             const dismiss=()=>{el.style.animation="bh-target-banner-out .25s ease-in forwards";setTimeout(()=>el.remove(),260);};
             const auto=setTimeout(dismiss,30_000);
             el.querySelector(".bh-alert-close").addEventListener("click",(e)=>{e.stopPropagation();clearTimeout(auto);dismiss();});
-            el.querySelector(".bh-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(ATTACK_URL+m.id);dismiss();});
+            el.querySelector(".bh-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(PROFILE_URL+m.id);dismiss();});
         }
         cancelAll(){for(const{timer}of this._scheduled.values())clearTimeout(timer);this._scheduled.clear();}
     }
@@ -691,7 +691,7 @@ table.bh-table{width:100%;border-collapse:collapse}
 
     // ── UI ─────────────────────────────────────────────────────
     class UI {
-        constructor(hunter,toaster,alertMgr,targetAlertMgr){this.hunter=hunter;this.toaster=toaster;this.alertMgr=alertMgr;this.targetAlertMgr=targetAlertMgr;this.activeTab="hunt";this._countdownTimer=null;this._panel=null;this._overlay=null;this._authed=false;this._sortCol="reward";this._sortDir="desc";this._refreshing=false;}
+        constructor(hunter,toaster,alertMgr,targetAlertMgr){this.hunter=hunter;this.toaster=toaster;this.alertMgr=alertMgr;this.targetAlertMgr=targetAlertMgr;this.activeTab="hunt";this._countdownTimer=null;this._panel=null;this._overlay=null;this._authed=false;this._sortCol="reward";this._sortDir="desc";this._refreshing=false;this._refreshingMarked=false;}
         inject(){
             injectCSS();
             const overlay=document.createElement("div"); overlay.id="bh-overlay"; document.body.appendChild(overlay);
@@ -769,7 +769,7 @@ table.bh-table{width:100%;border-collapse:collapse}
             const statusLine=`<div id="bh-status-line"><button id="bh-tgt-refresh" class="bh-btn-muted">Refresh now</button><span>${targets.length} marked target${targets.length===1?"":"s"}</span></div>`;
             if(targets.length===0){
                 content.innerHTML=statusLine+`<div class="bh-empty">No marked targets yet.<br><span style="color:#666">Tap <b>🎯 Mark</b> on any player profile to add them here.</span></div>`;
-                content.querySelector("#bh-tgt-refresh").addEventListener("click",async()=>{await this.hunter.refreshMarked().catch(()=>{});});
+                content.querySelector("#bh-tgt-refresh").addEventListener("click",async(e)=>{const btn=e.currentTarget;if(this._refreshingMarked)return;this._refreshingMarked=true;btn.disabled=true;try{await this.hunter.refreshMarked().catch(()=>{});}finally{this._refreshingMarked=false;}});
                 return;
             }
             const rows=targets.map((t)=>{
@@ -796,8 +796,8 @@ table.bh-table{width:100%;border-collapse:collapse}
                 </tr>`;
             }).join("");
             content.innerHTML=statusLine+`<table class="bh-table"><thead><tr><th>Target</th><th>Status</th><th title="Revivable">Rev.</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-            content.querySelector("#bh-tgt-refresh").addEventListener("click",async()=>{await this.hunter.refreshMarked().catch(()=>{});});
-            content.querySelectorAll(".bh-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(ATTACK_URL+el.dataset.id);}));
+            content.querySelector("#bh-tgt-refresh").addEventListener("click",async(e)=>{const btn=e.currentTarget;if(this._refreshingMarked)return;this._refreshingMarked=true;btn.disabled=true;try{await this.hunter.refreshMarked().catch(()=>{});}finally{this._refreshingMarked=false;}});
+            content.querySelectorAll(".bh-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(PROFILE_URL+el.dataset.id);}));
             content.querySelectorAll(".bh-target-remove").forEach((btn)=>btn.addEventListener("click",()=>{
                 const id=Number(btn.dataset.id),name=btn.dataset.name;
                 if(!confirm(`Remove ${name} from marked targets?`))return;
