@@ -194,7 +194,7 @@
     class TornAPI {
         constructor(key) { this.key=key; this._lastReq=0; }
         setKey(key) { this.key=key; }
-        async _rateLimit() { const w=API_DELAY_MS-(Date.now()-this._lastReq); if(w>0)await sleep(w); this._lastReq=Date.now(); }
+        async _rateLimit() { const w=API_DELAY_MS-(Date.now()-this._lastReq); this._lastReq=Date.now()+Math.max(0,w); if(w>0)await sleep(w); }
         async _get(pathOrUrl,params=null) {
             await this._rateLimit();
             const url=new URL(/^https?:\/\//.test(pathOrUrl)?pathOrUrl:API_BASE+pathOrUrl);
@@ -400,6 +400,7 @@
                 }
             }catch(e){
                 logDebug(`global war fetch failed: ${e.message}`,"warn");
+                return this._warCache?this._warCache.ids:ids;
             }
             this._warCache={ids,fetchedAt:now};
             return ids;
@@ -690,7 +691,7 @@ table.bh-table{width:100%;border-collapse:collapse}
 
     // ── UI ─────────────────────────────────────────────────────
     class UI {
-        constructor(hunter,toaster,alertMgr,targetAlertMgr){this.hunter=hunter;this.toaster=toaster;this.alertMgr=alertMgr;this.targetAlertMgr=targetAlertMgr;this.activeTab="hunt";this._countdownTimer=null;this._panel=null;this._overlay=null;this._authed=false;this._sortCol="reward";this._sortDir="desc";}
+        constructor(hunter,toaster,alertMgr,targetAlertMgr){this.hunter=hunter;this.toaster=toaster;this.alertMgr=alertMgr;this.targetAlertMgr=targetAlertMgr;this.activeTab="hunt";this._countdownTimer=null;this._panel=null;this._overlay=null;this._authed=false;this._sortCol="reward";this._sortDir="desc";this._refreshing=false;}
         inject(){
             injectCSS();
             const overlay=document.createElement("div"); overlay.id="bh-overlay"; document.body.appendChild(overlay);
@@ -741,9 +742,9 @@ table.bh-table{width:100%;border-collapse:collapse}
             const ffError=c&&c.ffError?(c.ffNetworkFail?`<span style="color:#ffb74d">FFScouter unreachable — showing all targets without FF filter.</span>`:`<span class="bh-err">FFScouter: ${escHtml(c.ffError)}</span>`):"";
             const thCls=(col)=>this._sortCol!==col?"":(this._sortDir==="asc"?"sort-asc":"sort-desc");
             const rlBanner=rateLimited?`<div class="bh-rl-banner"><div class="bh-rl-title">${rows.length>0?"Rate limit hit — showing previous results":"Rate limit hit — no results"}</div><div class="bh-rl-body">${rows.length>0?"The table below is from the last successful refresh.":"No successful refresh completed yet."}<br><br><b>To reduce API load:</b><ul class="bh-rl-tips"><li>Raise <b>Min reward</b></li><li>Narrow <b>FF</b> or <b>BS bracket</b></li><li>Increase <b>Auto-refresh</b> interval</li></ul><span class="bh-rl-hint">Auto-retry continues in the background.</span></div></div>`:"";
-            content.innerHTML=`<div id="bh-status-line"><button id="bh-refresh-btn" class="bh-btn-muted">Refresh now</button><span>Next refresh in <span id="bh-countdown">${nextIn}</span>s</span><span>${rows.length} match${rows.length===1?"":"es"}</span>${errLine}${ffKeyMissing}${ffError}</div>${rlBanner}${rows.length===0?(rateLimited?"":` <div class="bh-empty">No bounties match your filters right now.<br><span style="color:#666">Adjust reward, FF, BS bracket, hospital window, or revivable filter under Settings.</span></div>`):`<table class="bh-table"><thead><tr><th data-sort="target" class="${thCls("target")}">Target</th><th data-sort="reward" class="num ${thCls("reward")}">Reward</th><th data-sort="ff" class="num ${thCls("ff")}">FF</th><th data-sort="bs" class="num bh-col-divider ${thCls("bs")}">BS Est.</th><th data-sort="status" class="bh-col-divider ${thCls("status")}">Status</th><th class="bh-col-divider" title="Revivable">Rev.</th><th></th></tr></thead><tbody>${rows.map((row)=>this._renderRow(row)).join("")}</tbody></table>`}`;
+            content.innerHTML=`<div id="bh-status-line"><button id="bh-refresh-btn" class="bh-btn-muted"${this._refreshing?" disabled":""}>Refresh now</button><span>Next refresh in <span id="bh-countdown">${nextIn}</span>s</span><span>${rows.length} match${rows.length===1?"":"es"}</span>${errLine}${ffKeyMissing}${ffError}</div>${rlBanner}${rows.length===0?(rateLimited?"":` <div class="bh-empty">No bounties match your filters right now.<br><span style="color:#666">Adjust reward, FF, BS bracket, hospital window, or revivable filter under Settings.</span></div>`):`<table class="bh-table"><thead><tr><th data-sort="target" class="${thCls("target")}">Target</th><th data-sort="reward" class="num ${thCls("reward")}">Reward</th><th data-sort="ff" class="num ${thCls("ff")}">FF</th><th data-sort="bs" class="num bh-col-divider ${thCls("bs")}">BS Est.</th><th data-sort="status" class="bh-col-divider ${thCls("status")}">Status</th><th class="bh-col-divider" title="Revivable">Rev.</th><th></th></tr></thead><tbody>${rows.map((row)=>this._renderRow(row)).join("")}</tbody></table>`}`;
             const refreshBtn=content.querySelector("#bh-refresh-btn");
-            refreshBtn.addEventListener("click",async()=>{refreshBtn.disabled=true;try{await this.hunter.refresh();}catch{}refreshBtn.disabled=false;});
+            refreshBtn.addEventListener("click",async()=>{if(this._refreshing)return;this._refreshing=true;refreshBtn.disabled=true;try{await this.hunter.refresh();}catch{}this._refreshing=false;});
             content.querySelectorAll(".bh-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(PROFILE_URL+el.dataset.id);}));
             content.querySelectorAll("th[data-sort]").forEach((el)=>el.addEventListener("click",()=>{const col=el.dataset.sort;if(this._sortCol===col)this._sortDir=this._sortDir==="asc"?"desc":"asc";else{this._sortCol=col;this._sortDir=(col==="target")?"asc":"desc";}this._renderHunt();}));
             content.querySelectorAll(".bh-bell").forEach((btn)=>btn.addEventListener("click",(e)=>{e.stopPropagation();const id=btn.dataset.bellId;this.alertMgr.toggle(id);this.alertMgr.sync(this.hunter.lastMatches);const active=this.alertMgr.isAlertActive(id);btn.classList.toggle("bh-bell-on",active);btn.title=active?"Cancel alert":"Alert 1 min before exit";}));
