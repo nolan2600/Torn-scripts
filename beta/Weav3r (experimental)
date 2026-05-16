@@ -17,6 +17,7 @@
 // @grant        GM.listValues
 // @connect      weav3r.dev
 // @run-at       document-end
+// @tag          torn-bazaar
 // @downloadURL https://update.greasyfork.org/scripts/527616/Bazaars%20in%20Item%20Market%20Powered%20by%20TornW3B.user.js
 // @updateURL https://update.greasyfork.org/scripts/527616/Bazaars%20in%20Item%20Market%20Powered%20by%20TornW3B.meta.js
 // ==/UserScript==

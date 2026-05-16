@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Torn PDA Market Suite
 // @namespace    torn-market-suite-v1
-// @version      1.3
+// @version      1.4
 // @match        https://www.torn.com/*
 // @grant        none
+// @tag          torn-market
 // ==/UserScript==
 
 (function () {

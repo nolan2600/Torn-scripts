@@ -10,6 +10,7 @@
 // @connect      api.torn.com
 // @connect      ffscouter.com
 // @license      GPL-3.0-or-later
+// @tag          torn-bounty
 // ==/UserScript==
 
 /* eslint-disable no-undef */

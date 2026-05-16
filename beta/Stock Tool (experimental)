@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Torn Stock Investment Advisor (Open) v3
 // @namespace    http://tampermonkey.net/
-// @version      3.00
+// @version      3.01
 // @description  Stock advisor with color-coded performance, short-term momentum & long-term ROI recommendations
 // @author       Reverse engineered + enhanced (original by ShAdOwCrEsT [3929345])
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @grant        none
+// @connect      api.torn.com
+// @tag          torn-stocks
 // ==/UserScript==
 
 (function () {
@@ -247,7 +249,7 @@
 
     // ─── UI Shell ─────────────────────────────────────────────────────────────
     function createButton() {
-        const isPDA = /android|iphone|ipad|mobile/i.test(navigator.userAgent) || window.innerWidth <= 768;
+        const isPDA = typeof PDA_httpGet !== 'undefined' || window.innerWidth <= 768;
         const container = document.createElement('div');
         container.id = 'sadv-container';
         container.style.cssText = `position:fixed;top:${isPDA?'35px':'50px'};right:${isPDA?'10px':'20px'};z-index:99999;display:flex;gap:6px;align-items:center;`;
