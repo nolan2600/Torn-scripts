@@ -1,0 +1,1601 @@
+// ==UserScript==
+// @name         Torn Cash Flow Analytics
+// @namespace    https://github.com/torn-scripts/cash-flow-analytics
+// @version      1.0.0
+// @description  Comprehensive cash flow analytics — shop ROI, market trading, mugging stats, and dynamic charts.
+// @author       DieselBlade
+// @match        https://www.torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @require      https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js
+// @license      GPL-3.0-or-later
+// @tag          torn-cashflow
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+
+(function () {
+    "use strict";
+
+    // =========================================================================
+    // SECTION 1 — Constants & Config
+    // =========================================================================
+
+    const VERSION       = "1.0.0";
+    const API_BASE      = "https://api.torn.com/v2";
+    const API_DELAY_MS  = 750;
+    const ACCENT        = "#f59e0b";
+
+    const LS = {
+        shop:        "cfa_shop",
+        market:      "cfa_market",
+        mugging:     "cfa_mugging",
+        settings:    "cfa_settings",
+        lastMugSync: "cfa_lastMugSync",
+    };
+
+    const GM_KEY_APIKEY = "cfa_api_key";
+    const GM_KEY_MYID   = "cfa_my_user_id";
+
+    // =========================================================================
+    // SECTION 2 — Storage Layer
+    // =========================================================================
+
+    const Store = {
+        // --- Shop ---
+        getShop() {
+            try { return JSON.parse(localStorage.getItem(LS.shop) || "[]"); } catch { return []; }
+        },
+        saveShop(arr) { localStorage.setItem(LS.shop, JSON.stringify(arr)); },
+        addShop(entry) { const a = this.getShop(); a.push(entry); this.saveShop(a); },
+        resetShop() { localStorage.removeItem(LS.shop); },
+
+        // --- Market ---
+        getMarket() {
+            try { return JSON.parse(localStorage.getItem(LS.market) || "[]"); } catch { return []; }
+        },
+        saveMarket(arr) { localStorage.setItem(LS.market, JSON.stringify(arr)); },
+        addMarket(entry) { const a = this.getMarket(); a.push(entry); this.saveMarket(a); },
+        resetMarket() { localStorage.removeItem(LS.market); },
+
+        // --- Mugging ---
+        getMugging() {
+            try { return JSON.parse(localStorage.getItem(LS.mugging) || "[]"); } catch { return []; }
+        },
+        saveMugging(arr) { localStorage.setItem(LS.mugging, JSON.stringify(arr)); },
+        mergeMugging(newEntries) {
+            const existing = this.getMugging();
+            const ids = new Set(existing.map(e => e.id));
+            const merged = [...existing];
+            for (const e of newEntries) {
+                if (!ids.has(e.id)) { merged.push(e); ids.add(e.id); }
+            }
+            this.saveMugging(merged);
+        },
+        resetMugging() { localStorage.removeItem(LS.mugging); },
+
+        // --- Settings ---
+        getSettings() {
+            try { return JSON.parse(localStorage.getItem(LS.settings) || "{}"); } catch { return {}; }
+        },
+        saveSettings(s) { localStorage.setItem(LS.settings, JSON.stringify(s)); },
+
+        // --- API Key (GM secure storage) ---
+        getApiKey()      { return GM_getValue(GM_KEY_APIKEY, ""); },
+        saveApiKey(k)    { GM_setValue(GM_KEY_APIKEY, k); },
+
+        // --- My User ID (GM secure storage) ---
+        getMyUserId()    { return GM_getValue(GM_KEY_MYID, ""); },
+        saveMyUserId(id) { GM_setValue(GM_KEY_MYID, String(id)); },
+
+        // --- Last Mugging Sync ---
+        getLastMugSync() { return parseFloat(localStorage.getItem(LS.lastMugSync) || "0") || 0; },
+        setLastMugSync(ts) { localStorage.setItem(LS.lastMugSync, String(ts)); },
+    };
+
+    // =========================================================================
+    // SECTION 3 — Torn API Class
+    // =========================================================================
+
+    class TornAPI {
+        constructor(key) {
+            this.key      = key;
+            this._lastReq = 0;
+            this.myUserId = Store.getMyUserId() || null;
+        }
+
+        setKey(key) { this.key = key; }
+
+        async _rateLimit() {
+            const now  = Date.now();
+            const wait = API_DELAY_MS - (now - this._lastReq);
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            this._lastReq = Date.now();
+        }
+
+        async _gmGet(url) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method:  "GET",
+                    url,
+                    onload:  r => resolve({ status: r.status, text: r.responseText }),
+                    onerror: e => reject(new Error("Network error: " + JSON.stringify(e))),
+                    ontimeout: () => reject(new Error("Request timed out")),
+                    timeout: 15000,
+                });
+            });
+        }
+
+        async _get(path, params = {}) {
+            await this._rateLimit();
+            const url = new URL(API_BASE + path);
+            for (const [k, v] of Object.entries(params)) {
+                if (v != null) url.searchParams.set(k, String(v));
+            }
+            url.searchParams.set("key", this.key);
+            const { status, text } = await this._gmGet(url.toString());
+            if (status < 200 || status >= 300) throw new Error("HTTP " + status);
+            let data;
+            try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON response"); }
+            if (data && data.error) throw new Error(data.error.error || data.error.code || "API error");
+            return data;
+        }
+
+        async fetchProfile() {
+            return this._get("/user/profile");
+        }
+
+        async fetchAttacks(limit = 100, fromTimestamp = null) {
+            const params = { limit, sort: "DESC" };
+            if (fromTimestamp) params.from = fromTimestamp;
+            return this._get("/user/attacks", params);
+        }
+
+        async fetchMarketItem(itemId) {
+            try {
+                const data = await this._get(`/market/${itemId}/listings`, { type: "bazaar" });
+                const listings = data?.listings || data?.bazaar || [];
+                if (!listings.length) return null;
+                const prices = listings
+                    .map(l => l.price || l.cost || 0)
+                    .filter(p => p > 0)
+                    .sort((a, b) => a - b);
+                if (!prices.length) return null;
+                // Return median price
+                const mid = Math.floor(prices.length / 2);
+                return prices.length % 2 === 0
+                    ? Math.round((prices[mid - 1] + prices[mid]) / 2)
+                    : prices[mid];
+            } catch {
+                return null;
+            }
+        }
+    }
+
+    // =========================================================================
+    // SECTION 4 — Analytics (pure functions)
+    // =========================================================================
+
+    const Analytics = {};
+
+    Analytics.filterByRange = function (items, range) {
+        if (!range || range === "all") return items;
+        const now = Date.now() / 1000;
+        let cutoff;
+        if (range === "today") {
+            const d = new Date(); d.setHours(0, 0, 0, 0);
+            cutoff = d.getTime() / 1000;
+        } else if (range === "7d") {
+            cutoff = now - 7 * 86400;
+        } else if (range === "30d") {
+            cutoff = now - 30 * 86400;
+        } else {
+            return items;
+        }
+        return items.filter(i => (i.timestamp || 0) >= cutoff);
+    };
+
+    Analytics.shopROI = function (shopData) {
+        const groups = {};
+        for (const e of shopData) {
+            const key = e.itemName || "Unknown";
+            if (!groups[key]) groups[key] = { itemName: key, itemId: e.itemId ?? null, entries: [] };
+            groups[key].entries.push(e);
+        }
+        return Object.values(groups).map(g => {
+            const totalQty     = g.entries.reduce((s, e) => s + (e.qty || 0), 0);
+            const totalSpent   = g.entries.reduce((s, e) => s + (e.buyPriceTotal || 0), 0);
+            const avgBuyPrice  = totalQty > 0 ? totalSpent / totalQty : 0;
+            // Use the most recently set sellPrice
+            const withSell     = g.entries.filter(e => e.sellPricePerUnit != null);
+            const sellPrice    = withSell.length > 0
+                ? withSell[withSell.length - 1].sellPricePerUnit
+                : null;
+            const roi          = (sellPrice != null && avgBuyPrice > 0)
+                ? ((sellPrice - avgBuyPrice) / avgBuyPrice * 100)
+                : null;
+            const totalPL      = (sellPrice != null)
+                ? (sellPrice - avgBuyPrice) * totalQty
+                : null;
+            return { itemName: g.itemName, itemId: g.itemId, totalQty, avgBuyPrice, sellPrice, roi, totalSpent, totalPL };
+        });
+    };
+
+    Analytics.marketStats = function (marketData) {
+        const byItem = {};
+        let buyCount = 0, sellCount = 0;
+        for (const e of marketData) {
+            const key = e.itemName || "Unknown";
+            if (!byItem[key]) byItem[key] = { buys: [], sells: [] };
+            if (e.type === "buy") { byItem[key].buys.push(e); buyCount++; }
+            else                  { byItem[key].sells.push(e); sellCount++; }
+        }
+        let totalProfit = 0, totalVolume = 0;
+        const itemProfits = [];
+        for (const [name, { buys, sells }] of Object.entries(byItem)) {
+            const sellTotal = sells.reduce((s, e) => s + e.pricePerUnit * e.qty, 0);
+            const buyTotal  = buys.reduce((s, e) => s + e.pricePerUnit * e.qty, 0);
+            const sellQty   = sells.reduce((s, e) => s + e.qty, 0);
+            const buyQty    = buys.reduce((s, e) => s + e.qty, 0);
+            const profit    = sells.length > 0 && buys.length > 0
+                ? sellTotal - buyTotal
+                : 0;
+            totalVolume += sellTotal + buyTotal;
+            totalProfit += (sellTotal - buyTotal);
+            const avgSell  = sellQty > 0 ? sellTotal / sellQty : 0;
+            const avgBuy   = buyQty  > 0 ? buyTotal  / buyQty  : 0;
+            const roi      = (avgBuy > 0 && avgSell > 0)
+                ? ((avgSell - avgBuy) / avgBuy * 100)
+                : null;
+            itemProfits.push({ itemName: name, profit, roi });
+        }
+        const topItems = itemProfits.sort((a, b) => b.profit - a.profit).slice(0, 5);
+        return { totalProfit, totalVolume, topItems, buyCount, sellCount };
+    };
+
+    Analytics.muggingStats = function (muggingData) {
+        if (!muggingData.length) {
+            return { totalGained: 0, totalLost: 0, netMugging: 0, biggestLoss: null, biggestGain: null, dailyGained: 0, dailyLost: 0 };
+        }
+        const gained = muggingData.filter(e => e.type === "gained");
+        const lost   = muggingData.filter(e => e.type === "lost");
+        const totalGained = gained.reduce((s, e) => s + (e.amount || 0), 0);
+        const totalLost   = lost.reduce((s, e) => s + (e.amount || 0), 0);
+        const netMugging  = totalGained - totalLost;
+        const biggestLoss = lost.length  ? lost.reduce((a, b)  => b.amount > a.amount ? b : a)  : null;
+        const biggestGain = gained.length ? gained.reduce((a, b) => b.amount > a.amount ? b : a) : null;
+        const timestamps  = muggingData.map(e => e.timestamp || 0).filter(t => t > 0);
+        const minTs       = timestamps.length ? Math.min(...timestamps) : 0;
+        const maxTs       = timestamps.length ? Math.max(...timestamps) : 0;
+        const daySpan     = Math.max(1, (maxTs - minTs) / 86400);
+        return {
+            totalGained, totalLost, netMugging, biggestLoss, biggestGain,
+            dailyGained: totalGained / daySpan,
+            dailyLost:   totalLost   / daySpan,
+        };
+    };
+
+    Analytics.overview = function (shopData, marketData, muggingData) {
+        const allTs = [
+            ...shopData.map(e => e.timestamp),
+            ...marketData.map(e => e.timestamp),
+            ...muggingData.map(e => e.timestamp),
+        ].filter(t => t > 0);
+        const minTs    = allTs.length ? Math.min(...allTs) : 0;
+        const maxTs    = allTs.length ? Math.max(...allTs) : 0;
+        const daySpan  = Math.max(1, (maxTs - minTs) / 86400);
+
+        const totalShopSpend     = shopData.reduce((s, e) => s + (e.buyPriceTotal || 0), 0);
+        const buys               = marketData.filter(e => e.type === "buy");
+        const sells              = marketData.filter(e => e.type === "sell");
+        const totalMarketBuy     = buys.reduce((s, e)  => s + e.pricePerUnit * e.qty, 0);
+        const totalMarketSell    = sells.reduce((s, e) => s + e.pricePerUnit * e.qty, 0);
+        const totalMarketProfit  = totalMarketSell - totalMarketBuy;
+        const mugStats           = Analytics.muggingStats(muggingData);
+        const totalMuggingGained = mugStats.totalGained;
+        const totalMuggingLost   = mugStats.totalLost;
+        const netCashFlow        = totalMarketProfit + totalMuggingGained - totalMuggingLost - totalShopSpend;
+        const totalMovement      = totalShopSpend + totalMarketBuy + totalMarketSell + totalMuggingGained + totalMuggingLost;
+        const cashEfficiency     = (netCashFlow / Math.max(1, totalMovement)) * 100;
+        const dailyAvgIncome     = (totalMarketSell + totalMuggingGained) / daySpan;
+        const dailyAvgSpending   = (totalShopSpend  + totalMarketBuy)     / daySpan;
+
+        // Top 5 profitable items (shop + market combined)
+        const shopItems = Analytics.shopROI(shopData).map(i => ({
+            itemName: i.itemName, totalPL: i.totalPL ?? 0, roi: i.roi ?? 0,
+        }));
+        const mktStats  = Analytics.marketStats(marketData);
+        const mktItems  = mktStats.topItems.map(i => ({
+            itemName: i.itemName, totalPL: i.profit, roi: i.roi ?? 0,
+        }));
+        const combined  = [...shopItems, ...mktItems]
+            .sort((a, b) => b.totalPL - a.totalPL)
+            .slice(0, 5);
+
+        return {
+            totalShopSpend, totalMarketBuy, totalMarketSell, totalMarketProfit,
+            totalMuggingGained, totalMuggingLost, netCashFlow, cashEfficiency,
+            dailyAvgIncome, dailyAvgSpending, topProfitableItems: combined,
+        };
+    };
+
+    Analytics.dailyCashFlow = function (shopData, marketData, muggingData) {
+        const days = [];
+        const now  = new Date();
+        for (let i = 29; i >= 0; i--) {
+            const d = new Date(now);
+            d.setDate(d.getDate() - i);
+            d.setHours(0, 0, 0, 0);
+            days.push(d);
+        }
+        return days.map(day => {
+            const dayStart = day.getTime() / 1000;
+            const dayEnd   = dayStart + 86400;
+            const inRange  = e => (e.timestamp || 0) >= dayStart && (e.timestamp || 0) < dayEnd;
+            const income = marketData.filter(e => e.type === "sell" && inRange(e))
+                .reduce((s, e) => s + e.pricePerUnit * e.qty, 0)
+                + muggingData.filter(e => e.type === "gained" && inRange(e))
+                    .reduce((s, e) => s + (e.amount || 0), 0);
+            const spending = shopData.filter(inRange)
+                .reduce((s, e) => s + (e.buyPriceTotal || 0), 0)
+                + marketData.filter(e => e.type === "buy" && inRange(e))
+                    .reduce((s, e) => s + e.pricePerUnit * e.qty, 0);
+            const muggingLoss = muggingData.filter(e => e.type === "lost" && inRange(e))
+                .reduce((s, e) => s + (e.amount || 0), 0);
+            const dateStr = day.toISOString().slice(0, 10);
+            return { date: dateStr, income, spending, muggingLoss };
+        });
+    };
+
+    // =========================================================================
+    // SECTION 5 — CSV Export
+    // =========================================================================
+
+    function exportCSV(filename, headers, rows) {
+        const csv = [headers, ...rows]
+            .map(r => r.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(","))
+            .join("\n");
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement("a");
+        a.href     = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    // =========================================================================
+    // SECTION 6 — CSS Injection
+    // =========================================================================
+
+    function injectCSS() {
+        if (document.getElementById("cfa-style")) return;
+        const style = document.createElement("style");
+        style.id = "cfa-style";
+        style.textContent = `
+/* ── CFA overlay & panel ── */
+#cfa-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
+    z-index:999995; backdrop-filter:blur(2px);
+}
+#cfa-overlay.cfa-visible { display:block; }
+#cfa-panel {
+    display:none; position:fixed; top:50%; left:50%;
+    transform:translate(-50%,-50%);
+    width:960px; max-width:100vw; max-height:88vh;
+    background:#1a1a1a; border:1px solid #444; border-radius:10px;
+    z-index:999996; flex-direction:column; overflow:hidden;
+    font-family:'Segoe UI',Arial,sans-serif; font-size:14px; color:#ddd;
+    box-shadow:0 8px 40px rgba(0,0,0,.7);
+}
+#cfa-panel.cfa-visible { display:flex; }
+/* ── Header ── */
+#cfa-header {
+    background:#222; border-bottom:1px solid #444;
+    padding:12px 16px; display:flex; align-items:center;
+    justify-content:space-between; flex-shrink:0;
+}
+#cfa-header h2 { margin:0; font-size:17px; color:#f0f0f0; font-weight:600; }
+.cfa-ver { font-size:11px; color:#888; margin-left:6px; }
+.cfa-header-controls { display:flex; align-items:center; gap:10px; }
+#cfa-close {
+    background:none; border:none; color:#888; font-size:22px;
+    cursor:pointer; line-height:1; padding:0 4px;
+}
+#cfa-close:hover { color:#f0f0f0; }
+/* ── Tabs ── */
+#cfa-tabs {
+    display:flex; background:#252525; border-bottom:1px solid #333;
+    flex-shrink:0; overflow-x:auto;
+}
+.cfa-tab {
+    padding:10px 18px; cursor:pointer; color:#888; font-size:13px;
+    white-space:nowrap; border-bottom:2px solid transparent;
+    transition:color .15s,border-color .15s;
+}
+.cfa-tab:hover { color:#ddd; }
+.cfa-tab.active { color:${ACCENT}; border-bottom-color:${ACCENT}; }
+/* ── Content ── */
+#cfa-content {
+    flex:1; overflow-y:auto; padding:16px;
+    scrollbar-width:thin; scrollbar-color:#444 #1a1a1a;
+}
+#cfa-content::-webkit-scrollbar { width:6px; }
+#cfa-content::-webkit-scrollbar-track { background:#1a1a1a; }
+#cfa-content::-webkit-scrollbar-thumb { background:#444; border-radius:3px; }
+/* ── Toggle button ── */
+#cfa-toggle {
+    position:fixed; bottom:80px; right:16px; z-index:999997;
+    background:${ACCENT}; color:#000; border:none; border-radius:50px;
+    width:48px; height:48px; font-size:20px; font-weight:700;
+    cursor:pointer; box-shadow:0 2px 12px rgba(0,0,0,.5);
+    display:flex; align-items:center; justify-content:center;
+    transition:background .15s,transform .1s;
+}
+#cfa-toggle:hover { background:#d97706; transform:scale(1.08); }
+/* ── Inputs ── */
+.cfa-input, .cfa-select {
+    background:#2a2a2a; border:1px solid #444; color:#ddd;
+    border-radius:5px; padding:6px 9px; font-size:13px;
+}
+.cfa-input:focus, .cfa-select:focus {
+    outline:none; border-color:${ACCENT};
+}
+/* ── Buttons ── */
+.cfa-btn {
+    background:#b45309; color:#fff; border:none; border-radius:5px;
+    padding:7px 14px; font-size:13px; cursor:pointer;
+    transition:background .15s;
+}
+.cfa-btn:hover { background:#d97706; }
+.cfa-btn-muted {
+    background:#333; color:#ccc; border:none; border-radius:5px;
+    padding:7px 14px; font-size:13px; cursor:pointer;
+    transition:background .15s;
+}
+.cfa-btn-muted:hover { background:#444; }
+.cfa-btn-sm {
+    background:#333; color:#bbb; border:none; border-radius:4px;
+    padding:3px 8px; font-size:11px; cursor:pointer;
+}
+.cfa-btn-sm:hover { background:#444; }
+.cfa-btn-danger {
+    background:#7f1d1d; color:#fca5a5; border:none; border-radius:5px;
+    padding:7px 14px; font-size:13px; cursor:pointer;
+}
+.cfa-btn-danger:hover { background:#991b1b; }
+/* ── Table ── */
+.cfa-table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+.cfa-table th {
+    background:#2a2a2a; color:#aaa; text-align:left;
+    padding:8px 10px; border-bottom:1px solid #333;
+    cursor:pointer; user-select:none; font-weight:600;
+    white-space:nowrap;
+}
+.cfa-table th:hover { color:#f0f0f0; }
+.cfa-table td {
+    padding:7px 10px; border-bottom:1px solid #2a2a2a;
+    vertical-align:middle;
+}
+.cfa-table tr:hover td { background:#232323; }
+.cfa-row-profit td { background:rgba(76,175,80,.06); }
+.cfa-row-loss   td { background:rgba(239,83,80,.06); }
+.cfa-row-gained td { background:rgba(76,175,80,.08); }
+.cfa-row-lost   td { background:rgba(239,83,80,.08); }
+/* ── Badges ── */
+.cfa-badge-profit { color:#4caf50; font-weight:600; }
+.cfa-badge-loss   { color:#ef5350; font-weight:600; }
+.cfa-badge-neutral { color:#888; }
+/* ── Cards / grid ── */
+.cfa-card {
+    background:#222; border:1px solid #333; border-radius:8px; padding:14px;
+}
+.cfa-stats-grid {
+    display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:16px;
+}
+.cfa-stat {
+    background:#222; border:1px solid #333; border-radius:8px;
+    padding:14px; text-align:center;
+}
+.cfa-stat-label { font-size:11px; color:#888; margin-bottom:4px; }
+.cfa-stat-value { font-size:20px; font-weight:700; color:#f0f0f0; }
+/* ── Section ── */
+.cfa-section-title {
+    font-size:13px; font-weight:600; color:#aaa;
+    text-transform:uppercase; letter-spacing:.5px;
+    margin:16px 0 8px;
+}
+/* ── Form row ── */
+.cfa-form-row {
+    display:flex; flex-wrap:wrap; gap:10px;
+    align-items:flex-end; margin-bottom:12px;
+    background:#202020; border:1px solid #2e2e2e;
+    border-radius:8px; padding:12px;
+}
+.cfa-field { display:flex; flex-direction:column; gap:4px; }
+.cfa-field label { font-size:11px; color:#888; }
+/* ── Stats bar ── */
+.cfa-stats-bar {
+    display:flex; gap:20px; flex-wrap:wrap;
+    background:#202020; border:1px solid #2e2e2e;
+    border-radius:8px; padding:10px 14px;
+    margin-bottom:12px; font-size:13px;
+}
+.cfa-stats-bar span { color:#aaa; }
+.cfa-stats-bar b { color:#f0f0f0; }
+/* ── Sync bar ── */
+.cfa-sync-bar {
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    background:#202020; border:1px solid #2e2e2e; border-radius:8px;
+    padding:10px 14px; margin-bottom:14px;
+}
+.cfa-sync-note { font-size:11px; color:#666; margin-left:auto; }
+/* ── Spinner ── */
+.cfa-spinner {
+    display:inline-block; width:14px; height:14px;
+    border:2px solid #444; border-top-color:${ACCENT};
+    border-radius:50%; animation:cfa-spin .7s linear infinite;
+}
+@keyframes cfa-spin { to { transform:rotate(360deg); } }
+/* ── Misc ── */
+.cfa-msg-error   { color:#ef5350; font-size:12px; margin-top:4px; }
+.cfa-msg-success { color:#4caf50; font-size:12px; margin-top:4px; }
+.cfa-muted { color:#888; font-size:12px; }
+.cfa-top-table { width:100%; border-collapse:collapse; font-size:13px; }
+.cfa-top-table td { padding:6px 10px; border-bottom:1px solid #2a2a2a; }
+/* ── Chart container ── */
+.cfa-chart-wrap {
+    background:#222; border:1px solid #333; border-radius:8px;
+    padding:14px; margin-bottom:16px;
+}
+.cfa-chart-title { font-size:13px; color:#aaa; margin-bottom:10px; font-weight:600; }
+/* ── Media query ── */
+@media (max-width:620px) {
+    .cfa-stats-grid { grid-template-columns:repeat(2,1fr); }
+    .cfa-form-row   { flex-direction:column; }
+    #cfa-panel      { max-width:100vw; border-radius:0; }
+}
+        `;
+        document.head.appendChild(style);
+    }
+
+    // =========================================================================
+    // Utilities
+    // =========================================================================
+
+    function escHtml(s) {
+        return String(s ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+    }
+
+    const fmt = {
+        money(n) {
+            if (n == null || isNaN(n)) return "$0";
+            return "$" + Math.round(n).toLocaleString();
+        },
+        pct(n) {
+            if (n == null || isNaN(n)) return "—";
+            return n.toFixed(1) + "%";
+        },
+        date(ts) {
+            if (!ts) return "—";
+            return new Date(ts * 1000).toLocaleDateString();
+        },
+        dateTime(ts) {
+            if (!ts) return "—";
+            return new Date(ts * 1000).toLocaleString();
+        },
+        uid() {
+            return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        },
+    };
+
+    // =========================================================================
+    // SECTION 7 — UI Class
+    // =========================================================================
+
+    class UI {
+        constructor(api) {
+            this.api          = api;
+            this.activeTab    = "overview";
+            this._panel       = null;
+            this._overlay     = null;
+            this._authed      = false;
+            this._dateRange   = "all";
+            this._shopSort    = { col: "roi",       dir: "desc" };
+            this._marketSort  = { col: "timestamp", dir: "desc" };
+            this._muggingSort = { col: "timestamp", dir: "desc" };
+            this._syncing     = false;
+            this._charts      = {};
+        }
+
+        inject() {
+            injectCSS();
+
+            // Overlay
+            this._overlay = document.createElement("div");
+            this._overlay.id = "cfa-overlay";
+            document.body.appendChild(this._overlay);
+
+            // Panel
+            this._panel = document.createElement("div");
+            this._panel.id = "cfa-panel";
+            this._panel.innerHTML = `
+<div id="cfa-header">
+  <h2>Cash Flow Analytics <span class="cfa-ver">v${escHtml(VERSION)}</span></h2>
+  <div class="cfa-header-controls">
+    <label style="color:#888;font-size:12px">Range:</label>
+    <select id="cfa-date-range" class="cfa-select">
+      <option value="today">Today</option>
+      <option value="7d">Last 7 Days</option>
+      <option value="30d">Last 30 Days</option>
+      <option value="all" selected>All Time</option>
+    </select>
+    <button id="cfa-close">&times;</button>
+  </div>
+</div>
+<div id="cfa-tabs">
+  <div class="cfa-tab active" data-tab="overview">Overview</div>
+  <div class="cfa-tab" data-tab="shop">Shop ROI</div>
+  <div class="cfa-tab" data-tab="market">Market</div>
+  <div class="cfa-tab" data-tab="mugging">Mugging</div>
+  <div class="cfa-tab" data-tab="charts">Charts</div>
+  <div class="cfa-tab" data-tab="settings">Settings</div>
+</div>
+<div id="cfa-content"></div>
+            `;
+            document.body.appendChild(this._panel);
+
+            // Toggle button
+            const btn = document.createElement("button");
+            btn.id = "cfa-toggle";
+            btn.textContent = "$";
+            btn.title = "Cash Flow Analytics";
+            document.body.appendChild(btn);
+
+            // Events
+            this._overlay.addEventListener("click", () => this.toggle(false));
+            this._panel.querySelector("#cfa-close").addEventListener("click", () => this.toggle(false));
+            this._panel.querySelector("#cfa-tabs").addEventListener("click", e => {
+                const t = e.target.closest(".cfa-tab");
+                if (t && t.dataset.tab) {
+                    this.activeTab = t.dataset.tab;
+                    this._syncTabs();
+                    this._renderActive();
+                }
+            });
+            this._panel.querySelector("#cfa-date-range").addEventListener("change", e => {
+                this._dateRange = e.target.value;
+                this._renderActive();
+            });
+            btn.addEventListener("click", () => this.toggle());
+        }
+
+        toggle(open) {
+            const shouldOpen = open !== undefined ? open : !this._panel.classList.contains("cfa-visible");
+            this._panel.classList.toggle("cfa-visible", shouldOpen);
+            this._overlay.classList.toggle("cfa-visible", shouldOpen);
+            if (shouldOpen) this._renderActive();
+        }
+
+        _syncTabs() {
+            this._panel.querySelectorAll(".cfa-tab").forEach(t => {
+                t.classList.toggle("active", t.dataset.tab === this.activeTab);
+            });
+        }
+
+        _renderActive() {
+            if (!this._authed) { this._renderAuth(); return; }
+            const map = {
+                overview: () => this._renderOverview(),
+                shop:     () => this._renderShop(),
+                market:   () => this._renderMarket(),
+                mugging:  () => this._renderMugging(),
+                charts:   () => this._renderCharts(),
+                settings: () => this._renderSettings(),
+            };
+            (map[this.activeTab] || map.overview)();
+        }
+
+        _content(html) {
+            document.getElementById("cfa-content").innerHTML = html;
+        }
+
+        // ── Auth ──────────────────────────────────────────────────────────────
+
+        _renderAuth() {
+            this._content(`
+<div style="max-width:500px;margin:40px auto;">
+  <div class="cfa-card">
+    <div class="cfa-section-title">API Key Setup</div>
+    <p style="color:#aaa;font-size:13px;margin:0 0 12px">
+      Enter your Torn API key to enable mugging sync and market price lookup.
+    </p>
+    <div class="cfa-form-row" style="margin:0 0 10px">
+      <div class="cfa-field" style="flex:1">
+        <label>Torn API Key</label>
+        <input id="cfa-auth-key" class="cfa-input" type="password" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%">
+      </div>
+      <button id="cfa-auth-save" class="cfa-btn">Save &amp; Connect</button>
+    </div>
+    <div id="cfa-auth-msg"></div>
+    <hr style="border-color:#333;margin:14px 0">
+    <p style="color:#666;font-size:12px;margin:0 0 10px">
+      Dashboard features not requiring API (shop tracking, manual market entries) work without a key.
+    </p>
+    <button id="cfa-auth-skip" class="cfa-btn-muted">Continue without API key</button>
+  </div>
+</div>
+            `);
+            const c = document.getElementById("cfa-content");
+            c.querySelector("#cfa-auth-save").addEventListener("click", async () => {
+                const key = c.querySelector("#cfa-auth-key").value.trim();
+                const msg = c.querySelector("#cfa-auth-msg");
+                if (!key) { msg.className = "cfa-msg-error"; msg.textContent = "Please enter an API key."; return; }
+                msg.className = ""; msg.textContent = "Validating...";
+                try {
+                    this.api.setKey(key);
+                    const profile = await this.api.fetchProfile();
+                    const userId  = profile?.player_id || profile?.id || profile?.ID || "";
+                    Store.saveApiKey(key);
+                    if (userId) { Store.saveMyUserId(userId); this.api.myUserId = String(userId); }
+                    this._authed = true;
+                    msg.className = "cfa-msg-success";
+                    msg.textContent = "Connected! Loading dashboard...";
+                    setTimeout(() => this._renderActive(), 600);
+                } catch (err) {
+                    msg.className = "cfa-msg-error";
+                    msg.textContent = "Failed: " + (err.message || "Invalid key");
+                }
+            });
+            c.querySelector("#cfa-auth-skip").addEventListener("click", () => {
+                this._authed = true;
+                this._renderActive();
+            });
+        }
+
+        // ── Overview ─────────────────────────────────────────────────────────
+
+        _renderOverview() {
+            const range = this._dateRange;
+            const shopRaw   = Analytics.filterByRange(Store.getShop(),    range);
+            const mktRaw    = Analytics.filterByRange(Store.getMarket(),  range);
+            const mugRaw    = Analytics.filterByRange(Store.getMugging(), range);
+            const ov        = Analytics.overview(shopRaw, mktRaw, mugRaw);
+
+            const topRows   = ov.topProfitableItems.map(i => `
+<tr>
+  <td>${escHtml(i.itemName)}</td>
+  <td class="${i.totalPL >= 0 ? "cfa-badge-profit" : "cfa-badge-loss"}">${fmt.money(i.totalPL)}</td>
+  <td class="${(i.roi || 0) >= 0 ? "cfa-badge-profit" : "cfa-badge-loss"}">${fmt.pct(i.roi)}</td>
+</tr>`).join("") || `<tr><td colspan="3" class="cfa-muted" style="padding:12px">No item data yet.</td></tr>`;
+
+            const netColor  = ov.netCashFlow >= 0 ? "#4caf50" : "#ef5350";
+            const mugNet    = ov.totalMuggingGained - ov.totalMuggingLost;
+            const mugColor  = mugNet >= 0 ? "#4caf50" : "#ef5350";
+
+            this._content(`
+<div class="cfa-section-title">Top 5 Most Profitable Items</div>
+<div class="cfa-card" style="margin-bottom:16px">
+  <table class="cfa-top-table">
+    <thead><tr>
+      <th style="color:#888;font-size:12px;padding:6px 10px">Item</th>
+      <th style="color:#888;font-size:12px;padding:6px 10px">Total P&L</th>
+      <th style="color:#888;font-size:12px;padding:6px 10px">ROI%</th>
+    </tr></thead>
+    <tbody>${topRows}</tbody>
+  </table>
+</div>
+
+<div class="cfa-section-title">Summary</div>
+<div class="cfa-stats-grid">
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Net Cash Flow</div>
+    <div class="cfa-stat-value" style="color:${netColor}">${fmt.money(ov.netCashFlow)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Shop Spend</div>
+    <div class="cfa-stat-value" style="color:#ef5350">${fmt.money(ov.totalShopSpend)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Trade Profit</div>
+    <div class="cfa-stat-value" style="color:${ov.totalMarketProfit >= 0 ? "#4caf50" : "#ef5350"}">${fmt.money(ov.totalMarketProfit)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Mugging Net</div>
+    <div class="cfa-stat-value" style="color:${mugColor}">${fmt.money(mugNet)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Daily Avg Income</div>
+    <div class="cfa-stat-value">${fmt.money(ov.dailyAvgIncome)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Cash Efficiency</div>
+    <div class="cfa-stat-value" style="color:${ov.cashEfficiency >= 0 ? "#4caf50" : "#ef5350"}">${fmt.pct(ov.cashEfficiency)}</div>
+  </div>
+</div>
+            `);
+        }
+
+        // ── Shop ROI ──────────────────────────────────────────────────────────
+
+        _renderShop() {
+            const range  = this._dateRange;
+            const raw    = Analytics.filterByRange(Store.getShop(), range);
+            const rows   = Analytics.shopROI(raw);
+
+            // Sort rows
+            const { col, dir } = this._shopSort;
+            rows.sort((a, b) => {
+                let av = a[col], bv = b[col];
+                if (av == null) av = dir === "asc" ? Infinity : -Infinity;
+                if (bv == null) bv = dir === "asc" ? Infinity : -Infinity;
+                return dir === "asc" ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+            });
+
+            const th = (key, label) => {
+                const icon = this._shopSort.col === key ? (this._shopSort.dir === "asc" ? " ▲" : " ▼") : "";
+                return `<th data-sort="${key}">${label}${icon}</th>`;
+            };
+
+            const tableRows = rows.map(r => {
+                const isProfit = r.roi != null && r.roi > 0;
+                const isLoss   = r.roi != null && r.roi < 0;
+                const cls      = isProfit ? "cfa-row-profit" : isLoss ? "cfa-row-loss" : "";
+                return `
+<tr class="${cls}" data-itemname="${escHtml(r.itemName)}">
+  <td>${escHtml(r.itemName)}${r.itemId ? `<br><span class="cfa-muted">ID: ${escHtml(r.itemId)}</span>` : ""}</td>
+  <td>${r.totalQty.toLocaleString()}</td>
+  <td>${fmt.money(r.avgBuyPrice)}</td>
+  <td class="cfa-mkt-cell-${escHtml(r.itemName)}">${r.sellPrice != null ? fmt.money(r.sellPrice) : `<button class="cfa-btn-sm cfa-edit-sell" data-item="${escHtml(r.itemName)}">Set price</button>`}</td>
+  <td class="${isProfit ? "cfa-badge-profit" : isLoss ? "cfa-badge-loss" : "cfa-badge-neutral"}">${fmt.pct(r.roi)}</td>
+  <td>${fmt.money(r.totalSpent)}</td>
+  <td class="${r.totalPL != null && r.totalPL >= 0 ? "cfa-badge-profit" : r.totalPL != null ? "cfa-badge-loss" : "cfa-badge-neutral"}">${r.totalPL != null ? fmt.money(r.totalPL) : "—"}</td>
+  <td>
+    <button class="cfa-btn-sm cfa-update-sell" data-item="${escHtml(r.itemName)}" data-itemid="${escHtml(r.itemId ?? "")}">Update</button>
+    <button class="cfa-btn-sm cfa-del-shop" data-item="${escHtml(r.itemName)}" style="margin-left:4px;color:#ef9a9a">Del</button>
+  </td>
+</tr>`;
+            }).join("") || `<tr><td colspan="8" class="cfa-muted" style="padding:12px">No shop entries yet. Add a purchase below.</td></tr>`;
+
+            this._content(`
+<div class="cfa-form-row">
+  <div class="cfa-field">
+    <label>Item Name</label>
+    <input id="sh-name" class="cfa-input" placeholder="e.g. Xanax" style="width:140px">
+  </div>
+  <div class="cfa-field">
+    <label>Item ID (opt)</label>
+    <input id="sh-id" class="cfa-input" type="number" placeholder="206" style="width:90px">
+  </div>
+  <div class="cfa-field">
+    <label>Qty</label>
+    <input id="sh-qty" class="cfa-input" type="number" min="1" value="1" style="width:70px">
+  </div>
+  <div class="cfa-field">
+    <label>Total Buy Price ($)</label>
+    <input id="sh-buy" class="cfa-input" type="number" min="0" placeholder="500000" style="width:130px">
+  </div>
+  <div class="cfa-field">
+    <label>Sell Price/Unit ($)</label>
+    <input id="sh-sell" class="cfa-input" type="number" min="0" placeholder="optional" style="width:130px">
+  </div>
+  <div class="cfa-field" style="flex-direction:row;gap:6px;align-items:flex-end">
+    <button id="sh-fetch-mkt" class="cfa-btn-muted" title="Fetch market price for entered Item ID">Fetch Market ▼</button>
+    <button id="sh-add" class="cfa-btn">Add Entry</button>
+  </div>
+  <div id="sh-mkt-val" style="color:${ACCENT};font-size:12px;align-self:flex-end"></div>
+</div>
+<div id="sh-msg"></div>
+
+<table class="cfa-table">
+  <thead><tr>
+    ${th("itemName","Item")}
+    ${th("totalQty","Qty")}
+    ${th("avgBuyPrice","Avg Buy $")}
+    ${th("sellPrice","Market $")}
+    ${th("roi","ROI%")}
+    ${th("totalSpent","Total Spent")}
+    ${th("totalPL","P&L")}
+    <th>Actions</th>
+  </tr></thead>
+  <tbody>${tableRows}</tbody>
+</table>
+<br>
+<button id="sh-export" class="cfa-btn-muted">Export CSV</button>
+            `);
+
+            const c = document.getElementById("cfa-content");
+
+            // Sort headers
+            c.querySelectorAll(".cfa-table th[data-sort]").forEach(th2 => {
+                th2.addEventListener("click", () => {
+                    const key = th2.dataset.sort;
+                    if (this._shopSort.col === key) {
+                        this._shopSort.dir = this._shopSort.dir === "asc" ? "desc" : "asc";
+                    } else {
+                        this._shopSort = { col: key, dir: "desc" };
+                    }
+                    this._renderShop();
+                });
+            });
+
+            // Fetch market price
+            c.querySelector("#sh-fetch-mkt").addEventListener("click", async () => {
+                const itemId = parseInt(c.querySelector("#sh-id").value);
+                const valEl  = c.querySelector("#sh-mkt-val");
+                const key    = Store.getApiKey();
+                if (!key) { valEl.style.color = "#ef5350"; valEl.textContent = "API key required."; return; }
+                if (!itemId) { valEl.style.color = "#ef5350"; valEl.textContent = "Enter Item ID first."; return; }
+                valEl.style.color = "#888"; valEl.textContent = "Fetching...";
+                const price = await this.api.fetchMarketItem(itemId);
+                if (price != null) {
+                    c.querySelector("#sh-sell").value = price;
+                    valEl.style.color = ACCENT;
+                    valEl.textContent = `Market: ${fmt.money(price)}`;
+                } else {
+                    valEl.style.color = "#ef5350"; valEl.textContent = "No listings found.";
+                }
+            });
+
+            // Add entry
+            c.querySelector("#sh-add").addEventListener("click", () => {
+                const name = c.querySelector("#sh-name").value.trim();
+                const msg  = c.querySelector("#sh-msg");
+                if (!name) { msg.className = "cfa-msg-error"; msg.textContent = "Item name required."; return; }
+                const qty  = parseFloat(c.querySelector("#sh-qty").value) || 1;
+                const buy  = parseFloat(c.querySelector("#sh-buy").value) || 0;
+                const sell = c.querySelector("#sh-sell").value ? parseFloat(c.querySelector("#sh-sell").value) : null;
+                const id   = c.querySelector("#sh-id").value ? parseInt(c.querySelector("#sh-id").value) : null;
+                Store.addShop({ id: fmt.uid(), itemId: id, itemName: name, qty, buyPriceTotal: buy, sellPricePerUnit: sell, timestamp: Math.floor(Date.now() / 1000) });
+                msg.className = "cfa-msg-success"; msg.textContent = "Entry added!";
+                setTimeout(() => this._renderShop(), 300);
+            });
+
+            // Update sell price buttons
+            c.querySelectorAll(".cfa-update-sell").forEach(btn => {
+                btn.addEventListener("click", async () => {
+                    const itemName = btn.dataset.item;
+                    const itemId   = btn.dataset.itemid ? parseInt(btn.dataset.itemid) : null;
+                    const newPrice = prompt(`New sell price per unit for "${itemName}":`);
+                    if (newPrice === null) return;
+                    const price = parseFloat(newPrice);
+                    if (isNaN(price)) return;
+                    const all = Store.getShop();
+                    all.filter(e => e.itemName === itemName).forEach(e => { e.sellPricePerUnit = price; });
+                    Store.saveShop(all);
+                    this._renderShop();
+                });
+            });
+
+            // Delete
+            c.querySelectorAll(".cfa-del-shop").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    if (!confirm(`Delete all "${btn.dataset.item}" shop entries?`)) return;
+                    const all = Store.getShop().filter(e => e.itemName !== btn.dataset.item);
+                    Store.saveShop(all);
+                    this._renderShop();
+                });
+            });
+
+            // Export
+            c.querySelector("#sh-export").addEventListener("click", () => {
+                const headers = ["Item","Qty","Avg Buy $","Sell $/Unit","ROI%","Total Spent","P&L"];
+                const rws = Analytics.shopROI(Store.getShop()).map(r => [
+                    r.itemName, r.totalQty, r.avgBuyPrice.toFixed(2),
+                    r.sellPrice ?? "", r.roi != null ? r.roi.toFixed(2) : "",
+                    r.totalSpent.toFixed(2), r.totalPL != null ? r.totalPL.toFixed(2) : "",
+                ]);
+                exportCSV("cfa_shop_roi.csv", headers, rws);
+            });
+        }
+
+        // ── Market ────────────────────────────────────────────────────────────
+
+        _renderMarket() {
+            const range    = this._dateRange;
+            const raw      = Analytics.filterByRange(Store.getMarket(), range);
+            const stats    = Analytics.marketStats(raw);
+
+            const { col, dir } = this._marketSort;
+            const sorted = [...raw].sort((a, b) => {
+                let av = col === "total" ? a.pricePerUnit * a.qty : a[col];
+                let bv = col === "total" ? b.pricePerUnit * b.qty : b[col];
+                if (av == null) av = 0; if (bv == null) bv = 0;
+                return dir === "asc" ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+            });
+
+            const th = (key, label) => {
+                const icon = this._marketSort.col === key ? (this._marketSort.dir === "asc" ? " ▲" : " ▼") : "";
+                return `<th data-sort="${key}">${label}${icon}</th>`;
+            };
+
+            const profitColor = stats.totalProfit >= 0 ? "#4caf50" : "#ef5350";
+            const tableRows   = sorted.map(e => {
+                const total = e.pricePerUnit * e.qty;
+                const cls   = e.type === "sell" ? "cfa-row-gained" : "cfa-row-lost";
+                return `
+<tr class="${cls}">
+  <td>${escHtml(e.itemName)}</td>
+  <td><span class="${e.type === "sell" ? "cfa-badge-profit" : "cfa-badge-loss"}">${escHtml(e.type.toUpperCase())}</span></td>
+  <td>${e.qty.toLocaleString()}</td>
+  <td>${fmt.money(e.pricePerUnit)}</td>
+  <td>${fmt.money(total)}</td>
+  <td>${fmt.date(e.timestamp)}</td>
+  <td><button class="cfa-btn-sm cfa-del-mkt" data-id="${escHtml(e.id)}" style="color:#ef9a9a">Del</button></td>
+</tr>`;
+            }).join("") || `<tr><td colspan="7" class="cfa-muted" style="padding:12px">No market trades yet.</td></tr>`;
+
+            const today = new Date().toISOString().slice(0, 10);
+
+            this._content(`
+<div class="cfa-form-row">
+  <div class="cfa-field">
+    <label>Item Name</label>
+    <input id="mkt-name" class="cfa-input" placeholder="e.g. Xanax" style="width:140px">
+  </div>
+  <div class="cfa-field">
+    <label>Type</label>
+    <select id="mkt-type" class="cfa-select">
+      <option value="buy">Buy</option>
+      <option value="sell">Sell</option>
+    </select>
+  </div>
+  <div class="cfa-field">
+    <label>Qty</label>
+    <input id="mkt-qty" class="cfa-input" type="number" min="1" value="1" style="width:70px">
+  </div>
+  <div class="cfa-field">
+    <label>Price per Unit ($)</label>
+    <input id="mkt-price" class="cfa-input" type="number" min="0" placeholder="0" style="width:130px">
+  </div>
+  <div class="cfa-field">
+    <label>Date</label>
+    <input id="mkt-date" class="cfa-input" type="date" value="${today}" style="width:130px">
+  </div>
+  <button id="mkt-add" class="cfa-btn" style="align-self:flex-end">Add Trade</button>
+</div>
+<div id="mkt-msg"></div>
+
+<div class="cfa-stats-bar">
+  <span>Total Profit: <b style="color:${profitColor}">${fmt.money(stats.totalProfit)}</b></span>
+  <span>Volume Traded: <b>${fmt.money(stats.totalVolume)}</b></span>
+  <span>Buys: <b>${stats.buyCount}</b></span>
+  <span>Sells: <b>${stats.sellCount}</b></span>
+</div>
+
+<table class="cfa-table">
+  <thead><tr>
+    ${th("itemName","Item")}
+    ${th("type","Type")}
+    ${th("qty","Qty")}
+    ${th("pricePerUnit","Price/Unit")}
+    ${th("total","Total")}
+    ${th("timestamp","Date")}
+    <th>Del</th>
+  </tr></thead>
+  <tbody>${tableRows}</tbody>
+</table>
+<br>
+<button id="mkt-export" class="cfa-btn-muted">Export CSV</button>
+            `);
+
+            const c = document.getElementById("cfa-content");
+
+            c.querySelectorAll(".cfa-table th[data-sort]").forEach(th2 => {
+                th2.addEventListener("click", () => {
+                    const key = th2.dataset.sort;
+                    if (this._marketSort.col === key) {
+                        this._marketSort.dir = this._marketSort.dir === "asc" ? "desc" : "asc";
+                    } else {
+                        this._marketSort = { col: key, dir: "desc" };
+                    }
+                    this._renderMarket();
+                });
+            });
+
+            c.querySelector("#mkt-add").addEventListener("click", () => {
+                const name  = c.querySelector("#mkt-name").value.trim();
+                const msg   = c.querySelector("#mkt-msg");
+                if (!name) { msg.className = "cfa-msg-error"; msg.textContent = "Item name required."; return; }
+                const type  = c.querySelector("#mkt-type").value;
+                const qty   = parseFloat(c.querySelector("#mkt-qty").value) || 1;
+                const price = parseFloat(c.querySelector("#mkt-price").value) || 0;
+                const dateV = c.querySelector("#mkt-date").value;
+                const ts    = dateV ? Math.floor(new Date(dateV + "T12:00:00").getTime() / 1000) : Math.floor(Date.now() / 1000);
+                Store.addMarket({ id: fmt.uid(), itemId: null, itemName: name, type, qty, pricePerUnit: price, timestamp: ts });
+                msg.className = "cfa-msg-success"; msg.textContent = "Trade added!";
+                setTimeout(() => this._renderMarket(), 300);
+            });
+
+            c.querySelectorAll(".cfa-del-mkt").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    const all = Store.getMarket().filter(e => e.id !== btn.dataset.id);
+                    Store.saveMarket(all);
+                    this._renderMarket();
+                });
+            });
+
+            c.querySelector("#mkt-export").addEventListener("click", () => {
+                const headers = ["Item","Type","Qty","Price/Unit","Total","Date"];
+                const rws = Store.getMarket().map(e => [
+                    e.itemName, e.type, e.qty, e.pricePerUnit,
+                    (e.pricePerUnit * e.qty).toFixed(2), fmt.date(e.timestamp),
+                ]);
+                exportCSV("cfa_market_trades.csv", headers, rws);
+            });
+        }
+
+        // ── Mugging ───────────────────────────────────────────────────────────
+
+        _renderMugging() {
+            const range     = this._dateRange;
+            const raw       = Analytics.filterByRange(Store.getMugging(), range);
+            const stats     = Analytics.muggingStats(raw);
+            const lastSync  = Store.getLastMugSync();
+            const lastSyncStr = lastSync ? fmt.dateTime(lastSync) : "Never";
+
+            const { col, dir } = this._muggingSort;
+            const sorted = [...raw].sort((a, b) => {
+                let av = a[col], bv = b[col];
+                if (av == null) av = 0; if (bv == null) bv = 0;
+                return dir === "asc" ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+            });
+
+            const th = (key, label) => {
+                const icon = this._muggingSort.col === key ? (this._muggingSort.dir === "asc" ? " ▲" : " ▼") : "";
+                return `<th data-sort="${key}">${label}${icon}</th>`;
+            };
+
+            const netColor  = stats.netMugging >= 0 ? "#4caf50" : "#ef5350";
+
+            const tableRows = sorted.map(e => {
+                const cls = e.type === "gained" ? "cfa-row-gained" : "cfa-row-lost";
+                return `
+<tr class="${cls}">
+  <td><span class="${e.type === "gained" ? "cfa-badge-profit" : "cfa-badge-loss"}">${escHtml(e.type.toUpperCase())}</span></td>
+  <td>${escHtml(e.attackerName || "—")}</td>
+  <td>${escHtml(e.defenderName || "—")}</td>
+  <td class="${e.type === "gained" ? "cfa-badge-profit" : "cfa-badge-loss"}">${fmt.money(e.amount)}</td>
+  <td>${fmt.date(e.timestamp)}</td>
+  <td><button class="cfa-btn-sm cfa-del-mug" data-id="${escHtml(e.id)}" style="color:#ef9a9a">Del</button></td>
+</tr>`;
+            }).join("") || `<tr><td colspan="6" class="cfa-muted" style="padding:12px">No mugging data. Sync from API or add manually.</td></tr>`;
+
+            this._content(`
+<div class="cfa-sync-bar">
+  <button id="mug-sync" class="cfa-btn">&#x21bb; Sync from API</button>
+  <span id="mug-spinner" style="display:none"><span class="cfa-spinner"></span></span>
+  <span id="mug-sync-msg" class="cfa-muted"></span>
+  <span class="cfa-sync-note">Last sync: ${escHtml(lastSyncStr)}</span>
+</div>
+<p class="cfa-muted" style="margin:0 0 14px">Syncs attack log and detects mugging results automatically.</p>
+
+<div class="cfa-stats-grid">
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Total Gained</div>
+    <div class="cfa-stat-value" style="color:#4caf50">${fmt.money(stats.totalGained)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Total Lost</div>
+    <div class="cfa-stat-value" style="color:#ef5350">${fmt.money(stats.totalLost)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Net Mugging</div>
+    <div class="cfa-stat-value" style="color:${netColor}">${fmt.money(stats.netMugging)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Biggest Single Loss</div>
+    <div class="cfa-stat-value" style="color:#ef5350">${stats.biggestLoss ? fmt.money(stats.biggestLoss.amount) : "—"}</div>
+    ${stats.biggestLoss ? `<div class="cfa-muted" style="font-size:11px;margin-top:2px">by ${escHtml(stats.biggestLoss.attackerName || "?")}</div>` : ""}
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Daily Avg Gained</div>
+    <div class="cfa-stat-value" style="color:#4caf50">${fmt.money(stats.dailyGained)}</div>
+  </div>
+  <div class="cfa-stat">
+    <div class="cfa-stat-label">Daily Avg Lost</div>
+    <div class="cfa-stat-value" style="color:#ef5350">${fmt.money(stats.dailyLost)}</div>
+  </div>
+</div>
+
+<table class="cfa-table">
+  <thead><tr>
+    ${th("type","Type")}
+    ${th("attackerName","Attacker")}
+    ${th("defenderName","Victim")}
+    ${th("amount","Amount")}
+    ${th("timestamp","Date")}
+    <th>Del</th>
+  </tr></thead>
+  <tbody>${tableRows}</tbody>
+</table>
+<br>
+<button id="mug-export" class="cfa-btn-muted">Export CSV</button>
+            `);
+
+            const c = document.getElementById("cfa-content");
+
+            c.querySelectorAll(".cfa-table th[data-sort]").forEach(th2 => {
+                th2.addEventListener("click", () => {
+                    const key = th2.dataset.sort;
+                    if (this._muggingSort.col === key) {
+                        this._muggingSort.dir = this._muggingSort.dir === "asc" ? "desc" : "asc";
+                    } else {
+                        this._muggingSort = { col: key, dir: "desc" };
+                    }
+                    this._renderMugging();
+                });
+            });
+
+            c.querySelector("#mug-sync").addEventListener("click", () => this._syncMuggingData());
+
+            c.querySelectorAll(".cfa-del-mug").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    const all = Store.getMugging().filter(e => e.id !== btn.dataset.id);
+                    Store.saveMugging(all);
+                    this._renderMugging();
+                });
+            });
+
+            c.querySelector("#mug-export").addEventListener("click", () => {
+                const headers = ["Type","Attacker","Victim","Amount","Date"];
+                const rws = Store.getMugging().map(e => [
+                    e.type, e.attackerName || "", e.defenderName || "", e.amount, fmt.date(e.timestamp),
+                ]);
+                exportCSV("cfa_mugging.csv", headers, rws);
+            });
+        }
+
+        // ── Charts ────────────────────────────────────────────────────────────
+
+        _renderCharts() {
+            // Destroy existing charts
+            for (const [id, chart] of Object.entries(this._charts)) {
+                try { chart.destroy(); } catch {}
+            }
+            this._charts = {};
+
+            if (typeof Chart === "undefined") {
+                this._content(`<div class="cfa-card" style="text-align:center;padding:40px;color:#ef5350">
+                    Chart.js not loaded. Check your internet connection or the @require URL.
+                </div>`);
+                return;
+            }
+
+            this._content(`
+<div class="cfa-chart-wrap">
+  <div class="cfa-chart-title">Daily Cash Flow — Last 30 Days</div>
+  <canvas id="cfa-chart-daily" height="120"></canvas>
+</div>
+<div class="cfa-chart-wrap">
+  <div class="cfa-chart-title">Top Items by ROI%</div>
+  <canvas id="cfa-chart-roi" height="120"></canvas>
+</div>
+<div class="cfa-chart-wrap" style="max-width:400px">
+  <div class="cfa-chart-title">Spending Breakdown</div>
+  <canvas id="cfa-chart-donut" height="200"></canvas>
+</div>
+            `);
+
+            const range    = this._dateRange;
+            const shopAll  = Store.getShop();
+            const mktAll   = Store.getMarket();
+            const mugAll   = Store.getMugging();
+
+            // Chart defaults
+            const chartDefaults = {
+                color: "#ddd",
+                plugins: { legend: { labels: { color: "#ddd" } } },
+            };
+
+            // Chart 1 — Daily Cash Flow
+            const daily = Analytics.dailyCashFlow(shopAll, mktAll, mugAll);
+            {
+                const ctx  = document.getElementById("cfa-chart-daily").getContext("2d");
+                const inst = new Chart(ctx, {
+                    type: "line",
+                    data: {
+                        labels:   daily.map(d => d.date.slice(5)),
+                        datasets: [
+                            { label: "Income",       data: daily.map(d => d.income),      borderColor: "#4caf50", backgroundColor: "rgba(76,175,80,.1)",  tension: .3, fill: true  },
+                            { label: "Spending",     data: daily.map(d => d.spending),    borderColor: "#ef5350", backgroundColor: "rgba(239,83,80,.1)",   tension: .3, fill: true  },
+                            { label: "Mugging Loss", data: daily.map(d => d.muggingLoss), borderColor: "#f59e0b", backgroundColor: "rgba(245,158,11,.08)", tension: .3, fill: false },
+                        ],
+                    },
+                    options: {
+                        ...chartDefaults,
+                        plugins: {
+                            ...chartDefaults.plugins,
+                            legend: { labels: { color: "#ddd" } },
+                        },
+                        scales: {
+                            x: { ticks: { color: "#888", maxTicksLimit: 10 }, grid: { color: "rgba(255,255,255,.07)" } },
+                            y: { ticks: { color: "#888", callback: v => "$" + (v / 1e6 > 1 ? (v / 1e6).toFixed(1) + "M" : (v / 1e3).toFixed(0) + "k") }, grid: { color: "rgba(255,255,255,.07)" } },
+                        },
+                    },
+                });
+                this._charts["daily"] = inst;
+            }
+
+            // Chart 2 — ROI bar
+            {
+                const shopItems = Analytics.shopROI(Analytics.filterByRange(shopAll, range))
+                    .filter(i => i.roi != null)
+                    .sort((a, b) => b.roi - a.roi)
+                    .slice(0, 10);
+                const mktStats  = Analytics.marketStats(Analytics.filterByRange(mktAll, range));
+                const mktItems  = mktStats.topItems.filter(i => i.roi != null);
+                const combined  = [...shopItems.map(i => ({ itemName: i.itemName, roi: i.roi })), ...mktItems]
+                    .sort((a, b) => b.roi - a.roi)
+                    .slice(0, 10);
+                const ctx  = document.getElementById("cfa-chart-roi").getContext("2d");
+                const inst = new Chart(ctx, {
+                    type: "bar",
+                    data: {
+                        labels:   combined.map(i => i.itemName),
+                        datasets: [{
+                            label: "ROI%",
+                            data:  combined.map(i => i.roi),
+                            backgroundColor: combined.map(i => i.roi >= 0 ? "rgba(76,175,80,.7)" : "rgba(239,83,80,.7)"),
+                            borderRadius: 4,
+                        }],
+                    },
+                    options: {
+                        ...chartDefaults,
+                        plugins: { legend: { labels: { color: "#ddd" } } },
+                        scales: {
+                            x: { ticks: { color: "#888" }, grid: { color: "rgba(255,255,255,.07)" } },
+                            y: { ticks: { color: "#888", callback: v => v.toFixed(1) + "%" }, grid: { color: "rgba(255,255,255,.07)" } },
+                        },
+                    },
+                });
+                this._charts["roi"] = inst;
+            }
+
+            // Chart 3 — Spending Doughnut
+            {
+                const shopF   = Analytics.filterByRange(shopAll, range);
+                const mktF    = Analytics.filterByRange(mktAll,  range);
+                const shopSpend = shopF.reduce((s, e) => s + (e.buyPriceTotal || 0), 0);
+                const mktBuy    = mktF.filter(e => e.type === "buy").reduce((s, e) => s + e.pricePerUnit * e.qty, 0);
+                const ctx  = document.getElementById("cfa-chart-donut").getContext("2d");
+                const inst = new Chart(ctx, {
+                    type: "doughnut",
+                    data: {
+                        labels:   ["Shop Purchases", "Market Buys"],
+                        datasets: [{
+                            data:            [shopSpend, mktBuy],
+                            backgroundColor: ["#b45309", "#d97706"],
+                            borderColor:     "#1a1a1a",
+                            borderWidth:     3,
+                        }],
+                    },
+                    options: {
+                        ...chartDefaults,
+                        plugins: { legend: { labels: { color: "#ddd" } } },
+                    },
+                });
+                this._charts["donut"] = inst;
+            }
+        }
+
+        // ── Settings ──────────────────────────────────────────────────────────
+
+        _renderSettings() {
+            const currentKey  = Store.getApiKey();
+            const maskedKey   = currentKey ? currentKey.slice(0, 6) + "••••••••••••••••••••" + currentKey.slice(-4) : "Not set";
+            const lastSync    = Store.getLastMugSync();
+            const shopCount   = Store.getShop().length;
+            const mktCount    = Store.getMarket().length;
+            const mugCount    = Store.getMugging().length;
+
+            this._content(`
+<div class="cfa-section-title">API Key</div>
+<div class="cfa-card" style="margin-bottom:16px">
+  <p class="cfa-muted" style="margin:0 0 8px">Current key: <span style="color:#aaa;font-family:monospace">${escHtml(maskedKey)}</span></p>
+  <div class="cfa-form-row" style="margin:0 0 8px">
+    <div class="cfa-field" style="flex:1">
+      <label>New API Key</label>
+      <input id="set-key" class="cfa-input" type="password" placeholder="Paste key here" style="width:100%">
+    </div>
+    <button id="set-key-save" class="cfa-btn" style="align-self:flex-end">Save</button>
+    <button id="set-key-clear" class="cfa-btn-danger" style="align-self:flex-end">Clear</button>
+  </div>
+  <div id="set-key-msg"></div>
+  <p class="cfa-muted" style="margin:8px 0 0">
+    Key stored via GM_setValue (Tampermonkey secure storage).<br>
+    Used for: mugging sync, market price lookup.
+  </p>
+</div>
+
+<div class="cfa-section-title">Data Management</div>
+<div class="cfa-card" style="margin-bottom:16px">
+  <div style="display:flex;flex-wrap:wrap;gap:10px">
+    <button id="rst-shop" class="cfa-btn-danger">Reset Shop Data</button>
+    <button id="rst-mkt" class="cfa-btn-danger">Reset Market Data</button>
+    <button id="rst-mug" class="cfa-btn-danger">Reset Mugging Data</button>
+    <button id="rst-all" class="cfa-btn-danger" style="background:#7f1d1d">Reset ALL Data</button>
+  </div>
+  <div id="set-data-msg" style="margin-top:8px"></div>
+</div>
+
+<div class="cfa-section-title">Sync Status</div>
+<div class="cfa-card">
+  <div class="cfa-stats-bar" style="flex-direction:column;gap:6px">
+    <span>Last mugging sync: <b>${escHtml(lastSync ? fmt.dateTime(lastSync) : "Never")}</b></span>
+    <span>Shop records: <b>${shopCount}</b></span>
+    <span>Market records: <b>${mktCount}</b></span>
+    <span>Mugging records: <b>${mugCount}</b></span>
+  </div>
+</div>
+            `);
+
+            const c = document.getElementById("cfa-content");
+
+            // Save key
+            c.querySelector("#set-key-save").addEventListener("click", async () => {
+                const key = c.querySelector("#set-key").value.trim();
+                const msg = c.querySelector("#set-key-msg");
+                if (!key) { msg.className = "cfa-msg-error"; msg.textContent = "Enter a key first."; return; }
+                msg.textContent = "Validating..."; msg.className = "";
+                try {
+                    this.api.setKey(key);
+                    const profile = await this.api.fetchProfile();
+                    const userId  = profile?.player_id || profile?.id || profile?.ID || "";
+                    Store.saveApiKey(key);
+                    if (userId) { Store.saveMyUserId(userId); this.api.myUserId = String(userId); }
+                    this._authed = true;
+                    msg.className = "cfa-msg-success"; msg.textContent = "API key saved and validated!";
+                    c.querySelector("#set-key").value = "";
+                    setTimeout(() => this._renderSettings(), 800);
+                } catch (err) {
+                    msg.className = "cfa-msg-error"; msg.textContent = "Failed: " + (err.message || "Invalid key");
+                }
+            });
+
+            // Clear key
+            c.querySelector("#set-key-clear").addEventListener("click", () => {
+                if (!confirm("Clear stored API key?")) return;
+                Store.saveApiKey("");
+                this.api.setKey("");
+                const msg = c.querySelector("#set-key-msg");
+                msg.className = "cfa-msg-success"; msg.textContent = "API key cleared.";
+                setTimeout(() => this._renderSettings(), 500);
+            });
+
+            // Reset buttons
+            const dataMsg = c.querySelector("#set-data-msg");
+            const resetBtn = (id, label, fn) => {
+                c.querySelector(id).addEventListener("click", () => {
+                    if (!confirm(`Are you sure you want to reset ${label}? This cannot be undone.`)) return;
+                    fn();
+                    dataMsg.className = "cfa-msg-success";
+                    dataMsg.textContent = label + " reset successfully.";
+                    setTimeout(() => this._renderSettings(), 500);
+                });
+            };
+            resetBtn("#rst-shop", "Shop Data",    () => Store.resetShop());
+            resetBtn("#rst-mkt",  "Market Data",  () => Store.resetMarket());
+            resetBtn("#rst-mug",  "Mugging Data", () => Store.resetMugging());
+            c.querySelector("#rst-all").addEventListener("click", () => {
+                if (!confirm("RESET ALL DATA? This will permanently delete all shop, market, and mugging records.")) return;
+                Store.resetShop(); Store.resetMarket(); Store.resetMugging();
+                dataMsg.className = "cfa-msg-success"; dataMsg.textContent = "All data reset.";
+                setTimeout(() => this._renderSettings(), 500);
+            });
+        }
+
+        // ── Mugging Sync ──────────────────────────────────────────────────────
+
+        async _syncMuggingData() {
+            if (this._syncing) return;
+            const key = Store.getApiKey();
+            const msgEl = document.getElementById("mug-sync-msg");
+            const spinner = document.getElementById("mug-spinner");
+            const syncBtn = document.getElementById("mug-sync");
+
+            if (!key) {
+                if (msgEl) { msgEl.style.color = "#ef5350"; msgEl.textContent = "API key required. Set it in Settings."; }
+                return;
+            }
+
+            this._syncing = true;
+            if (syncBtn) syncBtn.disabled = true;
+            if (spinner) spinner.style.display = "inline-block";
+            if (msgEl)   { msgEl.style.color = "#888"; msgEl.textContent = "Fetching attacks..."; }
+
+            try {
+                // Ensure we have userId
+                if (!this.api.myUserId) {
+                    const profile = await this.api.fetchProfile();
+                    const uid = profile?.player_id || profile?.id || profile?.ID || "";
+                    if (uid) { Store.saveMyUserId(uid); this.api.myUserId = String(uid); }
+                }
+
+                const myId       = String(this.api.myUserId || "");
+                const lastSync   = Store.getLastMugSync() || null;
+                const data       = await this.api.fetchAttacks(100, lastSync || null);
+
+                // The v2 API returns attacks in various shapes
+                const attackList = data?.attacks || data?.items || Object.values(data?.attacks || {}) || [];
+
+                const newEntries = [];
+                for (const atk of attackList) {
+                    const result = atk.result || atk.result_name || atk.outcome || "";
+                    const isMug  = /mug/i.test(result);
+                    if (!isMug) continue;
+
+                    const amount       = atk.money_mugged || atk.cash_mugged || atk.stealthy_attack || 0;
+                    const ts           = atk.timestamp_ended || atk.ended || atk.timestamp || 0;
+                    const attackerId   = String(atk.attacker_id || atk.attackerId || "");
+                    const attackerName = atk.attacker_name || atk.attackerName || attackerId || "Unknown";
+                    const defenderId   = String(atk.defender_id || atk.defenderId || "");
+                    const defenderName = atk.defender_name || atk.defenderName || defenderId || "Unknown";
+                    const atkId        = String(atk.id || atk.attack_id || `${attackerId}_${ts}`);
+
+                    // Determine if we gained or lost
+                    let type;
+                    if (myId && attackerId === myId) type = "gained";
+                    else if (myId && defenderId === myId) type = "lost";
+                    else type = amount > 0 ? "gained" : "lost";
+
+                    newEntries.push({
+                        id: atkId,
+                        type,
+                        attackerName,
+                        defenderName,
+                        amount: Math.abs(amount),
+                        timestamp: ts,
+                    });
+                }
+
+                Store.mergeMugging(newEntries);
+                Store.setLastMugSync(Math.floor(Date.now() / 1000));
+
+                if (msgEl) { msgEl.style.color = "#4caf50"; msgEl.textContent = `Synced ${newEntries.length} new mugging event(s).`; }
+            } catch (err) {
+                if (msgEl) { msgEl.style.color = "#ef5350"; msgEl.textContent = "Sync failed: " + (err.message || "unknown error"); }
+            } finally {
+                this._syncing = false;
+                if (syncBtn) syncBtn.disabled = false;
+                if (spinner) spinner.style.display = "none";
+                // Re-render after a short delay to reflect new data
+                setTimeout(() => { if (this.activeTab === "mugging") this._renderMugging(); }, 600);
+            }
+        }
+    }
+
+    // =========================================================================
+    // SECTION 8 — Main
+    // =========================================================================
+
+    async function main() {
+        const storedKey = Store.getApiKey();
+        const api = new TornAPI(storedKey || "");
+        const ui  = new UI(api);
+        ui.inject();
+
+        if (storedKey) {
+            ui._authed = true;
+            // Restore cached userId if available
+            const cachedId = Store.getMyUserId();
+            if (cachedId) api.myUserId = cachedId;
+        }
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", main);
+    } else {
+        main();
+    }
+
+})();
