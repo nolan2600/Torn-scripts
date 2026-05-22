@@ -1,0 +1,555 @@
+// ==UserScript==
+// @name         Torn Target Scout
+// @namespace    https://github.com/torn-scripts/target-scout
+// @version      1.0.0
+// @description  Advanced player search — find lucrative attack targets by filtering FF score, level, account age, hospital status, and more.
+// @author       DieselBlade
+// @match        https://www.torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @connect      ffscouter.com
+// @license      GPL-3.0-or-later
+// @tag          torn-scout
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+
+(function () {
+    "use strict";
+
+    const PDA_API_KEY   = "###PDA-APIKEY###";
+    const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
+    const VERSION = "1.0.0";
+    const LS = { apiKey:"ts_apiKey", ffKey:"ts_ffKey", settings:"ts_settings" };
+
+    const NPP_DAYS = 14;
+    function isAttackableByAge(targetAge, myAge) {
+        if (targetAge == null) return true;
+        const meUnderNPP = (myAge != null) && (myAge < NPP_DAYS);
+        if (meUnderNPP) return targetAge >= 1;
+        return targetAge >= NPP_DAYS;
+    }
+
+    const API_BASE = "https://api.torn.com/v2";
+    const FF_BASE  = "https://ffscouter.com/api/v1";
+    const API_DELAY_MS = 750;
+    const PROFILE_URL  = "https://www.torn.com/profiles.php?XID=";
+    const STATUS_CONCURRENCY  = 1;
+    const FACTION_CACHE_MS = 5 * 60 * 1000;
+    const PROFILE_CACHE_MS = 60 * 1000;
+
+    const DEFAULT_SETTINGS = {
+        minLevel: 1, maxLevel: 100,
+        minAge: 0,   maxAge: 9999,
+        minFF: 1.0,  maxFF: 3.0,
+        includeUnknownFF: false,
+        status: "any",
+        hospitalMaxMin: 30,
+        excludeWar: true,
+        excludeNPP: true,
+        skipActiveHours: 0,
+        maxResults: 50,
+    };
+
+    const IS_PDA      = typeof PDA_httpGet === "function";
+    const HAS_PDA_KEY = PDA_API_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_API_KEY);
+    const GM_XHR      = (typeof GM_xmlhttpRequest !== "undefined") ? GM_xmlhttpRequest : null;
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    function escHtml(s) { return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+    function parseBS(human) { if (!human) return null; const m = String(human).match(/^\s*([\d.]+)\s*([kKmMbB]?)\s*$/); if (!m) return null; const n = parseFloat(m[1]); if (!Number.isFinite(n)) return null; const s=(m[2]||"").toLowerCase(),mult=s==="k"?1e3:s==="m"?1e6:s==="b"?1e9:1; return n*mult; }
+    function openTornUrl(url) { const a=document.createElement("a");a.href=url;a.target="_blank";a.rel="noopener noreferrer";document.body.appendChild(a);a.click();a.remove(); }
+
+    const fmt = {
+        hospLabel(untilSec) { const rem=Math.max(0,untilSec-Math.floor(Date.now()/1000));if(rem<=0)return"🏥 out";const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),s=rem%60;if(h>0)return`🏥 ${h}h ${m}m`;return m===0?`🏥 ${s}s`:`🏥 ${m}m ${s}s`; },
+        lastActive(ts) { if(!ts)return"?";const ago=Math.floor((Date.now()/1000-ts)/3600);if(ago<1)return"<1h";if(ago<24)return ago+"h ago";return Math.floor(ago/24)+"d ago"; },
+    };
+
+    function loadSettings() { try{const raw=localStorage.getItem(LS.settings);return{...DEFAULT_SETTINGS,...(raw?JSON.parse(raw):{})};} catch{return{...DEFAULT_SETTINGS};} }
+    function saveSettings(s) { localStorage.setItem(LS.settings,JSON.stringify(s)); }
+
+    // ── HTTP ───────────────────────────────────────────────────
+    function _gmGet(url) {
+        return new Promise((resolve,reject)=>{GM_XHR({method:"GET",url,onload:(r)=>resolve({status:r.status,text:r.responseText}),onerror:()=>reject(new Error("network_error")),ontimeout:()=>reject(new Error("timeout"))});});
+    }
+    async function _httpGetOnceRaw(url) {
+        if(IS_PDA){const res=await PDA_httpGet(url);if(res.status<200||res.status>=300){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;}return JSON.parse(res.responseText);}
+        if(GM_XHR){const res=await _gmGet(url);if(res.status<200||res.status>=300){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;}return JSON.parse(res.text);}
+        const res=await fetch(url);if(!res.ok){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;}return res.json();
+    }
+    async function _httpGetOnce(url) { return _httpGetOnceRaw(url); }
+    async function httpGetJson(url) {
+        try{return await _httpGetOnce(url);}
+        catch(err){if(err.status>=400&&err.status<500)throw err;await sleep(400);return _httpGetOnce(url);}
+    }
+    function isRateLimitError(err) { if(!err)return false;if(err.status===429)return true;if(err.tornCode===5)return true;return false; }
+
+    // ── Torn API ───────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key=key; this._lastReq=0; }
+        setKey(key) { this.key=key; }
+        async _rateLimit() { const w=API_DELAY_MS-(Date.now()-this._lastReq);this._lastReq=Date.now()+Math.max(0,w);if(w>0)await sleep(w); }
+        async _get(pathOrUrl,params=null) {
+            await this._rateLimit();
+            const url=new URL(/^https?:\/\//.test(pathOrUrl)?pathOrUrl:API_BASE+pathOrUrl);
+            if(params)for(const[k,v]of Object.entries(params))url.searchParams.set(k,v);
+            if(!url.searchParams.has("key"))url.searchParams.set("key",this.key);
+            const data=await httpGetJson(url.toString());
+            if(data&&data.error){const e=new Error(data.error.error||"Torn API error");e.tornCode=data.error.code;throw e;}
+            return data;
+        }
+        async fetchUserProfile(id) { const data=await this._get(`/user/${id}/profile`);if(!data)return null;return data.profile||(data.id?data:null); }
+        async validateKey() { const data=await this._get("/user/profile");return(data&&data.profile)||null; }
+        async fetchRecentAttacks(limit=100) { return this._get("/user/attacks",{limit,sort:"DESC"}); }
+        async fetchFactionMembers(factionId) { return this._get(`/faction/${factionId}`,{selections:"members"}); }
+    }
+
+    // ── FFScouter ──────────────────────────────────────────────
+    async function validateFFScouterKey(key) {
+        if(!/^[A-Za-z0-9]{16}$/.test(key))return{ok:false,message:"Must be 16 alphanumeric characters."};
+        try{const data=await httpGetJson(`${FF_BASE}/check-key?key=${encodeURIComponent(key)}`);if(data&&data.code)return{ok:false,message:data.error||`FFScouter code ${data.code}`};if(!data||!data.is_registered)return{ok:false,message:"Key not registered — sign up at ffscouter.com first."};return{ok:true,message:data.is_premium?"Valid — premium.":"Valid."};}
+        catch(e){return{ok:false,message:e?.message||"Could not reach FFScouter."};}
+    }
+    async function fetchFFScouterStats(key,userIds) {
+        const result={map:new Map(),error:null,nullCount:0,totalReturned:0,networkFail:false};
+        if(!key){result.error="no_key";return result;}
+        if(userIds.length===0)return result;
+        for(let i=0;i<userIds.length;i+=200){
+            const chunk=userIds.slice(i,i+200),url=`${FF_BASE}/get-stats?key=${encodeURIComponent(key)}&targets=${chunk.join(",")}`;
+            try{
+                const data=await httpGetJson(url);
+                if(!Array.isArray(data)){result.error=(data&&data.error)?data.error:"unexpected_response";continue;}
+                result.totalReturned+=data.length;
+                for(const p of data){if(p.fair_fight==null){result.nullCount++;continue;}result.map.set(Number(p.player_id),{ff:Number(p.fair_fight),bs:p.bs_estimate_human||null});}
+            }catch(e){
+                if(isRateLimitError(e))throw e;
+                if(!result.error){result.error=e.message||"network_error";if(String(e.message).match(/fetch|network|Failed/i))result.networkFail=true;}
+            }
+        }
+        return result;
+    }
+
+    // ── Key Resolver ───────────────────────────────────────────
+    const KeyResolver = {
+        resolveTornKey(){if(HAS_PDA_KEY)return PDA_API_KEY;return localStorage.getItem(LS.apiKey)||null;},
+        saveTornKey(k){localStorage.setItem(LS.apiKey,k);},
+        clearTornKey(){localStorage.removeItem(LS.apiKey);},
+        getFFKey(){return localStorage.getItem(LS.ffKey)||"";},
+        saveFFKey(k){localStorage.setItem(LS.ffKey,k);},
+        clearFFKey(){localStorage.removeItem(LS.ffKey);},
+        isPDAKey(){return HAS_PDA_KEY;},
+    };
+
+    // ── Target Scout ───────────────────────────────────────────
+    class TargetScout {
+        constructor(api) { this.api=api; this.myUserId=null; this.myUserAge=null; this._statusCache=new Map(); this._warCache=null; }
+
+        async _getMyProfile() {
+            if(this.myUserId!=null)return;
+            try{const p=await this.api.validateKey();if(p){this.myUserId=p.id||null;this.myUserAge=typeof p.age==="number"?p.age:null;}}catch{}
+        }
+
+        async getIdsFromAttackLog() {
+            const data=await this.api.fetchRecentAttacks(100);
+            const ids=new Set();
+            const attacks=Array.isArray(data.attacks)?data.attacks:Object.values(data.attacks||{});
+            for(const a of attacks){
+                if(a.attacker_id&&Number(a.attacker_id)!==this.myUserId)ids.add(Number(a.attacker_id));
+                if(a.defender_id&&Number(a.defender_id)!==this.myUserId)ids.add(Number(a.defender_id));
+            }
+            return[...ids];
+        }
+
+        async getIdsFromFaction(factionId) {
+            const data=await this.api.fetchFactionMembers(factionId);
+            const members=data.members||data.faction?.members||{};
+            if(Array.isArray(members))return members.map((m)=>Number(m.id)).filter(Boolean);
+            return Object.keys(members).map(Number).filter(Boolean);
+        }
+
+        async _fetchWarFactions() {
+            const now=Date.now();
+            if(this._warCache&&(now-this._warCache.fetchedAt)<FACTION_CACHE_MS)return this._warCache.ids;
+            const ids=new Set();
+            try{
+                const data=await this.api._get("/torn?selections=rankedwars,territorywars");
+                for(const war of Object.values(data.rankedwars||{}))for(const fid of Object.keys(war.factions||{})){const n=Number(fid);if(!isNaN(n)&&n>0)ids.add(n);}
+                for(const war of Object.values(data.territorywars||{}))for(const key of["assaulting_faction","defending_faction"]){const fid=war[key];if(fid){const n=Number(fid);if(!isNaN(n)&&n>0)ids.add(n);}}
+            }catch{}
+            this._warCache={ids,fetchedAt:now};
+            return ids;
+        }
+
+        async _fetchProfiles(ids,onProgress,signal) {
+            const out=new Map(),now=Date.now(),stale=[];
+            for(const id of ids){const c=this._statusCache.get(id);if(c&&(now-c.fetchedAt)<PROFILE_CACHE_MS){out.set(id,c.data);}else{stale.push(id);}}
+            let i=0,done=ids.length-stale.length,rateLimitErr=null;
+            if(onProgress)onProgress(done,ids.length,"Fetching profiles…");
+            const worker=async()=>{
+                while(i<stale.length&&!rateLimitErr){
+                    if(signal?.aborted)return;
+                    const id=stale[i++];
+                    try{
+                        const profile=await this.api.fetchUserProfile(id);
+                        if(profile&&typeof profile==="object"){
+                            const data={status:profile.status??null,age:typeof profile.age==="number"?profile.age:null,level:typeof profile.level==="number"?profile.level:null,faction_id:profile.faction?.id??profile.faction?.faction_id??profile.faction_id??null,revivable:typeof profile.revivable==="boolean"?profile.revivable:null,name:profile.name||profile.player_name||null,last_action_ts:profile.last_action?.timestamp??null};
+                            if(data.status!==null&&typeof data.status!=="object")data.status=null;
+                            out.set(id,data);this._statusCache.set(id,{data,fetchedAt:Date.now()});
+                        }
+                    }catch(err){if(isRateLimitError(err)){rateLimitErr=err;return;}}
+                    done++;
+                    if(onProgress)onProgress(done,ids.length,"Fetching profiles…");
+                }
+            };
+            await Promise.all(Array.from({length:STATUS_CONCURRENCY},worker));
+            if(rateLimitErr)throw rateLimitErr;
+            return out;
+        }
+
+        async scan(sourceType,sourceArg,settings,onProgress,signal) {
+            await this._getMyProfile();
+            if(signal?.aborted)return[];
+
+            if(onProgress)onProgress(0,1,"Fetching player list…");
+            let ids=[];
+            if(sourceType==="attacks"){ids=await this.getIdsFromAttackLog();}
+            else if(sourceType==="faction"){ids=await this.getIdsFromFaction(sourceArg);}
+            else{ids=sourceArg;}
+
+            ids=[...new Set(ids.map(Number))].filter((id)=>!isNaN(id)&&id>0&&id!==this.myUserId);
+            if(ids.length===0)return[];
+            if(signal?.aborted)return[];
+
+            const profiles=await this._fetchProfiles(ids,onProgress,signal);
+            if(signal?.aborted)return[];
+
+            if(onProgress)onProgress(ids.length,ids.length,"Fetching FF scores…");
+            const ff=await fetchFFScouterStats(KeyResolver.getFFKey(),ids);
+            if(signal?.aborted)return[];
+
+            const warFactions=settings.excludeWar?await this._fetchWarFactions():new Set();
+            if(signal?.aborted)return[];
+
+            const nowSec=Math.floor(Date.now()/1000),results=[];
+            for(const id of ids){
+                const p=profiles.get(id);
+                if(!p||!p.status||typeof p.status!=="object")continue;
+                if(p.level!=null&&(p.level<settings.minLevel||p.level>settings.maxLevel))continue;
+                if(p.age!=null&&(p.age<settings.minAge||p.age>settings.maxAge))continue;
+                if(settings.excludeNPP&&!isAttackableByAge(p.age,this.myUserAge))continue;
+                const ffData=ff.map.get(id);
+                const ffVal=ffData?ffData.ff:null,bsVal=ffData?ffData.bs:null;
+                if(!ff.networkFail){
+                    if(ffVal==null&&!settings.includeUnknownFF)continue;
+                    if(ffVal!=null&&(ffVal<settings.minFF||ffVal>settings.maxFF))continue;
+                }
+                const state=p.status.state,until=p.status.until||0,remaining=Math.max(0,until-nowSec),hospWindowSec=settings.hospitalMaxMin*60;
+                if(settings.status==="okay"){if(state!=="Okay")continue;}
+                else if(settings.status==="hospital"){if(state!=="Hospital")continue;if(remaining>hospWindowSec)continue;}
+                else{if(state==="Hospital"&&remaining>hospWindowSec)continue;if(state!=="Okay"&&state!=="Hospital")continue;}
+                if(settings.excludeWar&&p.faction_id&&warFactions.has(Number(p.faction_id)))continue;
+                if(settings.skipActiveHours>0&&p.last_action_ts){if((nowSec-p.last_action_ts)/3600<settings.skipActiveHours)continue;}
+                results.push({id,name:p.name||`Player ${id}`,level:p.level||0,age:p.age,ff:ffVal,bs:bsVal,statusState:state,hospUntil:until,revivable:p.revivable,inFactionWar:!!(p.faction_id&&warFactions.has(Number(p.faction_id))),lastActionTs:p.last_action_ts});
+            }
+            results.sort((a,b)=>{if(a.ff==null&&b.ff==null)return 0;if(a.ff==null)return 1;if(b.ff==null)return -1;return b.ff-a.ff;});
+            return results.slice(0,settings.maxResults);
+        }
+    }
+
+    // ── CSS ────────────────────────────────────────────────────
+    function injectCSS() {
+        if(document.getElementById("ts-style"))return;
+        const style=document.createElement("style");style.id="ts-style";
+        style.textContent=`
+#ts-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.7)}
+#ts-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#1a1a1a;border:1px solid #444;border-radius:10px;overflow:hidden;resize:both;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#ddd;font-size:14px;width:860px;max-width:100vw;max-height:88vh;min-width:340px;min-height:300px;flex-direction:column}
+#ts-panel.ts-open{display:flex}#ts-overlay.ts-open{display:block}#ts-panel *{box-sizing:border-box;color:inherit}
+#ts-panel ::-webkit-scrollbar{width:6px;height:6px}#ts-panel ::-webkit-scrollbar-track{background:#1a1a1a}#ts-panel ::-webkit-scrollbar-thumb{background:#444;border-radius:3px}#ts-panel ::-webkit-scrollbar-thumb:hover{background:#555}
+#ts-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#222;border-bottom:1px solid #444;flex-shrink:0}
+#ts-header h2{margin:0;font-size:17px;color:#fff}#ts-header .ts-ver{color:#666;font-size:12px;margin-left:8px}
+#ts-close{background:none;border:none;color:#999;font-size:22px;cursor:pointer;padding:4px 8px}#ts-close:hover{color:#fff}
+#ts-tabs{display:flex;background:#252525;border-bottom:1px solid #444;overflow-x:auto;flex-shrink:0}
+.ts-tab{padding:10px 20px;cursor:pointer;color:#999!important;border-bottom:2px solid transparent;white-space:nowrap;font-size:14px;transition:all .15s}.ts-tab:hover{color:#ccc!important;background:#2a2a2a}.ts-tab.active{color:#42a5f5!important;border-bottom-color:#42a5f5}
+#ts-content{padding:16px;overflow-y:auto;flex:1;min-height:0}
+.ts-section{margin-bottom:20px}.ts-section h3{margin:0 0 10px;font-size:14px;color:#eee}
+.ts-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ts-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}.ts-field label{color:#bbb;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.ts-input,.ts-select,.ts-textarea{background:#252525;border:1px solid #444;color:#ddd;padding:6px 10px;border-radius:4px;font-size:14px;width:100%}
+.ts-textarea{resize:vertical;font-family:ui-monospace,monospace;font-size:12px}
+.ts-input-masked{-webkit-text-security:disc;text-security:disc;font-family:monospace;letter-spacing:2px}
+.ts-btn{padding:7px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;color:#ddd}.ts-btn-primary{background:#1565c0;color:#fff!important}.ts-btn-primary:hover{background:#1976d2}.ts-btn-danger{background:#ef5350;color:#fff!important}.ts-btn-danger:hover{background:#f44336}.ts-btn-muted{background:#333;border:1px solid #444;color:#ddd}.ts-btn-muted:hover{background:#3a3a3a}.ts-btn-cancel{background:#3a2a1e;border:1px solid #664422;color:#ffb74d}.ts-btn-cancel:hover{background:#4a3028}.ts-btn:disabled{opacity:.5;cursor:not-allowed}
+.ts-hint{color:#888;font-size:12px;margin:4px 0}
+.ts-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:#ccc}.ts-check input{accent-color:#42a5f5}
+.ts-source-row{margin-bottom:6px}.ts-source-label{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:#ccc;font-size:13px}.ts-source-label input[type="radio"]{accent-color:#42a5f5}
+.ts-source-sub{margin:8px 0 8px 24px}
+.ts-progress-wrap{margin-top:12px;display:none}.ts-progress-wrap.ts-show{display:block}
+.ts-progress{background:#222;border-radius:4px;height:8px;overflow:hidden}.ts-progress-bar{background:#42a5f5;height:100%;width:0%;transition:width .3s}.ts-progress-label{color:#888;font-size:12px;margin-top:4px}
+.ts-scan-note{background:#1e2a1e;border:1px solid #2e5a2e;border-radius:4px;padding:8px 12px;color:#4caf50;font-size:12px;margin-bottom:12px}
+.ts-scan-err{background:#2a1414;border:1px solid #552222;border-radius:4px;padding:8px 12px;color:#ef9090;font-size:12px;margin-bottom:12px}
+#ts-status-line{display:flex;gap:12px;align-items:center;margin-bottom:12px;color:#888;font-size:12px;flex-wrap:wrap}
+table.ts-table{width:100%;border-collapse:collapse}
+.ts-table th,.ts-table td{padding:8px 12px;text-align:left;border-bottom:1px solid #333;font-size:13px;color:#ddd;vertical-align:middle;white-space:nowrap}
+.ts-table th{color:#999!important;font-weight:600;text-transform:uppercase;font-size:11px;position:sticky;top:0;background:#1a1a1a;border-bottom:2px solid #444;user-select:none}
+.ts-table th[data-sort]{cursor:pointer}.ts-table th[data-sort]:hover{color:#fff!important}.ts-table th[data-sort]::after{content:" ⇅";color:#555;font-size:10px}.ts-table th[data-sort].sort-asc::after{content:" ▲";color:#42a5f5;font-size:10px}.ts-table th[data-sort].sort-desc::after{content:" ▼";color:#42a5f5;font-size:10px}
+.ts-table tbody tr:hover td{background:#252525}.ts-table td.num,.ts-table th.num{text-align:right;font-variant-numeric:tabular-nums}
+.ts-attack{display:inline-block;padding:4px 10px;background:#1565c0;color:#fff!important;border-radius:4px;text-decoration:none;font-weight:600;font-size:12px;border:none;cursor:pointer}.ts-attack:hover{background:#1976d2}
+.ts-name-link{color:#4fc3f7!important;text-decoration:none}.ts-name-link:hover{text-decoration:underline}
+.ts-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}.ts-badge-ok{background:#1e3a2a;color:#4caf50}.ts-badge-hosp{background:#3a2a1e;color:#ffb74d}
+.ts-badge-war{display:inline-block;padding:2px 6px;border-radius:8px;font-size:11px;font-weight:700;background:#1a2a3a;color:#64b5f6;border:1px solid #2a4a6a;margin-left:5px;vertical-align:middle}
+.ts-empty{text-align:center;color:#888;padding:30px 8px;font-size:14px}
+.ts-save-status{margin-top:8px;min-height:1em;font-size:12px}.ts-save-ok{color:#4caf50}.ts-save-err{color:#ef5350}.ts-save-info{color:#bbb}
+.ts-row-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#ts-auth{padding:24px;color:#ddd;line-height:1.5}#ts-auth h3{margin:0 0 12px;color:#fff}#ts-auth .ts-auth-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+@media(max-width:768px){#ts-panel{width:100vw!important;max-width:100vw;min-width:0;border-radius:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}.ts-grid-2{grid-template-columns:1fr}.ts-table td,.ts-table th{padding:6px 6px;font-size:12px}}
+`;
+        document.head.appendChild(style);
+    }
+
+    // ── UI ─────────────────────────────────────────────────────
+    class UI {
+        constructor(scout) {
+            this.scout=scout; this.activeTab="search"; this._panel=null; this._overlay=null; this._authed=false;
+            this._scanning=false; this._scanAbort=null; this._results=[]; this._sortCol="ff"; this._sortDir="desc";
+            this._lastScanError=null; this._countdownTimer=null;
+        }
+
+        inject() {
+            injectCSS();
+            const overlay=document.createElement("div");overlay.id="ts-overlay";document.body.appendChild(overlay);
+            const panel=document.createElement("div");panel.id="ts-panel";
+            panel.innerHTML=`<div id="ts-header"><h2>Target Scout <span class="ts-ver">v${VERSION}</span><span style="color:#888;font-size:11px;font-weight:400;margin-left:10px">DieselBlade</span></h2><button id="ts-close">&times;</button></div><div id="ts-tabs"><div class="ts-tab active" data-tab="search">Search</div><div class="ts-tab" data-tab="results">Results</div><div class="ts-tab" data-tab="settings">Settings</div></div><div id="ts-content"></div>`;
+            document.body.appendChild(panel);this._panel=panel;this._overlay=overlay;
+            overlay.addEventListener("click",()=>this.toggle(false));
+            panel.querySelector("#ts-close").addEventListener("click",()=>this.toggle(false));
+            panel.querySelector("#ts-tabs").addEventListener("click",(e)=>{const t=e.target.closest(".ts-tab");if(!t)return;this.activeTab=t.dataset.tab;this._syncTabs();this._renderActive();});
+            this._countdownTimer=setInterval(()=>{
+                document.querySelectorAll("[data-hosp-until]").forEach((el)=>{const u=parseInt(el.dataset.hospUntil,10);if(!Number.isFinite(u))return;el.textContent=fmt.hospLabel(u);});
+            },1000);
+        }
+
+        _isOpen() { return this._panel&&this._panel.classList.contains("ts-open"); }
+        toggle(open) { const isOpen=open!=null?open:!this._isOpen();this._panel.classList.toggle("ts-open",isOpen);this._overlay.classList.toggle("ts-open",isOpen);if(isOpen)this._renderActive(); }
+        _syncTabs() { for(const t of this._panel.querySelectorAll(".ts-tab"))t.classList.toggle("active",t.dataset.tab===this.activeTab); }
+        _renderActive() { if(!this._authed){this._renderAuth();return;}if(this.activeTab==="search")this._renderSearch();else if(this.activeTab==="results")this._renderResults();else this._renderSettings(); }
+        setAuthed(b) { this._authed=b;if(this._isOpen())this._renderActive(); }
+
+        _updateResultsTab() {
+            const tab=this._panel?.querySelector('[data-tab="results"]');
+            if(tab)tab.textContent=this._results.length>0?`Results (${this._results.length})`:"Results";
+        }
+
+        _renderAuth() {
+            const content=this._panel.querySelector("#ts-content");
+            content.innerHTML=`<div id="ts-auth"><h3>Set your Torn API key</h3><p>Target Scout needs a <b>public</b> Torn API key. Stored in localStorage, sent only to <code>api.torn.com</code>.</p><p class="ts-hint">Get one at <a class="ts-name-link" href="https://www.torn.com/preferences.php#tab=api" target="_blank" rel="noopener">torn.com → Preferences → API Key</a>.</p><div class="ts-field"><label>Torn API key (16 chars)</label><input id="ts-auth-key" class="ts-input ts-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other"></div><div class="ts-auth-actions"><button id="ts-auth-save" class="ts-btn ts-btn-primary">Save &amp; continue</button></div><p class="ts-hint ts-save-err" id="ts-auth-err" style="min-height:1em"></p><hr style="border:none;border-top:1px solid #333;margin:16px 0"><h3>Optional: FFScouter key</h3><p class="ts-hint">Required for FF and BS bracket filtering.</p><div class="ts-field"><label>FFScouter key (16 chars)</label><input id="ts-auth-ffkey" class="ts-input ts-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(KeyResolver.getFFKey())}"></div></div>`;
+            const keyInput=content.querySelector("#ts-auth-key"),err=content.querySelector("#ts-auth-err");
+            const save=async()=>{err.textContent="";const k=keyInput.value.trim();if(!/^[A-Za-z0-9]{16}$/.test(k)){err.textContent="That doesn't look like a 16-character Torn key.";return;}await this._adoptKey(k,content.querySelector("#ts-auth-ffkey").value.trim());};
+            content.querySelector("#ts-auth-save").addEventListener("click",save);
+            keyInput.addEventListener("keydown",(e)=>{if(e.key==="Enter")save();});
+        }
+        async _adoptKey(tornKey,ffKey) {
+            const err=this._panel.querySelector("#ts-auth-err");if(err)err.textContent="Validating…";
+            this.scout.api.setKey(tornKey);
+            try{await this.scout.api.validateKey();}catch(e){if(err)err.textContent="Torn rejected that key: "+(e.message||"invalid");return;}
+            KeyResolver.saveTornKey(tornKey);
+            if(ffKey&&/^[A-Za-z0-9]{16}$/.test(ffKey))KeyResolver.saveFFKey(ffKey);
+            this.scout.myUserId=null;
+            this.setAuthed(true);
+        }
+
+        _renderSearch() {
+            const content=this._panel.querySelector("#ts-content");
+            const s=loadSettings();
+            const scanNote=this._scanning?`<div class="ts-scan-note">⏳ Scan in progress…</div>`:"";
+            const errNote=this._lastScanError&&!this._scanning?`<div class="ts-scan-err">⚠️ ${escHtml(this._lastScanError)}</div>`:"";
+            const statusOpts=["any","okay","hospital"].map((v)=>`<option value="${v}"${s.status===v?" selected":""}>${v==="any"?"Any (Okay + Hospital)":v.charAt(0).toUpperCase()+v.slice(1)}</option>`).join("");
+            content.innerHTML=`${scanNote}${errNote}
+<div class="ts-section"><h3>Source</h3>
+<div class="ts-source-row"><label class="ts-source-label"><input type="radio" name="ts-source" value="attacks" checked> My Recent Attacks <span style="color:#666;font-size:11px">(last 100)</span></label></div>
+<div class="ts-source-row"><label class="ts-source-label"><input type="radio" name="ts-source" value="faction"> Faction Members</label><div class="ts-source-sub" id="ts-faction-sub" style="display:none"><input id="ts-faction-id" class="ts-input" type="number" min="1" placeholder="Faction ID" style="width:180px"></div></div>
+<div class="ts-source-row"><label class="ts-source-label"><input type="radio" name="ts-source" value="manual"> Manual Player IDs</label><div class="ts-source-sub" id="ts-manual-sub" style="display:none"><textarea id="ts-manual-ids" class="ts-input ts-textarea" rows="3" placeholder="Comma or newline-separated player IDs"></textarea></div></div>
+</div>
+<div class="ts-section"><h3>Filters</h3>
+<div class="ts-grid-2">
+<div class="ts-field"><label>Level min</label><input id="ts-min-level" class="ts-input" type="number" min="1" max="100" value="${s.minLevel}"></div>
+<div class="ts-field"><label>Level max</label><input id="ts-max-level" class="ts-input" type="number" min="1" max="100" value="${s.maxLevel}"></div>
+<div class="ts-field"><label>Account age min (days)</label><input id="ts-min-age" class="ts-input" type="number" min="0" value="${s.minAge}"></div>
+<div class="ts-field"><label>Account age max (days)</label><input id="ts-max-age" class="ts-input" type="number" min="0" value="${s.maxAge}"></div>
+<div class="ts-field"><label>Fair-fight min</label><input id="ts-min-ff" class="ts-input" type="number" min="1" max="10" step="0.1" value="${s.minFF}"></div>
+<div class="ts-field"><label>Fair-fight max</label><input id="ts-max-ff" class="ts-input" type="number" min="1" max="10" step="0.1" value="${s.maxFF}"></div>
+<div class="ts-field"><label>Status filter</label><select id="ts-status" class="ts-select">${statusOpts}</select></div>
+<div class="ts-field"><label>Hospital max (minutes)</label><input id="ts-hosp-max" class="ts-input" type="number" min="0" value="${s.hospitalMaxMin}"><span class="ts-hint">Max remaining hosp time shown</span></div>
+<div class="ts-field"><label>Skip active in last (hours, 0=off)</label><input id="ts-skip-active" class="ts-input" type="number" min="0" step="1" value="${s.skipActiveHours}"></div>
+<div class="ts-field"><label>Max results</label><input id="ts-max-results" class="ts-input" type="number" min="1" max="500" value="${s.maxResults}"></div>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+<label class="ts-check"><input type="checkbox" id="ts-incl-unk-ff"${s.includeUnknownFF?" checked":""}> Include players with unknown FF score</label>
+<label class="ts-check"><input type="checkbox" id="ts-excl-war"${s.excludeWar?" checked":""}> Exclude players whose faction is in an active war</label>
+<label class="ts-check"><input type="checkbox" id="ts-excl-npp"${s.excludeNPP?" checked":""}> Exclude New Player Protection (age &lt; 14 days)</label>
+</div>
+</div>
+<div class="ts-section">
+<div class="ts-row-actions">
+<button id="ts-run-btn" class="ts-btn ts-btn-primary"${this._scanning?" disabled":""}>🔍 Run Search</button>
+<button id="ts-cancel-btn" class="ts-btn ts-btn-cancel" style="display:${this._scanning?"inline-block":"none"}">✕ Cancel</button>
+</div>
+<div class="ts-progress-wrap" id="ts-progress-wrap"${this._scanning?' style="display:block"':""}>
+<div class="ts-progress"><div class="ts-progress-bar" id="ts-progress-bar" style="width:0%"></div></div>
+<div class="ts-progress-label" id="ts-progress-label">Preparing…</div>
+</div>
+</div>`;
+
+            // Source sub-field toggle
+            const radios=content.querySelectorAll('[name="ts-source"]');
+            const factionSub=content.querySelector("#ts-faction-sub"),manualSub=content.querySelector("#ts-manual-sub");
+            const showSubs=(val)=>{factionSub.style.display=val==="faction"?"block":"none";manualSub.style.display=val==="manual"?"block":"none";};
+            radios.forEach((r)=>{r.addEventListener("change",()=>showSubs(r.value));if(r.checked)showSubs(r.value);});
+
+            // Auto-save filters on change
+            const persistSettings=()=>{
+                const $=(id)=>content.querySelector("#"+id);
+                const minFF=parseFloat($("ts-min-ff").value),maxFF=parseFloat($("ts-max-ff").value);
+                const cleanMin=Number.isFinite(minFF)?Math.max(1,minFF):1.0,cleanMax=Number.isFinite(maxFF)?Math.max(cleanMin,maxFF):cleanMin;
+                saveSettings({...loadSettings(),minLevel:parseInt($("ts-min-level").value,10)||1,maxLevel:parseInt($("ts-max-level").value,10)||100,minAge:parseInt($("ts-min-age").value,10)||0,maxAge:parseInt($("ts-max-age").value,10)||9999,minFF:cleanMin,maxFF:cleanMax,status:$("ts-status").value,hospitalMaxMin:parseInt($("ts-hosp-max").value,10)||30,skipActiveHours:parseInt($("ts-skip-active").value,10)||0,maxResults:parseInt($("ts-max-results").value,10)||50,includeUnknownFF:$("ts-incl-unk-ff").checked,excludeWar:$("ts-excl-war").checked,excludeNPP:$("ts-excl-npp").checked});
+            };
+            ["ts-min-level","ts-max-level","ts-min-age","ts-max-age","ts-min-ff","ts-max-ff","ts-status","ts-hosp-max","ts-skip-active","ts-max-results","ts-incl-unk-ff","ts-excl-war","ts-excl-npp"].forEach((id)=>{const el=content.querySelector("#"+id);if(el)el.addEventListener("change",persistSettings);});
+
+            content.querySelector("#ts-run-btn").addEventListener("click",()=>this._startScan(content));
+            content.querySelector("#ts-cancel-btn").addEventListener("click",()=>{if(this._scanAbort)this._scanAbort.abort();});
+        }
+
+        _startScan(content) {
+            if(this._scanning)return;
+            this._lastScanError=null;
+            const $=(id)=>content.querySelector("#"+id);
+
+            // Save current filter values before running
+            const minFF=parseFloat($("ts-min-ff")?.value),maxFF=parseFloat($("ts-max-ff")?.value);
+            const cleanMin=Number.isFinite(minFF)?Math.max(1,minFF):1.0,cleanMax=Number.isFinite(maxFF)?Math.max(cleanMin,maxFF):cleanMin;
+            saveSettings({...loadSettings(),minLevel:parseInt($("ts-min-level")?.value,10)||1,maxLevel:parseInt($("ts-max-level")?.value,10)||100,minAge:parseInt($("ts-min-age")?.value,10)||0,maxAge:parseInt($("ts-max-age")?.value,10)||9999,minFF:cleanMin,maxFF:cleanMax,status:$("ts-status")?.value||"any",hospitalMaxMin:parseInt($("ts-hosp-max")?.value,10)||30,skipActiveHours:parseInt($("ts-skip-active")?.value,10)||0,maxResults:parseInt($("ts-max-results")?.value,10)||50,includeUnknownFF:$("ts-incl-unk-ff")?.checked||false,excludeWar:$("ts-excl-war")?.checked!==false,excludeNPP:$("ts-excl-npp")?.checked!==false});
+
+            const settings=loadSettings();
+            const sourceType=content.querySelector('[name="ts-source"]:checked')?.value||"attacks";
+            let sourceArg=null;
+            if(sourceType==="faction"){sourceArg=parseInt($("ts-faction-id")?.value,10);if(!sourceArg){alert("Please enter a faction ID.");return;}}
+            else if(sourceType==="manual"){const raw=$("ts-manual-ids")?.value||"";sourceArg=raw.split(/[\s,\n]+/).map((v)=>parseInt(v.trim(),10)).filter((n)=>!isNaN(n)&&n>0);if(sourceArg.length===0){alert("Please enter at least one player ID.");return;}}
+
+            this._scanning=true;
+            this._scanAbort=new AbortController();
+            const signal=this._scanAbort.signal;
+
+            const runBtn=$("ts-run-btn"),cancelBtn=$("ts-cancel-btn"),progressWrap=$("ts-progress-wrap"),progressBar=$("ts-progress-bar"),progressLabel=$("ts-progress-label");
+            if(runBtn)runBtn.disabled=true;
+            if(cancelBtn)cancelBtn.style.display="inline-block";
+            if(progressWrap)progressWrap.style.display="block";
+
+            const onProgress=(done,total,msg)=>{
+                if(!progressBar?.isConnected||!progressLabel?.isConnected)return;
+                progressBar.style.width=(total>0?Math.min(100,Math.round((done/total)*100)):0)+"%";
+                progressLabel.textContent=msg?`${msg} — ${done}/${total}`:`${done}/${total}`;
+            };
+
+            this.scout.scan(sourceType,sourceArg,settings,onProgress,signal).then((results)=>{
+                this._scanning=false;this._scanAbort=null;
+                if(!signal.aborted){
+                    this._results=results;
+                    this._updateResultsTab();
+                    this.activeTab="results";this._syncTabs();this._renderActive();
+                }else{
+                    if(this._isOpen()&&this.activeTab==="search")this._renderSearch();
+                }
+            }).catch((err)=>{
+                this._scanning=false;this._scanAbort=null;
+                this._lastScanError=err?.message||"Scan failed";
+                if(this._isOpen()&&this.activeTab==="search")this._renderSearch();
+            });
+        }
+
+        _renderResults() {
+            const content=this._panel.querySelector("#ts-content");
+            if(this._results.length===0){
+                content.innerHTML=`<div id="ts-status-line"><span>No results</span></div><div class="ts-empty">No results yet.<br><span style="color:#666">Run a search from the Search tab.</span></div>`;
+                return;
+            }
+            const rows=this._sortResults(this._results);
+            const thCls=(col)=>this._sortCol!==col?"":(this._sortDir==="asc"?"sort-asc":"sort-desc");
+            content.innerHTML=`<div id="ts-status-line"><span>${this._results.length} result${this._results.length===1?"":"s"}</span><button id="ts-clear-btn" class="ts-btn ts-btn-muted" style="padding:3px 10px;font-size:12px">Clear</button></div><table class="ts-table"><thead><tr><th data-sort="name" class="${thCls("name")}">Name</th><th data-sort="level" class="num ${thCls("level")}">Lvl</th><th data-sort="age" class="num ${thCls("age")}">Age</th><th data-sort="ff" class="num ${thCls("ff")}">FF</th><th data-sort="bs" class="num ${thCls("bs")}">BS Est.</th><th data-sort="status" class="${thCls("status")}">Status</th><th data-sort="lastActive" class="${thCls("lastActive")}">Last Active</th><th></th></tr></thead><tbody>${rows.map((r)=>this._renderRow(r)).join("")}</tbody></table>`;
+            content.querySelector("#ts-clear-btn").addEventListener("click",()=>{if(!confirm("Clear all results?"))return;this._results=[];this._updateResultsTab();this._renderResults();});
+            content.querySelectorAll(".ts-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(PROFILE_URL+el.dataset.id);}));
+            content.querySelectorAll("th[data-sort]").forEach((el)=>el.addEventListener("click",()=>{const col=el.dataset.sort;if(this._sortCol===col)this._sortDir=this._sortDir==="asc"?"desc":"asc";else{this._sortCol=col;this._sortDir=col==="name"?"asc":"desc";}this._renderResults();}));
+        }
+
+        _sortResults(list) {
+            const col=this._sortCol,dir=this._sortDir==="asc"?1:-1;
+            const keyFor=(r)=>{switch(col){case"name":return String(r.name||"").toLowerCase();case"level":return r.level||0;case"age":return r.age==null?Infinity:r.age;case"ff":return r.ff==null?Infinity:r.ff;case"bs":return parseBS(r.bs)==null?Infinity:parseBS(r.bs);case"status":return(r.statusState==="Okay"?0:1)*1e6+Math.max(0,(r.hospUntil||0)-Math.floor(Date.now()/1000));case"lastActive":return r.lastActionTs==null?0:r.lastActionTs;default:return r.ff==null?Infinity:r.ff;}};
+            return[...list].sort((a,b)=>{const ka=keyFor(a),kb=keyFor(b);if(ka===Infinity&&kb!==Infinity)return 1;if(kb===Infinity&&ka!==Infinity)return-1;if(ka<kb)return-1*dir;if(ka>kb)return 1*dir;return 0;});
+        }
+
+        _renderRow(r) {
+            const isHosp=r.statusState==="Hospital",statusClass=isHosp?"ts-badge-hosp":"ts-badge-ok";
+            const hospAttr=isHosp?` data-hosp-until="${r.hospUntil}"`:""
+            const statusText=isHosp?fmt.hospLabel(r.hospUntil):"Okay";
+            const warBadge=r.inFactionWar?`<span class="ts-badge-war" title="Faction at war — outside attackers blocked">⚔️ War</span>`:"";
+            return`<tr><td><a class="ts-name-link" href="${PROFILE_URL}${r.id}" target="_blank" rel="noopener">${escHtml(r.name)}</a> <span style="color:#666;font-size:11px">L${r.level}</span>${warBadge}</td><td class="num">${r.level}</td><td class="num">${r.age==null?"?":r.age+"d"}</td><td class="num">${r.ff==null?"?":r.ff.toFixed(2)}</td><td class="num">${escHtml(r.bs||"—")}</td><td><span class="ts-badge ${statusClass}"${hospAttr}>${statusText}</span></td><td style="color:#888;font-size:12px">${fmt.lastActive(r.lastActionTs)}</td><td><button class="ts-attack" data-id="${r.id}">Attack →</button></td></tr>`;
+        }
+
+        _renderSettings() {
+            const content=this._panel.querySelector("#ts-content");
+            const tornKey=KeyResolver.resolveTornKey()||"";
+            const pdaNote=KeyResolver.isPDAKey()?`<p class="ts-hint">Your Torn key is provided by Torn PDA and is not editable here.</p>`:"";
+            content.innerHTML=`
+<div class="ts-section"><h3>Torn API key</h3>${pdaNote}<div class="ts-field"><input id="ts-set-tornkey" class="ts-input ts-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(tornKey)}" ${KeyResolver.isPDAKey()?"disabled":""}></div>${!KeyResolver.isPDAKey()?`<div class="ts-row-actions"><button id="ts-key-save" class="ts-btn ts-btn-primary">Save Torn key</button><button id="ts-key-clear" class="ts-btn ts-btn-danger">Clear &amp; log out</button></div><div id="ts-key-status" class="ts-save-status"></div>`:""}</div>
+<div class="ts-section"><h3>FFScouter key</h3><p class="ts-hint">Required for FF and BS bracket filtering. Get one at <a class="ts-name-link" href="https://ffscouter.com" target="_blank" rel="noopener">ffscouter.com</a>.</p><div class="ts-field"><input id="ts-set-ffkey" class="ts-input ts-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(KeyResolver.getFFKey())}"></div><div class="ts-row-actions"><button id="ts-ffkey-save" class="ts-btn ts-btn-primary">Save FFScouter key</button><button id="ts-ffkey-clear" class="ts-btn ts-btn-muted">Clear</button></div><div id="ts-ffkey-status" class="ts-save-status"></div></div>
+<div class="ts-section"><h3>Environment</h3><p class="ts-hint">Version ${VERSION} · Platform: ${IS_PDA?"Torn PDA":"Desktop"}</p><button id="ts-reset" class="ts-btn ts-btn-muted">Reset all filters to defaults</button></div>`;
+            const $=(id)=>content.querySelector("#"+id);
+            const setStatus=(elId,kind,msg)=>{const el=$(elId);if(!el)return;el.className="ts-save-status ts-save-"+kind;el.textContent=msg;};
+            if(!KeyResolver.isPDAKey()){
+                $("ts-key-save").addEventListener("click",async()=>{const k=$("ts-set-tornkey").value.trim();if(!/^[A-Za-z0-9]{16}$/.test(k)){setStatus("ts-key-status","err","Must be 16 alphanumeric characters.");return;}setStatus("ts-key-status","info","Validating…");this.scout.api.setKey(k);try{await this.scout.api.validateKey();}catch(e){setStatus("ts-key-status","err","Key rejected: "+(e.message||"invalid"));return;}KeyResolver.saveTornKey(k);this.scout.myUserId=null;setStatus("ts-key-status","ok","Saved ✓");});
+                $("ts-key-clear").addEventListener("click",()=>{if(!confirm("Clear the Torn API key and return to the auth screen?"))return;KeyResolver.clearTornKey();this.scout.myUserId=null;this.setAuthed(false);});
+            }
+            $("ts-ffkey-save").addEventListener("click",async()=>{const k=$("ts-set-ffkey").value.trim();if(!k){KeyResolver.clearFFKey();setStatus("ts-ffkey-status","info","Cleared.");return;}setStatus("ts-ffkey-status","info","Validating with FFScouter…");const result=await validateFFScouterKey(k);if(!result.ok){setStatus("ts-ffkey-status","err",result.message);return;}KeyResolver.saveFFKey(k);setStatus("ts-ffkey-status","ok",result.message+" Saved ✓");});
+            $("ts-ffkey-clear").addEventListener("click",()=>{KeyResolver.clearFFKey();$("ts-set-ffkey").value="";setStatus("ts-ffkey-status","info","Cleared.");});
+            $("ts-reset").addEventListener("click",()=>{if(!confirm("Reset all search filters to defaults?"))return;saveSettings({...DEFAULT_SETTINGS});this.activeTab="search";this._syncTabs();this._renderSearch();});
+        }
+    }
+
+    // ── Shared Footer Menu ─────────────────────────────────────
+    (function setupEugFooterMenu(){
+        const W=(typeof unsafeWindow!=="undefined")?unsafeWindow:window;
+        if(W.__eugFooterMenuLoaded)return; W.__eugFooterMenuLoaded=true; W.__eugeneScripts=W.__eugeneScripts||[];
+        const ROW_ID="eug-footer-row";
+        function injectFMCSS(){if(document.getElementById("eug-footer-style"))return;const s=document.createElement("style");s.id="eug-footer-style";s.textContent=`[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`;document.head.appendChild(s);}
+        function injectEntryCSS(entry){if(!entry.color)return;const id=`eug-color-${entry.id}`,dark=entry.colorDark||"#222",hover=entry.hoverColor||entry.color,css=`[data-eug-id="${entry.id}"]{background:linear-gradient(to bottom,${entry.color},${dark})!important}[data-eug-id="${entry.id}"]:hover{background:linear-gradient(to bottom,${hover},${entry.color})!important}`;const ex=document.getElementById(id);if(ex){ex.textContent=css;return;}const el=document.createElement("style");el.id=id;el.textContent=css;document.head.appendChild(el);}
+        const findRefBtn=()=>document.getElementById("notes_panel_button")||document.getElementById("people_panel_button"),getRow=()=>document.getElementById(ROW_ID),closeRow=()=>{const r=getRow();if(r)r.classList.remove("eug-open");};
+        const openRow=(btn)=>{const row=getRow();if(!row)return;const rect=btn.getBoundingClientRect();row.classList.add("eug-open");const rr=row.getBoundingClientRect();let left=Math.max(4,Math.min(rect.left+rect.width/2-rr.width/2,window.innerWidth-rr.width-4));row.style.left=left+"px";row.style.bottom=(window.innerHeight-rect.top+6)+"px";};
+        function makeScriptBtn(entry,refBtn,role){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title=entry.name;btn.setAttribute("data-eug",role);btn.setAttribute("data-eug-id",entry.id);btn.innerHTML=(entry.iconSVG||"").replace(/<svg\b([^>]*)>/,(m,a)=>/\sclass\s*=/.test(a)?m:`<svg${a} class="${ic}">`);btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();closeRow();try{entry.onClick();}catch{}});injectEntryCSS(entry);return btn;}
+        function makeMenuBtn(refBtn){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title="My userscripts";btn.setAttribute("data-eug","menu");btn.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`;btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();const row=getRow();if(row&&row.classList.contains("eug-open"))closeRow();else openRow(btn);});return btn;}
+        const LEGACY=["tat-footer-btn","spa-footer-btn"];
+        function render(){const refBtn=findRefBtn();if(!refBtn)return false;injectFMCSS();const parent=refBtn.parentNode;parent.querySelectorAll("[data-eug]").forEach((el)=>el.remove());LEGACY.forEach((id)=>{const el=document.getElementById(id);if(el)el.remove();});const oldRow=getRow();if(oldRow)oldRow.remove();const scripts=W.__eugeneScripts||[];if(scripts.length===0)return true;if(scripts.length===1){parent.insertBefore(makeScriptBtn(scripts[0],refBtn,"solo"),refBtn);}else{const mb=makeMenuBtn(refBtn);parent.insertBefore(mb,refBtn);const row=document.createElement("div");row.id=ROW_ID;row.setAttribute("data-eug-row","");for(const s of scripts)row.appendChild(makeScriptBtn(s,refBtn,"item"));document.body.appendChild(row);}return true;}
+        function mount(){render();let pending=false;const obs=new MutationObserver(()=>{if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;const r=findRefBtn();if(r&&!r.parentNode.querySelector("[data-eug]"))render();});});obs.observe(document.body,{childList:true,subtree:true});}
+        W.addEventListener("eugene-scripts-updated",render);
+        document.addEventListener("click",(e)=>{const row=getRow();if(!row||!row.classList.contains("eug-open"))return;const mb=document.querySelector('[data-eug="menu"]');if(mb&&mb.contains(e.target))return;if(row.contains(e.target))return;closeRow();});
+        document.addEventListener("keydown",(e)=>{if(e.key==="Escape")closeRow();});
+        W.addEventListener("scroll",closeRow,{passive:true}); W.addEventListener("resize",closeRow);
+        W.registerEugeneScript=function(entry){const list=W.__eugeneScripts,i=list.findIndex((s)=>s.id===entry.id);if(i>=0)list[i]=entry;else list.push(entry);W.dispatchEvent(new CustomEvent("eugene-scripts-updated"));};
+        W.mountEugeneFooterMenu=mount;
+    })();
+
+    // ── Main ───────────────────────────────────────────────────
+    const TS_ICON_SVG=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><defs><linearGradient id="ts_ig" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#ts_ig)"><path d="M10 2a8 8 0 1 0 5.29 13.71l4.5 4.5 1.42-1.42-4.5-4.5A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12A6 6 0 0 1 10 4zm-1 3v2H7v2h2v2h2v-2h2V9h-2V7H9z"/></g></svg>`;
+
+    function main() {
+        const initialKey=KeyResolver.resolveTornKey();
+        const api=new TornAPI(initialKey||"");
+        const scout=new TargetScout(api);
+        const ui=new UI(scout);
+        window.__tsUI=ui;
+        ui.inject();
+        ui.setAuthed(!!initialKey);
+        const W=(typeof unsafeWindow!=="undefined")?unsafeWindow:window;
+        W.registerEugeneScript({id:"ts",name:"Target Scout",color:"#1565c0",colorDark:"#0d47a1",hoverColor:"#1976d2",iconSVG:TS_ICON_SVG,onClick:()=>ui.toggle(true)});
+        W.mountEugeneFooterMenu();
+    }
+    if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);
+    else main();
+})();
