@@ -19,7 +19,7 @@
 
     const PDA_API_KEY   = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION = "2.4.6";
+    const VERSION = "2.5.0";
     const LS = { apiKey:"bh_apiKey", ffKey:"bh_ffscouterKey", settings:"bh_settings", shared:"bh_shared", debug:"bh_debug", marked:"bh_marked" };
     const SHARED_FRESH_RATIO = 0.8;
     const SPA_LS_APIKEY = "spa_apiKey";
@@ -385,7 +385,7 @@
             const ids=new Set();
             try{
                 // Fetch both rankedwars and territorywars in one call
-                const data=await this.api._get("https://api.torn.com/torn/?selections=rankedwars,territorywars");
+                const data=await this.api._get("/torn?selections=rankedwars,territorywars");
                 // Ranked wars — factions keyed by ID
                 for(const war of Object.values(data.rankedwars||{})){
                     for(const fid of Object.keys(war.factions||{})){
@@ -797,7 +797,7 @@ table.bh-table{width:100%;border-collapse:collapse}
             }).join("");
             content.innerHTML=statusLine+`<table class="bh-table"><thead><tr><th>Target</th><th>Status</th><th title="Revivable">Rev.</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
             content.querySelector("#bh-tgt-refresh").addEventListener("click",async()=>{await this.hunter.refreshMarked().catch(()=>{});});
-            content.querySelectorAll(".bh-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(ATTACK_URL+el.dataset.id);}));
+            content.querySelectorAll(".bh-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(PROFILE_URL+el.dataset.id);}));
             content.querySelectorAll(".bh-target-remove").forEach((btn)=>btn.addEventListener("click",()=>{
                 const id=Number(btn.dataset.id),name=btn.dataset.name;
                 if(!confirm(`Remove ${name} from marked targets?`))return;

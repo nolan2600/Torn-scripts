@@ -385,7 +385,7 @@
             const ids=new Set();
             try{
                 // Fetch both rankedwars and territorywars in one call
-                const data=await this.api._get("https://api.torn.com/torn/?selections=rankedwars,territorywars");
+                const data=await this.api._get("/torn?selections=rankedwars,territorywars");
                 // Ranked wars — factions keyed by ID
                 for(const war of Object.values(data.rankedwars||{})){
                     for(const fid of Object.keys(war.factions||{})){
@@ -400,6 +400,7 @@
                 }
             }catch(e){
                 logDebug(`global war fetch failed: ${e.message}`,"warn");
+                return this._warCache?this._warCache.ids:ids;
             }
             this._warCache={ids,fetchedAt:now};
             return ids;
