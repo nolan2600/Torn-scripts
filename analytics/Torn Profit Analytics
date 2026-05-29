@@ -1,0 +1,1219 @@
+// ==UserScript==
+// @name         Torn Profit Analytics
+// @namespace    https://github.com/nolan2600/torn-scripts
+// @version      1.0.0
+// @description  Track daily/weekly/monthly profits from muggings, bounties, crimes and more — with source breakdown, top events, and trend charts.
+// @author       DieselBlade
+// @match        https://www.torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @license      GPL-3.0-or-later
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+
+(function () {
+    "use strict";
+
+    const PDA_API_KEY     = "###PDA-APIKEY###";
+    const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
+    const VERSION         = "1.0.0";
+    const API_BASE        = "https://api.torn.com/v2";
+    const API_DELAY_MS    = 750;
+    const SPA_LS_APIKEY   = "spa_apiKey";
+
+    const LS = {
+        apiKey:        "ta_apiKey",
+        settings:      "ta_settings_v1",
+        events:        "ta_events_v1",
+        snapshots:     "ta_snapshots_v1",
+        lastAttackTs:  "ta_last_attack_ts",
+        lastCrimeTs:   "ta_last_crime_ts",
+        lastSnapTs:    "ta_last_snap_ts",
+    };
+
+    const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", CRIME:"crime", ATTACK:"attack" };
+
+    const TYPE_CONFIG = {
+        mugging: { label:"Mugging",    color:"#ef5350", icon:"💰" },
+        bounty:  { label:"Bounty",     color:"#ffd700", icon:"🎯" },
+        crime:   { label:"Crime",      color:"#ab47bc", icon:"🔪" },
+        attack:  { label:"Attack Win", color:"#4fc3f7", icon:"⚔️"  },
+    };
+
+    const DEFAULT_SETTINGS = {
+        includeMuggings:  true,
+        includeBounties:  true,
+        includeCrimes:    true,
+        includeAttacks:   false,
+        refreshSec:       300,
+        retentionDays:    90,
+        maxEvents:        5000,
+        snapEvery:        3600, // personalstats snapshot interval (seconds)
+    };
+
+    const SNAP_FIELDS = [
+        "attackswon","attackslost","moneymugged","defendslost",
+        "criminaloffenses","nerverefills","bazaarsales","bazaarprofit",
+        "networth","respectforfaction","useractivity",
+    ];
+
+    const IS_PDA      = typeof PDA_httpGet === "function";
+    const HAS_PDA_KEY = PDA_API_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_API_KEY);
+    const GM_XHR      = (typeof GM_xmlhttpRequest !== "undefined") ? GM_xmlhttpRequest : null;
+
+    // ── Utilities ──────────────────────────────────────────────
+    function escHtml(s) {
+        return String(s == null ? "" : s)
+            .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+            .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    const fmt = {
+        money(n) {
+            if (n == null) return "$0";
+            const a = Math.abs(n);
+            const s = a >= 1e9 ? (a/1e9).toFixed(2)+"B"
+                    : a >= 1e6 ? (a/1e6).toFixed(2)+"M"
+                    : a >= 1e3 ? (a/1e3).toFixed(1)+"K"
+                    : a.toLocaleString();
+            return (n < 0 ? "-$" : "$") + s;
+        },
+        moneyFull(n) { return (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(); },
+        date(ts)     { return new Date(ts * 1000).toLocaleDateString(); },
+        relTime(ts)  {
+            const d = Math.floor(Date.now()/1000) - ts;
+            if (d < 60)    return `${d}s ago`;
+            if (d < 3600)  return `${Math.floor(d/60)}m ago`;
+            if (d < 86400) return `${Math.floor(d/3600)}h ago`;
+            return `${Math.floor(d/86400)}d ago`;
+        },
+        pct(n) { return (n == null ? 0 : n).toFixed(1) + "%"; },
+    };
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // ── Storage ────────────────────────────────────────────────
+    function loadSettings()   { try { const r = localStorage.getItem(LS.settings); return {...DEFAULT_SETTINGS,...(r?JSON.parse(r):{})}; } catch { return {...DEFAULT_SETTINGS}; } }
+    function saveSettings(s)  { localStorage.setItem(LS.settings, JSON.stringify(s)); }
+    function loadEvents()     { try { const r = localStorage.getItem(LS.events); return r ? JSON.parse(r) : []; } catch { return []; } }
+    function loadSnapshots()  { try { const r = localStorage.getItem(LS.snapshots); return r ? JSON.parse(r) : []; } catch { return []; } }
+
+    function saveEvents(events) {
+        try { localStorage.setItem(LS.events, JSON.stringify(events)); }
+        catch { try { localStorage.setItem(LS.events, JSON.stringify(events.slice(-1000))); } catch {} }
+    }
+    function saveSnapshots(snaps) {
+        try { localStorage.setItem(LS.snapshots, JSON.stringify(snaps.slice(-365))); } catch {}
+    }
+    function getTs(key)     { try { return parseInt(localStorage.getItem(key)||"0",10); } catch { return 0; } }
+    function setTs(key, ts) { try { localStorage.setItem(key, String(ts)); } catch {} }
+
+    // ── Key Resolver ───────────────────────────────────────────
+    const KeyResolver = {
+        resolveTornKey() {
+            if (HAS_PDA_KEY) return PDA_API_KEY;
+            const k = localStorage.getItem(LS.apiKey);
+            if (k) return k;
+            return localStorage.getItem(SPA_LS_APIKEY) || null;
+        },
+        saveKey(k)   { localStorage.setItem(LS.apiKey, k); },
+        clearKey()   { localStorage.removeItem(LS.apiKey); },
+        isPDAKey()   { return HAS_PDA_KEY; },
+    };
+
+    // ── HTTP ───────────────────────────────────────────────────
+    function _gmGet(url) {
+        return new Promise((resolve, reject) => {
+            GM_XHR({ method:"GET", url,
+                onload:   r => resolve({status:r.status, text:r.responseText}),
+                onerror:  () => reject(new Error("network_error")),
+                ontimeout:() => reject(new Error("timeout")),
+            });
+        });
+    }
+
+    async function httpGetJson(url) {
+        if (IS_PDA) {
+            const res = await PDA_httpGet(url);
+            if (res.status < 200 || res.status >= 300) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+            return JSON.parse(res.responseText);
+        }
+        if (GM_XHR) {
+            const res = await _gmGet(url);
+            if (res.status < 200 || res.status >= 300) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+            return JSON.parse(res.text);
+        }
+        const res = await fetch(url);
+        if (!res.ok) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+        return res.json();
+    }
+
+    // ── Torn API ───────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key = key; this._lastReq = 0; }
+        setKey(key) { this.key = key; }
+
+        async _rateLimit() { const w = API_DELAY_MS - (Date.now() - this._lastReq); if (w > 0) await sleep(w); this._lastReq = Date.now(); }
+
+        async _get(path, params = {}) {
+            await this._rateLimit();
+            const url = new URL(/^https?:\/\//.test(path) ? path : API_BASE + path);
+            for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+            if (!url.searchParams.has("key")) url.searchParams.set("key", this.key);
+            const data = await httpGetJson(url.toString());
+            if (data && data.error) { const e = new Error(data.error.error || "Torn API error"); e.tornCode = data.error.code; throw e; }
+            return data;
+        }
+
+        async validateKey() {
+            const data = await this._get("/user/profile");
+            return (data && data.profile) || (data && data.id ? data : null);
+        }
+
+        async fetchAttacks(fromTs = 0) {
+            const all = []; let offset = 0; let pages = 0;
+            while (pages < 20) {
+                const params = { limit: 100, offset };
+                if (fromTs > 0) params.from = fromTs + 1; // +1 avoids re-fetching the last seen
+                const data = await this._get("/user/attacks", params);
+                const raw = data.attacks;
+                if (!raw) break;
+                const arr = Array.isArray(raw) ? raw : Object.values(raw);
+                if (arr.length === 0) break;
+                all.push(...arr);
+                if (arr.length < 100) break;
+                offset += 100; pages++;
+            }
+            return all;
+        }
+
+        async fetchCrimes(fromTs = 0) {
+            const all = []; let offset = 0; let pages = 0;
+            while (pages < 10) {
+                const params = { limit: 100, offset };
+                if (fromTs > 0) params.from = fromTs + 1;
+                try {
+                    const data = await this._get("/user/crimes", params);
+                    const raw = data.crimes;
+                    if (!raw) break;
+                    const arr = Array.isArray(raw) ? raw : Object.values(raw);
+                    if (arr.length === 0) break;
+                    all.push(...arr);
+                    if (arr.length < 100) break;
+                    offset += 100; pages++;
+                } catch { break; } // crimes endpoint may not exist — skip silently
+            }
+            return all;
+        }
+
+        async fetchPersonalStats() {
+            try {
+                const data = await this._get("/user/personalstats");
+                return data.personalstats || data || null;
+            } catch { return null; }
+        }
+    }
+
+    // ── Data Normalizers ───────────────────────────────────────
+    function normalizeAttack(a) {
+        return {
+            id:           a.id || a.code || null,
+            code:         a.code || null,
+            ts:           a.ended || a.timestamp_ended || a.timestamp || 0,
+            attackerId:   a.attacker?.id || a.attacker_id || null,
+            attackerName: a.attacker?.name || a.attacker_name || "",
+            defenderId:   a.defender?.id || a.defender_id || null,
+            defenderName: a.defender?.name || a.defender_name || "",
+            result:       a.result || "",
+            moneyMugged:  a.stolen?.money || a.money_mugged || a.mug || 0,
+            respect:      a.respect || a.respect_gain || 0,
+        };
+    }
+
+    function normalizeCrime(c) {
+        const reward = c.reward?.money || c.reward || c.cash || c.cash_gain || c.money_gain || 0;
+        return {
+            id:      c.id || c.crime_id || null,
+            name:    c.title || c.crime_name || c.name || "Crime",
+            ts:      c.time_completed || c.ended || c.timestamp || 0,
+            reward:  typeof reward === "number" ? reward : 0,
+            success: c.success !== false,
+        };
+    }
+
+    // ── Event Processors ───────────────────────────────────────
+    function processAttacks(rawAttacks, myUserId, settings) {
+        const events = [];
+        for (const raw of rawAttacks) {
+            const a = normalizeAttack(raw);
+            if (!a.ts) continue;
+            if (myUserId && a.attackerId && a.attackerId !== myUserId) continue; // skip if I'm not the attacker
+
+            const uid = a.code || a.id || `${a.ts}_${a.defenderId}`;
+
+            if (settings.includeMuggings && a.moneyMugged > 0) {
+                events.push({
+                    id:     `mug_${uid}`,
+                    type:   EVENT_TYPES.MUGGING,
+                    amount: a.moneyMugged,
+                    ts:     a.ts,
+                    label:  `Mugged ${a.defenderName || "Player"}`,
+                    meta:   { targetId: a.defenderId, targetName: a.defenderName, result: a.result },
+                });
+            }
+
+            if (settings.includeBounties && a.result === "Bounty") {
+                events.push({
+                    id:     `bnty_${uid}`,
+                    type:   EVENT_TYPES.BOUNTY,
+                    amount: a.moneyMugged || 0,
+                    ts:     a.ts,
+                    label:  `Bounty — ${a.defenderName || "Player"}`,
+                    meta:   { targetId: a.defenderId, targetName: a.defenderName },
+                });
+            }
+
+            if (settings.includeAttacks && a.moneyMugged === 0 && a.respect > 0) {
+                events.push({
+                    id:     `atk_${uid}`,
+                    type:   EVENT_TYPES.ATTACK,
+                    amount: 0,
+                    ts:     a.ts,
+                    label:  `${a.result || "Win"} vs ${a.defenderName || "Player"} (+${a.respect.toFixed(2)} resp)`,
+                    meta:   { targetId: a.defenderId, targetName: a.defenderName, respect: a.respect },
+                });
+            }
+        }
+        return events;
+    }
+
+    function processCrimes(rawCrimes, settings) {
+        if (!settings.includeCrimes) return [];
+        const events = [];
+        for (const raw of rawCrimes) {
+            const c = normalizeCrime(raw);
+            if (!c.ts || !c.success || c.reward <= 0) continue;
+            events.push({
+                id:     `cr_${c.id || c.ts}`,
+                type:   EVENT_TYPES.CRIME,
+                amount: c.reward,
+                ts:     c.ts,
+                label:  c.name,
+                meta:   { crimeName: c.name },
+            });
+        }
+        return events;
+    }
+
+    function mergeEvents(existing, incoming) {
+        const seen = new Set(existing.map(e => e.id));
+        const added = incoming.filter(e => e.id && !seen.has(e.id));
+        return [...existing, ...added].sort((a, b) => b.ts - a.ts);
+    }
+
+    function pruneEvents(events, settings) {
+        const cutoff = Math.floor(Date.now()/1000) - settings.retentionDays * 86400;
+        return events.filter(e => e.ts >= cutoff).slice(0, settings.maxEvents);
+    }
+
+    // ── Analytics ──────────────────────────────────────────────
+    function getRange(period) {
+        const now = Math.floor(Date.now()/1000);
+        switch (period) {
+            case "today": {
+                const d = new Date(); d.setHours(0,0,0,0);
+                return { from: Math.floor(d.getTime()/1000), to: now, label:"Today", days:1 };
+            }
+            case "week":   return { from: now - 7*86400,  to: now, label:"Last 7 Days",  days:7  };
+            case "month":  return { from: now - 30*86400, to: now, label:"Last 30 Days", days:30 };
+            case "3month": return { from: now - 90*86400, to: now, label:"Last 90 Days", days:90 };
+            default:       return { from: 0,              to: now, label:"All Time",     days:0  };
+        }
+    }
+
+    function filterByPeriod(events, period, settings) {
+        const { from, to } = getRange(period);
+        return events.filter(e => {
+            if (e.ts < from || e.ts > to) return false;
+            if (e.type === EVENT_TYPES.MUGGING && !settings.includeMuggings) return false;
+            if (e.type === EVENT_TYPES.BOUNTY  && !settings.includeBounties) return false;
+            if (e.type === EVENT_TYPES.CRIME   && !settings.includeCrimes)   return false;
+            if (e.type === EVENT_TYPES.ATTACK  && !settings.includeAttacks)  return false;
+            return true;
+        });
+    }
+
+    function calcStats(events) {
+        const money = events.filter(e => (e.amount||0) > 0);
+        const total = money.reduce((s,e) => s + e.amount, 0);
+        const count = money.length;
+        return {
+            total, count,
+            avg:  count > 0 ? total/count : 0,
+            best: count > 0 ? Math.max(...money.map(e => e.amount)) : 0,
+        };
+    }
+
+    function groupByType(events) {
+        const g = {};
+        for (const e of events) {
+            if ((e.amount||0) <= 0) continue;
+            if (!g[e.type]) g[e.type] = { total:0, count:0 };
+            g[e.type].total += e.amount;
+            g[e.type].count++;
+        }
+        return g;
+    }
+
+    function groupByDay(events, days) {
+        const now = Math.floor(Date.now()/1000);
+        return Array.from({length: days}, (_, i) => {
+            const dayEnd   = now - i*86400;
+            const dayStart = dayEnd - 86400;
+            const dayEvts  = events.filter(e => e.ts >= dayStart && e.ts < dayEnd && (e.amount||0) > 0);
+            const total    = dayEvts.reduce((s,e) => s + e.amount, 0);
+            const mid      = new Date((dayStart + 43200)*1000);
+            return {
+                label: mid.toLocaleDateString([], {month:"short", day:"numeric"}),
+                total, count: dayEvts.length,
+            };
+        }).reverse();
+    }
+
+    function groupByTarget(events) {
+        const t = {};
+        for (const e of events) {
+            if (!e.meta?.targetId || (e.amount||0) <= 0) continue;
+            const id = e.meta.targetId;
+            if (!t[id]) t[id] = { id, name: e.meta.targetName || `Player ${id}`, total:0, count:0 };
+            t[id].total += e.amount;
+            t[id].count++;
+        }
+        return Object.values(t).sort((a,b) => b.total - a.total);
+    }
+
+    function buildWeeklyComparison(events) {
+        const now   = Math.floor(Date.now()/1000);
+        const weeks = [];
+        for (let w = 0; w < 4; w++) {
+            const from = now - (w+1)*7*86400;
+            const to   = now - w*7*86400;
+            const evts = events.filter(e => e.ts >= from && e.ts < to && (e.amount||0) > 0);
+            const total = evts.reduce((s,e) => s + e.amount, 0);
+            const lbl   = w === 0 ? "This Week" : w === 1 ? "Last Week" : `${w+1} Weeks Ago`;
+            weeks.push({ label: lbl, total, count: evts.length });
+        }
+        return weeks;
+    }
+
+    function computeSnapDelta(snaps, periodSec) {
+        if (snaps.length < 2) return null;
+        const now     = Math.floor(Date.now()/1000);
+        const recent  = snaps[snaps.length - 1];
+        const cutoff  = now - periodSec;
+        const earlier = [...snaps].reverse().find(s => s.ts <= cutoff);
+        if (!earlier) return null;
+        const delta = {};
+        for (const f of SNAP_FIELDS) {
+            if (recent[f] != null && earlier[f] != null) {
+                delta[f] = recent[f] - earlier[f];
+            }
+        }
+        return delta;
+    }
+
+    // ── CSS ────────────────────────────────────────────────────
+    function injectCSS() {
+        if (document.getElementById("ta-style")) return;
+        const s = document.createElement("style");
+        s.id = "ta-style";
+        s.textContent = `
+#ta-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.7)}
+#ta-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#1a1a1a;border:1px solid #444;border-radius:10px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#ddd;font-size:14px;width:680px;max-width:98vw;max-height:90vh;min-width:320px;flex-direction:column}
+#ta-panel.ta-open{display:flex}#ta-overlay.ta-open{display:block}
+#ta-panel *{box-sizing:border-box;color:inherit}
+#ta-panel ::-webkit-scrollbar{width:6px}#ta-panel ::-webkit-scrollbar-track{background:#1a1a1a}#ta-panel ::-webkit-scrollbar-thumb{background:#444;border-radius:3px}
+#ta-header{display:flex;align-items:center;gap:8px;padding:10px 16px;background:#222;border-bottom:1px solid #444;flex-shrink:0}
+#ta-header h2{margin:0;font-size:17px;color:#fff}
+.ta-ver{color:#666;font-size:11px;margin-left:4px}
+#ta-close{background:none;border:none;color:#999;font-size:22px;cursor:pointer;padding:2px 8px;margin-left:auto}#ta-close:hover{color:#fff}
+#ta-tabs{display:flex;background:#252525;border-bottom:1px solid #444;overflow-x:auto;flex-shrink:0}
+.ta-tab{padding:10px 16px;cursor:pointer;color:#999!important;border-bottom:2px solid transparent;white-space:nowrap;font-size:13px;transition:all .15s;background:none;border-top:none;border-left:none;border-right:none}.ta-tab:hover{color:#ccc!important;background:#2a2a2a}.ta-tab.active{color:#4fc3f7!important;border-bottom-color:#4fc3f7}
+#ta-body{padding:14px 16px;overflow-y:auto;flex:1;min-height:0}
+#ta-footer{display:flex;align-items:center;justify-content:space-between;padding:6px 14px;border-top:1px solid #2a2a2a;flex-shrink:0;font-size:11px;color:#666}
+.ta-btn{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;transition:background .15s}
+.ta-btn-primary{background:#1565c0;color:#fff}.ta-btn-primary:hover{background:#1976d2}
+.ta-btn-danger{background:#c62828;color:#fff}.ta-btn-danger:hover{background:#d32f2f}
+.ta-btn-muted{background:#2a2a2a;border:1px solid #444;color:#ccc}.ta-btn-muted:hover{background:#333}
+.ta-btn-sm{padding:3px 8px;font-size:11px}
+.ta-btn:disabled{opacity:.5;cursor:not-allowed}
+.ta-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}
+.ta-card{background:#242424;border-radius:6px;padding:10px 12px;border:1px solid #2e2e2e}
+.ta-card-lbl{font-size:10px;color:#777;text-transform:uppercase;letter-spacing:.5px}
+.ta-card-val{font-size:20px;font-weight:700;color:#4fc3f7;margin-top:2px}
+.ta-card-sub{font-size:11px;color:#666;margin-top:2px}
+.ta-period-row{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
+.ta-period-btn{padding:4px 10px;border-radius:12px;border:1px solid #3a3a3a;background:#242424;color:#888;font-size:11px;cursor:pointer;transition:all .15s}
+.ta-period-btn:hover{border-color:#555;color:#bbb}.ta-period-btn.active{background:#1565c0;border-color:#1976d2;color:#fff}
+.ta-chart{margin-bottom:14px}
+.ta-chart-lbl{font-size:11px;color:#777;margin-bottom:6px}
+.ta-bars{display:flex;align-items:flex-end;gap:2px;height:72px}
+.ta-bar-col{flex:1;min-width:6px;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.ta-bar-fill{width:100%;background:#1565c0;border-radius:2px 2px 0 0;min-height:2px;cursor:default;transition:background .1s}
+.ta-bar-fill:hover{background:#42a5f5}.ta-bar-fill.ta-bar-zero{background:#2a2a2a;min-height:2px}
+.ta-chart-axis{display:flex;justify-content:space-between;font-size:9px;color:#555;margin-top:3px}
+.ta-section-hd{font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px;padding-bottom:4px;border-bottom:1px solid #252525}
+.ta-event-list{}
+.ta-event-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #242424;font-size:12px}
+.ta-event-row:last-child{border-bottom:none}
+.ta-event-icon{font-size:13px;flex-shrink:0;width:18px;text-align:center}
+.ta-event-lbl{flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ta-event-amt{font-weight:700;flex-shrink:0}.ta-event-amt.pos{color:#66bb6a}.ta-event-amt.zero{color:#666}
+.ta-event-time{font-size:10px;color:#555;flex-shrink:0}
+table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.ta-tbl th{text-align:left;padding:5px 8px;border-bottom:1px solid #333;font-size:10px;text-transform:uppercase;color:#666;position:sticky;top:0;background:#1a1a1a;white-space:nowrap}
+.ta-tbl td{padding:6px 8px;border-bottom:1px solid #252525;vertical-align:middle}
+.ta-tbl tr:hover td{background:#1f1f1f}
+.ta-tbl th.num,.ta-tbl td.num{text-align:right}
+.ta-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:3px;font-size:11px;font-weight:600}
+.ta-pbar-bg{background:#242424;border-radius:3px;height:5px;width:80px;overflow:hidden;display:inline-block}
+.ta-pbar-fill{height:100%;border-radius:3px}
+.ta-top-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:4px;margin-bottom:4px;background:#1f1f1f}
+.ta-top-rank{font-size:12px;font-weight:700;color:#555;width:22px;flex-shrink:0;text-align:center}
+.ta-top-lbl{flex:1;font-size:12px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ta-top-amt{font-size:13px;font-weight:700;color:#66bb6a;flex-shrink:0}
+.ta-top-meta{font-size:10px;color:#555;flex-shrink:0}
+.ta-cmp-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #242424;font-size:12px}
+.ta-cmp-lbl{width:110px;flex-shrink:0;color:#aaa}.ta-cmp-bar-wrap{flex:1}
+.ta-cmp-bar-bg{background:#242424;border-radius:3px;height:8px;overflow:hidden}
+.ta-cmp-bar-fill{height:100%;border-radius:3px;background:#1565c0;transition:width .3s}
+.ta-cmp-amt{width:80px;text-align:right;font-weight:700;color:#4fc3f7;flex-shrink:0}
+.ta-snap-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #252525;font-size:12px}
+.ta-snap-key{color:#999}.ta-snap-val{color:#ccc;font-weight:600}
+.ta-field{margin-bottom:10px}
+.ta-field label{display:block;font-size:11px;color:#888;margin-bottom:3px}
+.ta-input{width:100%;padding:6px 8px;background:#242424;border:1px solid #3a3a3a;border-radius:4px;color:#ddd;font-size:13px}
+.ta-input:focus{border-color:#4fc3f7;outline:none}
+.ta-check-row{display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer}
+.ta-check-row input{accent-color:#4fc3f7;width:14px;height:14px}
+.ta-check-row label{font-size:12px;color:#ccc;cursor:pointer}
+.ta-key-row{display:flex;gap:6px}.ta-key-row .ta-input{flex:1}
+.ta-settings-hd{font-size:13px;font-weight:700;color:#aaa;margin:14px 0 8px}
+.ta-save-status{font-size:11px;margin-top:6px;min-height:1em}
+.ta-save-ok{color:#66bb6a}.ta-save-err{color:#ef5350}.ta-save-info{color:#aaa}
+.ta-empty{text-align:center;padding:24px 8px;color:#666;font-size:13px}
+.ta-empty-icon{font-size:26px;margin-bottom:6px}
+.ta-link{color:#4fc3f7!important;text-decoration:none}.ta-link:hover{text-decoration:underline}
+@media(max-width:768px){#ta-panel{width:100vw!important;max-width:100vw;min-width:0;border-radius:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}.ta-cards{grid-template-columns:1fr 1fr}}
+`;
+        document.head.appendChild(s);
+    }
+
+    // ── UI ─────────────────────────────────────────────────────
+    class AnalyticsUI {
+        constructor() {
+            this._panel   = null;
+            this._overlay = null;
+            this.tab      = "overview";
+            this.period   = "week";
+            this.settings = loadSettings();
+            this.syncing  = false;
+            this.lastSync = 0;
+            this.lastErr  = null;
+            this.myId     = null;
+            this._ticker  = null;
+            this._syncTmr = null;
+        }
+
+        init() {
+            injectCSS();
+            this._registerEugene();
+        }
+
+        _registerEugene() {
+            const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+            const tryReg = () => {
+                if (W.registerEugeneScript) {
+                    W.registerEugeneScript({
+                        id: "torn-analytics", name: "Analytics",
+                        color: "#1565c0", colorDark: "#0d3a6e", hoverColor: "#1976d2",
+                        iconSVG: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="ta_g" x1=".5" x2=".5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#ta_g)"><path d="M5 20h2v-8H5v8zm4 0h2V4H9v16zm4 0h2v-5h-2v5zm4 0h2V9h-2v11z"/></g></svg>`,
+                        onClick: () => this.toggle(true),
+                    });
+                } else {
+                    setTimeout(tryReg, 500);
+                }
+            };
+            tryReg();
+        }
+
+        toggle(open) {
+            const isOpen = open != null ? open : !(this._panel && this._panel.classList.contains("ta-open"));
+            if (isOpen) this._open(); else this._close();
+        }
+
+        _open() {
+            injectCSS();
+            if (!this._panel) this._build();
+            this._panel.classList.add("ta-open");
+            this._overlay.classList.add("ta-open");
+            this._renderBody();
+            this._startTicker();
+            // Auto-sync on open if stale
+            const key = KeyResolver.resolveTornKey();
+            if (key && (Date.now() - this.lastSync) > this.settings.refreshSec * 1000) {
+                this.syncData();
+            }
+        }
+
+        _close() {
+            if (this._panel)   this._panel.classList.remove("ta-open");
+            if (this._overlay) this._overlay.classList.remove("ta-open");
+            this._stopTicker();
+        }
+
+        _build() {
+            const overlay = document.createElement("div");
+            overlay.id = "ta-overlay";
+            overlay.addEventListener("click", () => this._close());
+            document.body.appendChild(overlay);
+            this._overlay = overlay;
+
+            const panel = document.createElement("div");
+            panel.id = "ta-panel";
+            panel.innerHTML = `
+                <div id="ta-header">
+                    <h2>📊 Profit Analytics <span class="ta-ver">v${VERSION}</span></h2>
+                    <button id="ta-close" title="Close">✕</button>
+                </div>
+                <div id="ta-tabs">
+                    <button class="ta-tab active" data-tab="overview">Overview</button>
+                    <button class="ta-tab" data-tab="sources">By Source</button>
+                    <button class="ta-tab" data-tab="top">Top Events</button>
+                    <button class="ta-tab" data-tab="trends">Trends</button>
+                    <button class="ta-tab" data-tab="settings">Settings</button>
+                </div>
+                <div id="ta-body"></div>
+                <div id="ta-footer">
+                    <span id="ta-status-txt">—</span>
+                    <button class="ta-btn ta-btn-primary ta-btn-sm" id="ta-sync-btn">⟳ Sync</button>
+                </div>`;
+            document.body.appendChild(panel);
+            this._panel = panel;
+
+            panel.querySelector("#ta-close").addEventListener("click", () => this._close());
+            panel.querySelectorAll(".ta-tab").forEach(t =>
+                t.addEventListener("click", () => { this.tab = t.dataset.tab; this._syncTabs(); this._renderBody(); })
+            );
+            panel.querySelector("#ta-sync-btn").addEventListener("click", () => this.syncData());
+        }
+
+        _syncTabs() {
+            this._panel.querySelectorAll(".ta-tab").forEach(t =>
+                t.classList.toggle("active", t.dataset.tab === this.tab)
+            );
+        }
+
+        _startTicker() {
+            if (this._ticker) return;
+            this._ticker = setInterval(() => this._tickFooter(), 5000);
+        }
+        _stopTicker() { if (this._ticker) { clearInterval(this._ticker); this._ticker = null; } }
+
+        _tickFooter() {
+            const el = this._panel && this._panel.querySelector("#ta-status-txt");
+            if (!el) return;
+            if (this.syncing) { el.textContent = "⟳ Syncing…"; return; }
+            if (this.lastErr) { el.textContent = `❌ ${this.lastErr}`; return; }
+            if (this.lastSync > 0) {
+                const events = loadEvents();
+                el.textContent = `${events.length} events · synced ${fmt.relTime(Math.floor(this.lastSync/1000))}`;
+            } else {
+                el.textContent = "No data yet — click ⟳ Sync";
+            }
+        }
+
+        _renderBody() {
+            const body = this._panel && this._panel.querySelector("#ta-body");
+            if (!body) return;
+            const key = KeyResolver.resolveTornKey();
+            if (!key) { body.innerHTML = this._authHTML(); this._wireAuth(body); this._tickFooter(); return; }
+            switch (this.tab) {
+                case "overview": body.innerHTML = this._overviewHTML(); this._wirePeriod(body); break;
+                case "sources":  body.innerHTML = this._sourcesHTML(); this._wirePeriod(body); break;
+                case "top":      body.innerHTML = this._topHTML();     this._wirePeriod(body); break;
+                case "trends":   body.innerHTML = this._trendsHTML();  break;
+                case "settings": body.innerHTML = this._settingsHTML(); this._wireSettings(body); break;
+            }
+            this._tickFooter();
+        }
+
+        // ── Auth ──────────────────────────────────────────────
+        _authHTML() {
+            return `<div style="padding:8px 0">
+                <div style="font-size:14px;font-weight:700;margin-bottom:10px">API Key Required</div>
+                <div class="ta-field">
+                    <label>Torn API Key (16 characters)</label>
+                    <div class="ta-key-row">
+                        <input type="text" class="ta-input" id="ta-auth-inp" maxlength="16" placeholder="Paste your key here" autocomplete="off" data-lpignore="true" />
+                        <button class="ta-btn ta-btn-primary" id="ta-auth-save">Save</button>
+                    </div>
+                    <div id="ta-auth-msg" class="ta-save-status"></div>
+                </div>
+                <p style="font-size:11px;color:#666;margin-top:6px">
+                    Get your key at <a class="ta-link" href="https://www.torn.com/preferences.php#tab=api" target="_blank">Torn → Preferences → API Key</a>. "Public" access is sufficient.
+                </p>
+            </div>`;
+        }
+
+        _wireAuth(body) {
+            const inp = body.querySelector("#ta-auth-inp");
+            const btn = body.querySelector("#ta-auth-save");
+            const msg = body.querySelector("#ta-auth-msg");
+            const save = async () => {
+                const k = inp.value.trim();
+                if (!/^[A-Za-z0-9]{16}$/.test(k)) { msg.className = "ta-save-status ta-save-err"; msg.textContent = "Must be exactly 16 alphanumeric characters."; return; }
+                btn.disabled = true;
+                msg.className = "ta-save-status ta-save-info"; msg.textContent = "Validating…";
+                try {
+                    const api  = new TornAPI(k);
+                    const prof = await api.validateKey();
+                    if (!prof) throw new Error("Key rejected or insufficient access.");
+                    KeyResolver.saveKey(k);
+                    this.myId = prof.id || prof.player_id;
+                    msg.className = "ta-save-status ta-save-ok";
+                    msg.textContent = `✓ Valid — ${prof.name || "Player"} [${this.myId}]`;
+                    setTimeout(() => { this._renderBody(); this.syncData(); }, 1200);
+                } catch (e) {
+                    msg.className = "ta-save-status ta-save-err"; msg.textContent = e.message || "Validation failed.";
+                } finally { btn.disabled = false; }
+            };
+            btn.addEventListener("click", save);
+            inp.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+        }
+
+        // ── Period selector ───────────────────────────────────
+        _periodRow() {
+            const periods = [
+                {id:"today",label:"Today"},{id:"week",label:"7 Days"},
+                {id:"month",label:"30 Days"},{id:"3month",label:"90 Days"},{id:"all",label:"All Time"},
+            ];
+            return `<div class="ta-period-row">${periods.map(p =>
+                `<button class="ta-period-btn${p.id===this.period?" active":""}" data-period="${p.id}">${p.label}</button>`
+            ).join("")}</div>`;
+        }
+
+        _wirePeriod(container) {
+            container.querySelectorAll(".ta-period-btn").forEach(btn =>
+                btn.addEventListener("click", () => { this.period = btn.dataset.period; this._renderBody(); })
+            );
+        }
+
+        _events() { return filterByPeriod(loadEvents(), this.period, this.settings); }
+
+        // ── Overview ──────────────────────────────────────────
+        _overviewHTML() {
+            const events  = this._events();
+            const stats   = calcStats(events);
+            const { label, days } = getRange(this.period);
+            const allEvts = loadEvents().filter(e => (e.amount||0) > 0);
+            const allTot  = allEvts.reduce((s,e) => s + e.amount, 0);
+            const dAvg    = days > 0 ? stats.total / days : stats.total;
+
+            const cards = `<div class="ta-cards">
+                <div class="ta-card">
+                    <div class="ta-card-lbl">${escHtml(label)} Profit</div>
+                    <div class="ta-card-val">${escHtml(fmt.money(stats.total))}</div>
+                    <div class="ta-card-sub">${stats.count} events</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">Avg per Event</div>
+                    <div class="ta-card-val">${escHtml(fmt.money(stats.avg))}</div>
+                    <div class="ta-card-sub">Best single: ${escHtml(fmt.money(stats.best))}</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">Daily Average</div>
+                    <div class="ta-card-val">${escHtml(fmt.money(dAvg))}</div>
+                    <div class="ta-card-sub">over ${escHtml(label.toLowerCase())}</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">All-Time Total</div>
+                    <div class="ta-card-val">${escHtml(fmt.money(allTot))}</div>
+                    <div class="ta-card-sub">${allEvts.length} events tracked</div>
+                </div>
+            </div>`;
+
+            // Always show at least 7 days in the bar chart for readability
+            const chartDays = days <= 1 ? 7 : Math.min(days, 30);
+            const chartPeriod = chartDays <= 7 ? "week" : chartDays <= 30 ? "month" : "3month";
+            const chart = this._barChart(filterByPeriod(loadEvents(), chartPeriod, this.settings), chartDays);
+
+            const recent = events.filter(e => (e.amount||0) > 0 || e.type === EVENT_TYPES.ATTACK).slice(0, 12);
+
+            return `${this._periodRow()}${cards}
+                <div class="ta-section-hd">Daily Trend</div>
+                ${chart}
+                <div class="ta-section-hd">Recent Activity</div>
+                ${this._eventListHTML(recent)}`;
+        }
+
+        _barChart(events, days) {
+            const buckets = groupByDay(events, days);
+            const maxVal  = Math.max(...buckets.map(b => b.total), 1);
+            const bars    = buckets.map(b => {
+                const h = Math.max(2, Math.round((b.total / maxVal) * 100));
+                return `<div class="ta-bar-col" title="${escHtml(b.label)}: ${escHtml(fmt.money(b.total))} (${b.count} events)">
+                    <div class="ta-bar-fill${b.total===0?" ta-bar-zero":""}" style="height:${h}%"></div>
+                </div>`;
+            }).join("");
+            return `<div class="ta-chart">
+                <div class="ta-bars">${bars}</div>
+                <div class="ta-chart-axis">
+                    <span>${escHtml(buckets[0]?.label||"")}</span>
+                    <span>Today</span>
+                </div>
+            </div>`;
+        }
+
+        _eventListHTML(events) {
+            if (events.length === 0) return `<div class="ta-empty"><div class="ta-empty-icon">📭</div>No events for this period.<br>Click ⟳ Sync to fetch data.</div>`;
+            return `<div class="ta-event-list">${events.map(e => {
+                const tc   = TYPE_CONFIG[e.type] || {icon:"•"};
+                const pos  = (e.amount||0) > 0;
+                const amtS = pos ? "+" + fmt.money(e.amount)
+                           : e.type === EVENT_TYPES.ATTACK ? fmt.money(e.meta?.respect||0) + " resp"
+                           : fmt.money(0);
+                return `<div class="ta-event-row">
+                    <div class="ta-event-icon">${tc.icon}</div>
+                    <div class="ta-event-lbl" title="${escHtml(e.label)}">${escHtml(e.label)}</div>
+                    <div class="ta-event-amt ${pos?"pos":"zero"}">${escHtml(amtS)}</div>
+                    <div class="ta-event-time">${fmt.relTime(e.ts)}</div>
+                </div>`;
+            }).join("")}</div>`;
+        }
+
+        // ── Sources ───────────────────────────────────────────
+        _sourcesHTML() {
+            const events   = this._events().filter(e => (e.amount||0) > 0);
+            const groups   = groupByType(events);
+            const grandTot = events.reduce((s,e) => s + e.amount, 0);
+
+            if (Object.keys(groups).length === 0) {
+                return `${this._periodRow()}<div class="ta-empty"><div class="ta-empty-icon">📊</div>No profitable events for this period.</div>`;
+            }
+
+            const rows = Object.entries(groups)
+                .sort((a,b) => b[1].total - a[1].total)
+                .map(([type, g]) => {
+                    const tc  = TYPE_CONFIG[type] || {icon:"•", label:type, color:"#888"};
+                    const pct = grandTot > 0 ? g.total/grandTot*100 : 0;
+                    const avg = g.count > 0 ? g.total/g.count : 0;
+                    return `<tr>
+                        <td><span class="ta-badge" style="background:${tc.color}1a;color:${tc.color}">${tc.icon} ${tc.label}</span></td>
+                        <td class="num" style="color:#aaa">${g.count}</td>
+                        <td class="num" style="color:#66bb6a;font-weight:700">${escHtml(fmt.money(g.total))}</td>
+                        <td>
+                            <span class="ta-pbar-bg"><span class="ta-pbar-fill" style="width:${pct.toFixed(1)}%;background:${tc.color};display:block;height:100%;border-radius:3px"></span></span>
+                            <span style="font-size:10px;color:#777;margin-left:5px">${fmt.pct(pct)}</span>
+                        </td>
+                        <td class="num" style="color:#888">${escHtml(fmt.money(avg))}</td>
+                    </tr>`;
+                }).join("");
+
+            return `${this._periodRow()}
+                <table class="ta-tbl">
+                    <thead><tr>
+                        <th>Source</th><th class="num">Events</th>
+                        <th class="num">Total Profit</th><th>Share</th>
+                        <th class="num">Avg / Event</th>
+                    </tr></thead>
+                    <tbody>${rows}</tbody>
+                    <tfoot>
+                        <tr style="border-top:1px solid #333">
+                            <td style="color:#777;font-weight:700;font-size:11px">TOTAL</td>
+                            <td class="num" style="color:#777">${events.length}</td>
+                            <td class="num" style="color:#4fc3f7;font-weight:700">${escHtml(fmt.money(grandTot))}</td>
+                            <td></td>
+                            <td class="num" style="color:#777">${escHtml(fmt.money(grandTot/(events.length||1)))}</td>
+                        </tr>
+                    </tfoot>
+                </table>`;
+        }
+
+        // ── Top Events ────────────────────────────────────────
+        _topHTML() {
+            const events      = this._events().filter(e => (e.amount||0) > 0);
+            const topEvents   = [...events].sort((a,b) => b.amount - a.amount).slice(0, 15);
+            const topTargets  = groupByTarget(filterByPeriod(loadEvents(), this.period, this.settings)).slice(0, 10);
+
+            const evtHTML = topEvents.length === 0
+                ? `<div class="ta-empty"><div class="ta-empty-icon">🏆</div>No events yet for this period.</div>`
+                : topEvents.map((e, i) => {
+                    const tc = TYPE_CONFIG[e.type] || {icon:"•"};
+                    return `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">${tc.icon}</div>
+                        <div class="ta-top-lbl" title="${escHtml(e.label)}">${escHtml(e.label)}</div>
+                        <div class="ta-top-amt">${escHtml(fmt.money(e.amount))}</div>
+                        <div class="ta-top-meta">${fmt.relTime(e.ts)}</div>
+                    </div>`;
+                }).join("");
+
+            const tgtHTML = topTargets.length === 0
+                ? `<div style="padding:6px;color:#666;font-size:12px">No target data available.</div>`
+                : topTargets.map((t, i) =>
+                    `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">🎯</div>
+                        <div class="ta-top-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
+                        <div class="ta-top-amt">${escHtml(fmt.money(t.total))}</div>
+                        <div class="ta-top-meta">${t.count} hit${t.count===1?"":"s"}</div>
+                    </div>`
+                ).join("");
+
+            return `${this._periodRow()}
+                <div class="ta-section-hd">Top Individual Events</div>
+                ${evtHTML}
+                <div class="ta-section-hd">Most Profitable Targets</div>
+                ${tgtHTML}`;
+        }
+
+        // ── Trends ────────────────────────────────────────────
+        _trendsHTML() {
+            const allEvts = loadEvents().filter(e => (e.amount||0) > 0 &&
+                (this.settings.includeMuggings && e.type===EVENT_TYPES.MUGGING ||
+                 this.settings.includeBounties && e.type===EVENT_TYPES.BOUNTY  ||
+                 this.settings.includeCrimes   && e.type===EVENT_TYPES.CRIME   ||
+                 this.settings.includeAttacks  && e.type===EVENT_TYPES.ATTACK));
+
+            const weeks   = buildWeeklyComparison(allEvts);
+            const maxWeek = Math.max(...weeks.map(w => w.total), 1);
+            const weekRows = weeks.map(w => `
+                <div class="ta-cmp-row">
+                    <div class="ta-cmp-lbl">${escHtml(w.label)}</div>
+                    <div class="ta-cmp-bar-wrap">
+                        <div class="ta-cmp-bar-bg">
+                            <div class="ta-cmp-bar-fill" style="width:${(w.total/maxWeek*100).toFixed(1)}%"></div>
+                        </div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${w.count} events</div>
+                    </div>
+                    <div class="ta-cmp-amt">${escHtml(fmt.money(w.total))}</div>
+                </div>`).join("");
+
+            // Monthly bars (last 6 months)
+            const now = Math.floor(Date.now()/1000);
+            const months = Array.from({length:6}, (_,i) => {
+                const to   = now - i*30*86400;
+                const from = to - 30*86400;
+                const evts = allEvts.filter(e => e.ts >= from && e.ts < to);
+                const tot  = evts.reduce((s,e) => s + e.amount, 0);
+                const d    = new Date((from + 15*86400)*1000);
+                return { label: d.toLocaleDateString([], {month:"short", year:"2-digit"}), total: tot, count: evts.length };
+            }).reverse();
+            const maxMo = Math.max(...months.map(m => m.total), 1);
+            const moRows = months.map(m => `
+                <div class="ta-cmp-row">
+                    <div class="ta-cmp-lbl">${escHtml(m.label)}</div>
+                    <div class="ta-cmp-bar-wrap">
+                        <div class="ta-cmp-bar-bg">
+                            <div class="ta-cmp-bar-fill" style="width:${(m.total/maxMo*100).toFixed(1)}%"></div>
+                        </div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${m.count} events</div>
+                    </div>
+                    <div class="ta-cmp-amt">${escHtml(fmt.money(m.total))}</div>
+                </div>`).join("");
+
+            const snaps   = loadSnapshots();
+            const delta7  = computeSnapDelta(snaps, 7*86400);
+            const delta30 = computeSnapDelta(snaps, 30*86400);
+
+            const snapField = (label, key, d7, d30) => {
+                const v7  = d7  && d7[key]  != null ? d7[key]  : null;
+                const v30 = d30 && d30[key] != null ? d30[key] : null;
+                if (v7 == null && v30 == null) return "";
+                const fmtN = (n) => n == null ? "—" : n.toLocaleString();
+                return `<div class="ta-snap-row">
+                    <div class="ta-snap-key">${escHtml(label)}</div>
+                    <div style="display:flex;gap:16px">
+                        <div class="ta-snap-val" title="7-day change">${fmtN(v7)} <span style="color:#555;font-size:10px">7d</span></div>
+                        <div class="ta-snap-val" title="30-day change">${fmtN(v30)} <span style="color:#555;font-size:10px">30d</span></div>
+                    </div>
+                </div>`;
+            };
+
+            const snapHTML = snaps.length >= 2 ? `
+                <div class="ta-section-hd">Personal Stats Deltas</div>
+                <div style="font-size:10px;color:#555;margin-bottom:8px">${snaps.length} snapshots · last: ${fmt.relTime(snaps[snaps.length-1]?.ts||0)}</div>
+                ${snapField("Attacks Won",   "attackswon",   delta7, delta30)}
+                ${snapField("Money Mugged",  "moneymugged",  delta7, delta30)}
+                ${snapField("Crimes",        "criminaloffenses", delta7, delta30)}
+                ${snapField("Bazaar Sales",  "bazaarsales",  delta7, delta30)}
+                ${snapField("Bazaar Profit", "bazaarprofit", delta7, delta30)}
+                ${snapField("Nerve Refills", "nerverefills", delta7, delta30)}
+            ` : `<div class="ta-section-hd">Personal Stats Deltas</div>
+                <div style="font-size:11px;color:#666;padding:8px 0">Syncing periodically to track stat deltas — check back after a few sessions.</div>`;
+
+            return `<div class="ta-section-hd">Weekly Comparison</div>
+                ${weekRows}
+                <div class="ta-section-hd">Monthly Comparison (6 months)</div>
+                ${moRows}
+                ${snapHTML}`;
+        }
+
+        // ── Settings ──────────────────────────────────────────
+        _settingsHTML() {
+            const s   = this.settings;
+            const key = !KeyResolver.isPDAKey() ? (KeyResolver.resolveTornKey() || "") : "";
+            const pdaNote = KeyResolver.isPDAKey() ? `<div class="ta-save-status ta-save-ok">✓ API key provided by Torn PDA</div>` : "";
+
+            return `
+                <div class="ta-settings-hd">🔑 API Key</div>
+                ${pdaNote}
+                ${!KeyResolver.isPDAKey() ? `
+                <div class="ta-field">
+                    <label>Torn API Key</label>
+                    <div class="ta-key-row">
+                        <input type="text" class="ta-input" id="ta-s-key" value="${escHtml(key)}" maxlength="16" autocomplete="off" data-lpignore="true" />
+                        <button class="ta-btn ta-btn-primary ta-btn-sm" id="ta-s-key-save">Save</button>
+                    </div>
+                    <div id="ta-s-key-msg" class="ta-save-status"></div>
+                </div>` : ""}
+
+                <div class="ta-settings-hd">📊 Track Sources</div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-mug"  ${s.includeMuggings?"checked":""} />
+                    <label for="ta-s-mug">💰 <strong>Muggings</strong> — money stolen from attacks</label>
+                </div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-bty"  ${s.includeBounties?"checked":""} />
+                    <label for="ta-s-bty">🎯 <strong>Bounties</strong> — rewards for killing bounty targets</label>
+                </div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-cr"   ${s.includeCrimes?"checked":""} />
+                    <label for="ta-s-cr">🔪 <strong>Crimes</strong> — nerve crime cash rewards</label>
+                </div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-atk"  ${s.includeAttacks?"checked":""} />
+                    <label for="ta-s-atk">⚔️ <strong>Attack Wins</strong> — track respect from wins (no cash)</label>
+                </div>
+
+                <div class="ta-settings-hd">⚙️ Sync & Data</div>
+                <div class="ta-field">
+                    <label>Auto-sync every (seconds, min 60)</label>
+                    <input type="number" class="ta-input" id="ta-s-refresh" value="${s.refreshSec}" min="60" max="3600" style="width:120px" />
+                </div>
+                <div class="ta-field">
+                    <label>Keep data for (days, max 365)</label>
+                    <input type="number" class="ta-input" id="ta-s-retain" value="${s.retentionDays}" min="7" max="365" style="width:120px" />
+                </div>
+
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                    <button class="ta-btn ta-btn-primary" id="ta-s-save">Save Settings</button>
+                    <button class="ta-btn ta-btn-muted ta-btn-sm" id="ta-s-export">⬇ Export CSV</button>
+                    <button class="ta-btn ta-btn-danger ta-btn-sm" id="ta-s-clear">🗑 Clear All Data</button>
+                </div>
+                <div id="ta-s-msg" class="ta-save-status"></div>
+                <div style="font-size:10px;color:#555;margin-top:10px">
+                    Version ${VERSION} · Platform: ${IS_PDA ? "Torn PDA" : "Desktop"} · ${loadEvents().length} events stored
+                </div>`;
+        }
+
+        _wireSettings(body) {
+            const msg = body.querySelector("#ta-s-msg");
+
+            // API key save
+            const keySave = body.querySelector("#ta-s-key-save");
+            if (keySave) {
+                keySave.addEventListener("click", async () => {
+                    const k    = body.querySelector("#ta-s-key").value.trim();
+                    const kMsg = body.querySelector("#ta-s-key-msg");
+                    if (!/^[A-Za-z0-9]{16}$/.test(k)) { kMsg.className = "ta-save-status ta-save-err"; kMsg.textContent = "Must be 16 alphanumeric characters."; return; }
+                    keySave.disabled = true;
+                    kMsg.className = "ta-save-status ta-save-info"; kMsg.textContent = "Validating…";
+                    try {
+                        const api  = new TornAPI(k);
+                        const prof = await api.validateKey();
+                        if (!prof) throw new Error("Key rejected.");
+                        KeyResolver.saveKey(k);
+                        this.myId = prof.id;
+                        kMsg.className = "ta-save-status ta-save-ok";
+                        kMsg.textContent = `✓ Valid — ${prof.name || "Player"} [${prof.id}]`;
+                    } catch (e) {
+                        kMsg.className = "ta-save-status ta-save-err"; kMsg.textContent = e.message || "Validation failed.";
+                    } finally { keySave.disabled = false; }
+                });
+            }
+
+            // Settings save
+            body.querySelector("#ta-s-save").addEventListener("click", () => {
+                this.settings = {
+                    ...this.settings,
+                    includeMuggings: body.querySelector("#ta-s-mug").checked,
+                    includeBounties: body.querySelector("#ta-s-bty").checked,
+                    includeCrimes:   body.querySelector("#ta-s-cr").checked,
+                    includeAttacks:  body.querySelector("#ta-s-atk").checked,
+                    refreshSec:      Math.max(60, parseInt(body.querySelector("#ta-s-refresh").value, 10) || 300),
+                    retentionDays:   Math.min(365, Math.max(7, parseInt(body.querySelector("#ta-s-retain").value, 10) || 90)),
+                };
+                saveSettings(this.settings);
+                msg.className = "ta-save-status ta-save-ok";
+                msg.textContent = "✓ Settings saved.";
+                setTimeout(() => { msg.textContent = ""; }, 2000);
+            });
+
+            // Export CSV
+            body.querySelector("#ta-s-export").addEventListener("click", () => {
+                const events = loadEvents();
+                const csv    = ["type,amount,label,date"].concat(
+                    events.map(e => `${e.type},${e.amount||0},"${(e.label||"").replace(/"/g,'""')}",${fmt.date(e.ts)}`)
+                ).join("\n");
+                const blob = new Blob([csv], {type:"text/csv"});
+                const url  = URL.createObjectURL(blob);
+                const a    = document.createElement("a");
+                a.href = url; a.download = `torn-analytics-${Date.now()}.csv`; a.click();
+                URL.revokeObjectURL(url);
+            });
+
+            // Clear data
+            body.querySelector("#ta-s-clear").addEventListener("click", () => {
+                if (!confirm("Clear ALL tracked profit data? This cannot be undone.")) return;
+                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastCrimeTs, LS.lastSnapTs].forEach(k => {
+                    try { localStorage.removeItem(k); } catch {}
+                });
+                msg.className = "ta-save-status ta-save-err";
+                msg.textContent = "All data cleared.";
+                this.lastSync = 0;
+                this._tickFooter();
+                setTimeout(() => this._renderBody(), 1500);
+            });
+        }
+
+        // ── Sync ──────────────────────────────────────────────
+        async syncData() {
+            if (this.syncing) return;
+            const key = KeyResolver.resolveTornKey();
+            if (!key) return;
+            const api = new TornAPI(key);
+
+            this.syncing = true; this.lastErr = null;
+            this._tickFooter();
+
+            try {
+                // Validate key + get own ID
+                const prof = await api.validateKey();
+                if (!prof) throw new Error("API key invalid or expired.");
+                this.myId = prof.id || prof.player_id;
+
+                const lastAtkTs  = getTs(LS.lastAttackTs);
+                const lastCrTs   = getTs(LS.lastCrimeTs);
+                const lastSnapTs = getTs(LS.lastSnapTs);
+                let newEvents    = [];
+                let newAtkTs     = lastAtkTs;
+                let newCrTs      = lastCrTs;
+
+                // ── Fetch attacks ──────────────────────────────
+                try {
+                    const attacks = await api.fetchAttacks(lastAtkTs);
+                    if (attacks.length > 0) {
+                        newEvents.push(...processAttacks(attacks, this.myId, this.settings));
+                        newAtkTs = Math.max(...attacks.map(a => a.ended || a.timestamp_ended || a.timestamp || 0), newAtkTs);
+                    }
+                } catch (e) {
+                    if (e.tornCode === 18) { /* no attacks — normal */ } else throw e;
+                }
+
+                // ── Fetch crimes ───────────────────────────────
+                if (this.settings.includeCrimes) {
+                    try {
+                        const crimes = await api.fetchCrimes(lastCrTs);
+                        if (crimes.length > 0) {
+                            newEvents.push(...processCrimes(crimes, this.settings));
+                            newCrTs = Math.max(...crimes.map(c => c.time_completed || c.ended || c.timestamp || 0), newCrTs);
+                        }
+                    } catch { /* crimes endpoint not available — skip */ }
+                }
+
+                // ── Merge & save events ────────────────────────
+                const merged = mergeEvents(loadEvents(), newEvents);
+                saveEvents(pruneEvents(merged, this.settings));
+                if (newAtkTs > lastAtkTs) setTs(LS.lastAttackTs, newAtkTs);
+                if (newCrTs  > lastCrTs)  setTs(LS.lastCrimeTs,  newCrTs);
+
+                // ── PersonalStats snapshot (once per hour) ─────
+                const now = Math.floor(Date.now()/1000);
+                if ((now - lastSnapTs) >= this.settings.snapEvery) {
+                    const stats = await api.fetchPersonalStats();
+                    if (stats) {
+                        const snap = { ts: now };
+                        for (const f of SNAP_FIELDS) { if (stats[f] != null) snap[f] = stats[f]; }
+                        const snaps = loadSnapshots();
+                        snaps.push(snap);
+                        saveSnapshots(snaps);
+                        setTs(LS.lastSnapTs, now);
+                    }
+                }
+
+                this.lastSync = Date.now();
+                if (this._panel && this._panel.classList.contains("ta-open")) this._renderBody();
+
+            } catch (e) {
+                this.lastErr = e.message || "Sync failed";
+            } finally {
+                this.syncing = false;
+                this._tickFooter();
+                // Schedule next auto-sync
+                if (this._syncTmr) clearTimeout(this._syncTmr);
+                this._syncTmr = setTimeout(() => {
+                    if (this._panel && this._panel.classList.contains("ta-open")) this.syncData();
+                }, this.settings.refreshSec * 1000);
+            }
+        }
+    }
+
+    // ── Shared Eugene Footer Menu ──────────────────────────────
+    // (Initialises the shared footer button system — same pattern as Bounty Hunter)
+    (function setupEugFooterMenu() {
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        if (W.__eugFooterMenuLoaded) return;
+        W.__eugFooterMenuLoaded = true;
+        W.__eugeneScripts = W.__eugeneScripts || [];
+        const ROW_ID = "eug-footer-row";
+        function injectFMCSS() { if (document.getElementById("eug-footer-style")) return; const s = document.createElement("style"); s.id = "eug-footer-style"; s.textContent = `[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`; document.head.appendChild(s); }
+        function injectEntryCSS(entry) { if (!entry.color) return; const id = `eug-color-${entry.id}`, dark = entry.colorDark || "#222", hover = entry.hoverColor || entry.color, css = `[data-eug-id="${entry.id}"]{background:linear-gradient(to bottom,${entry.color},${dark})!important}[data-eug-id="${entry.id}"]:hover{background:linear-gradient(to bottom,${hover},${entry.color})!important}`; const ex = document.getElementById(id); if (ex) { ex.textContent = css; return; } const el = document.createElement("style"); el.id = id; el.textContent = css; document.head.appendChild(el); }
+        const findRefBtn = () => document.getElementById("notes_panel_button") || document.getElementById("people_panel_button"), getRow = () => document.getElementById(ROW_ID), closeRow = () => { const r = getRow(); if (r) r.classList.remove("eug-open"); };
+        const openRow = (btn) => { const row = getRow(); if (!row) return; const rect = btn.getBoundingClientRect(); row.classList.add("eug-open"); const rr = row.getBoundingClientRect(); let left = Math.max(4, Math.min(rect.left + rect.width / 2 - rr.width / 2, window.innerWidth - rr.width - 4)); row.style.left = left + "px"; row.style.bottom = (window.innerHeight - rect.top + 6) + "px"; };
+        function makeScriptBtn(entry, refBtn, role) { const ic = refBtn.querySelector("svg")?.className?.baseVal || "", btn = document.createElement("button"); btn.type = "button"; btn.className = refBtn.className; btn.title = entry.name; btn.setAttribute("data-eug", role); btn.setAttribute("data-eug-id", entry.id); btn.innerHTML = (entry.iconSVG || "").replace(/<svg\b([^>]*)>/, (m, a) => /\sclass\s*=/.test(a) ? m : `<svg${a} class="${ic}">`); btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); closeRow(); try { entry.onClick(); } catch {} }); injectEntryCSS(entry); return btn; }
+        function makeMenuBtn(refBtn) { const ic = refBtn.querySelector("svg")?.className?.baseVal || "", btn = document.createElement("button"); btn.type = "button"; btn.className = refBtn.className; btn.title = "My userscripts"; btn.setAttribute("data-eug", "menu"); btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`; btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); const row = getRow(); if (row && row.classList.contains("eug-open")) closeRow(); else openRow(btn); }); return btn; }
+        const LEGACY = ["tat-footer-btn", "spa-footer-btn"];
+        function render() { const refBtn = findRefBtn(); if (!refBtn) return false; injectFMCSS(); const parent = refBtn.parentNode; parent.querySelectorAll("[data-eug]").forEach(el => el.remove()); LEGACY.forEach(id => { const el = document.getElementById(id); if (el) el.remove(); }); const oldRow = getRow(); if (oldRow) oldRow.remove(); const scripts = W.__eugeneScripts || []; if (scripts.length === 0) return true; if (scripts.length === 1) { parent.insertBefore(makeScriptBtn(scripts[0], refBtn, "solo"), refBtn); } else { const mb = makeMenuBtn(refBtn); parent.insertBefore(mb, refBtn); const row = document.createElement("div"); row.id = ROW_ID; row.setAttribute("data-eug-row", ""); for (const s of scripts) row.appendChild(makeScriptBtn(s, refBtn, "item")); document.body.appendChild(row); } return true; }
+        function mount() { render(); let pending = false; const obs = new MutationObserver(() => { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; const r = findRefBtn(); if (r && !r.parentNode.querySelector("[data-eug]")) render(); }); }); obs.observe(document.body, { childList: true, subtree: true }); }
+        W.addEventListener("eugene-scripts-updated", render);
+        document.addEventListener("click", (e) => { const row = getRow(); if (!row || !row.classList.contains("eug-open")) return; const mb = document.querySelector('[data-eug="menu"]'); if (mb && mb.contains(e.target)) return; if (row.contains(e.target)) return; closeRow(); });
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeRow(); });
+        W.addEventListener("scroll", closeRow, { passive: true }); W.addEventListener("resize", closeRow);
+        W.registerEugeneScript = function (entry) { const list = W.__eugeneScripts, i = list.findIndex(s => s.id === entry.id); if (i >= 0) list[i] = entry; else list.push(entry); W.dispatchEvent(new CustomEvent("eugene-scripts-updated")); };
+        W.mountEugeneFooterMenu = mount;
+    })();
+
+    // ── Main ───────────────────────────────────────────────────
+    const ANALYTICS_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><defs><linearGradient id="ta_ig" x1=".5" x2=".5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#ta_ig)"><path d="M5 20h2v-8H5v8zm4 0h2V4H9v16zm4 0h2v-5h-2v5zm4 0h2V9h-2v11z"/></g></svg>`;
+
+    function main() {
+        const ui = new AnalyticsUI();
+        ui.init();
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        W.registerEugeneScript({
+            id: "torn-analytics", name: "Analytics",
+            color: "#1565c0", colorDark: "#0d3a6e", hoverColor: "#1976d2",
+            iconSVG: ANALYTICS_ICON,
+            onClick: () => ui.toggle(true),
+        });
+        W.mountEugeneFooterMenu();
+    }
+
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+    else main();
+
+})();
