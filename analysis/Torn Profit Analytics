@@ -33,19 +33,17 @@
         myId:          "ta_my_id",
     };
 
-    const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", CRIME:"crime", ATTACK:"attack" };
+    const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", ATTACK:"attack" };
 
     const TYPE_CONFIG = {
         mugging: { label:"Mugging",    color:"#ef5350", icon:"💰" },
         bounty:  { label:"Bounty",     color:"#ffd700", icon:"🎯" },
-        crime:   { label:"Crime",      color:"#ab47bc", icon:"🔪" },
         attack:  { label:"Attack Win", color:"#4fc3f7", icon:"⚔️"  },
     };
 
     const DEFAULT_SETTINGS = {
         includeMuggings:  true,
         includeBounties:  true,
-        includeCrimes:    true,
         includeAttacks:   true,
         refreshSec:       600,
         retentionDays:    90,
@@ -197,41 +195,6 @@
             return Array.isArray(raw) ? raw : Object.values(raw);
         }
 
-        // Fetch crimes — try v2, fall back to v1
-        async fetchCrimes(fromTs = 0) {
-            const NINETY_DAYS = 90 * 86400;
-            const effectiveFrom = fromTs > 0
-                ? fromTs
-                : Math.floor(Date.now() / 1000) - NINETY_DAYS;
-
-            // Try v2 first
-            try {
-                await this._rateLimit();
-                const url = new URL(API_BASE + "/user/crimes");
-                url.searchParams.set("key", this.key);
-                url.searchParams.set("from", effectiveFrom);
-                const data = await httpGetJson(url.toString());
-                if (!data || data.error) throw new Error("v2 crimes unavailable");
-                const raw = data.crimes;
-                if (!raw) return [];
-                return Array.isArray(raw) ? raw : Object.values(raw);
-            } catch {
-                // Fall back to v1
-                try {
-                    await this._rateLimit();
-                    const url = new URL("https://api.torn.com/user/");
-                    url.searchParams.set("selections", "crimes");
-                    url.searchParams.set("key", this.key);
-                    url.searchParams.set("from", effectiveFrom);
-                    const data = await httpGetJson(url.toString());
-                    if (!data || data.error) return [];
-                    const raw = data.crimes;
-                    if (!raw) return [];
-                    return Array.isArray(raw) ? raw : Object.values(raw);
-                } catch { return []; }
-            }
-        }
-
         // Use v1 API for personalstats — most reliable
         async fetchPersonalStats() {
             try {
@@ -259,17 +222,6 @@
             result:       a.result || "",
             moneyMugged:  a.stolen?.money || a.money_mugged || a.mug || 0,
             respect:      a.respect || a.respect_gain || 0,
-        };
-    }
-
-    function normalizeCrime(c) {
-        const reward = c.reward?.money || c.reward || c.cash || c.cash_gain || c.money_gain || 0;
-        return {
-            id:      c.id || c.crime_id || null,
-            name:    c.title || c.crime_name || c.name || "Crime",
-            ts:      c.time_completed || c.ended || c.timestamp || 0,
-            reward:  typeof reward === "number" ? reward : 0,
-            success: c.success !== false,
         };
     }
 
@@ -320,24 +272,6 @@
         return events;
     }
 
-    function processCrimes(rawCrimes, settings) {
-        if (!settings.includeCrimes) return [];
-        const events = [];
-        for (const raw of rawCrimes) {
-            const c = normalizeCrime(raw);
-            if (!c.ts || !c.success || c.reward <= 0) continue;
-            events.push({
-                id:     `cr_${c.id || c.ts}`,
-                type:   EVENT_TYPES.CRIME,
-                amount: c.reward,
-                ts:     c.ts,
-                label:  c.name,
-                meta:   { crimeName: c.name },
-            });
-        }
-        return events;
-    }
-
     function mergeEvents(existing, incoming) {
         const seen = new Set(existing.map(e => e.id));
         const added = incoming.filter(e => e.id && !seen.has(e.id));
@@ -370,7 +304,6 @@
             if (e.ts < from || e.ts > to) return false;
             if (e.type === EVENT_TYPES.MUGGING && !settings.includeMuggings) return false;
             if (e.type === EVENT_TYPES.BOUNTY  && !settings.includeBounties) return false;
-            if (e.type === EVENT_TYPES.CRIME   && !settings.includeCrimes)   return false;
             if (e.type === EVENT_TYPES.ATTACK  && !settings.includeAttacks)  return false;
             return true;
         });
@@ -814,9 +747,10 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 </div>`;
 
                 const xtra = [
-                    ["People Mugged", s.peoplemugged != null ? s.peoplemugged.toLocaleString() : null],
-                    ["Attacks Lost",  s.attackslost  != null ? s.attackslost.toLocaleString() : null],
-                    ["Nerve Refills", s.nerverefills  != null ? s.nerverefills.toLocaleString() : null],
+                    ["People Mugged",  s.peoplemugged  != null ? s.peoplemugged.toLocaleString()  : null],
+                    ["Attacks Lost",   s.attackslost   != null ? s.attackslost.toLocaleString()   : null],
+                    ["Bazaar Profit",  s.bazaarprofit  != null ? fmt.money(s.bazaarprofit)        : null],
+                    ["Items Sold",     s.bazaarsales   != null ? s.bazaarsales.toLocaleString()   : null],
                 ].filter(([, v]) => v != null);
 
                 if (xtra.length) {
@@ -928,9 +862,9 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 const s = this.cachedStats;
                 if (s) {
                     const rows = [
-                        { icon:"💰", label:"Muggings",    val: fmt.money(s.moneymugged ?? 0),                          sub: `${(s.peoplemugged ?? 0).toLocaleString()} targets hit` },
-                        { icon:"⚔️",  label:"Attacks",     val: `${(s.attackswon ?? 0).toLocaleString()} wins`,         sub: `${(s.attackslost ?? 0).toLocaleString()} losses` },
-                        { icon:"🔪", label:"Crimes",      val: `${(s.criminaloffenses ?? 0).toLocaleString()} offenses`, sub: "per-crime rewards not tracked by Torn API" },
+                        { icon:"💰", label:"Muggings",      val: fmt.money(s.moneymugged ?? 0),                  sub: `${(s.peoplemugged ?? 0).toLocaleString()} targets hit` },
+                        { icon:"⚔️",  label:"Attacks",       val: `${(s.attackswon ?? 0).toLocaleString()} wins`, sub: `${(s.attackslost ?? 0).toLocaleString()} losses` },
+                        { icon:"🛒", label:"Bazaar Profit",  val: fmt.money(s.bazaarprofit ?? 0),                 sub: `${(s.bazaarsales ?? 0).toLocaleString()} items sold` },
                     ];
                     return `${this._periodRow()}
                         <div style="font-size:11px;color:#555;margin-bottom:12px">No profitable events in this period yet — showing all-time lifetime totals from your personal stats.</div>
@@ -1042,7 +976,6 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             const allEvts = loadEvents().filter(e =>
                 (this.settings.includeMuggings && e.type===EVENT_TYPES.MUGGING ||
                  this.settings.includeBounties && e.type===EVENT_TYPES.BOUNTY  ||
-                 this.settings.includeCrimes   && e.type===EVENT_TYPES.CRIME   ||
                  this.settings.includeAttacks  && e.type===EVENT_TYPES.ATTACK));
 
             const weeks        = buildWeeklyComparison(allEvts);
@@ -1119,22 +1052,23 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                     return (v >= 0 ? "+" : "") + (money ? fmt.money(v) : v.toLocaleString());
                 };
                 const sinceRows = [
-                    ["Money Mugged",       "moneymugged",      true],
-                    ["Attacks Won",        "attackswon",       false],
-                    ["Criminal Offenses",  "criminaloffenses", false],
-                    ["Nerve Refills",      "nerverefills",     false],
-                    ["Networth Change",    "networth",         true],
+                    ["Money Mugged",    "moneymugged",  true],
+                    ["Bazaar Profit",   "bazaarprofit", true],
+                    ["Networth Change", "networth",     true],
+                    ["Attacks Won",     "attackswon",   false],
+                    ["Items Sold",      "bazaarsales",  false],
+                    ["Nerve Refills",   "nerverefills", false],
                 ].map(([lbl, key, money]) => `<div class="ta-snap-row">
                     <div class="ta-snap-key">${escHtml(lbl)}</div>
                     <div class="ta-snap-val">${escHtml(dSince(key, money))}</div>
                 </div>`).join("");
 
                 const recentDeltaRows = snaps.length >= 2 ? [
-                    ["Attacks Won",       "attackswon",       false],
-                    ["Money Mugged",      "moneymugged",      true],
-                    ["Crimes",            "criminaloffenses", false],
-                    ["Nerve Refills",     "nerverefills",     false],
-                ].map(([lbl, key, money]) => snapField(lbl, key, delta7, delta30)).join("") : "";
+                    ["Money Mugged",  "moneymugged",  true],
+                    ["Bazaar Profit", "bazaarprofit", true],
+                    ["Networth",      "networth",     true],
+                    ["Attacks Won",   "attackswon",   false],
+                ].map(([lbl, key]) => snapField(lbl, key, delta7, delta30)).join("") : "";
 
                 snapHTML = `<div class="ta-section-hd">Changes Since ${escHtml(since)}</div>
                     <div style="font-size:10px;color:#555;margin-bottom:8px">${snaps.length} snapshot${snaps.length===1?"":"s"} · tracking started ${escHtml(since)}</div>
@@ -1179,10 +1113,6 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 <div class="ta-check-row">
                     <input type="checkbox" id="ta-s-bty"  ${s.includeBounties?"checked":""} />
                     <label for="ta-s-bty">🎯 <strong>Bounties</strong> — rewards for killing bounty targets</label>
-                </div>
-                <div class="ta-check-row">
-                    <input type="checkbox" id="ta-s-cr"   ${s.includeCrimes?"checked":""} />
-                    <label for="ta-s-cr">🔪 <strong>Crimes</strong> — nerve crime cash rewards</label>
                 </div>
                 <div class="ta-check-row">
                     <input type="checkbox" id="ta-s-atk"  ${s.includeAttacks?"checked":""} />
@@ -1243,7 +1173,6 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                     ...this.settings,
                     includeMuggings: body.querySelector("#ta-s-mug").checked,
                     includeBounties: body.querySelector("#ta-s-bty").checked,
-                    includeCrimes:   body.querySelector("#ta-s-cr").checked,
                     includeAttacks:  body.querySelector("#ta-s-atk").checked,
                     refreshSec:      Math.max(60, parseInt(body.querySelector("#ta-s-refresh").value, 10) || 300),
                     retentionDays:   Math.min(365, Math.max(7, parseInt(body.querySelector("#ta-s-retain").value, 10) || 90)),
