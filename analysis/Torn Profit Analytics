@@ -749,49 +749,82 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
         // ── Overview ──────────────────────────────────────────
         _overviewHTML() {
-            const events  = this._events();
-            const stats   = calcStats(events);
-            const { label, days } = getRange(this.period);
-            const allEvts = loadEvents().filter(e => (e.amount||0) > 0);
-            const allTot  = allEvts.reduce((s,e) => s + e.amount, 0);
-            const dAvg    = days > 0 ? stats.total / days : stats.total;
+            const s     = this.cachedStats;
+            const snaps = loadSnapshots();
+            const first = snaps.length > 0 ? snaps[0] : null;
 
-            const cards = `<div class="ta-cards">
-                <div class="ta-card">
-                    <div class="ta-card-lbl">${escHtml(label)} Profit</div>
-                    <div class="ta-card-val">${escHtml(fmt.money(stats.total))}</div>
-                    <div class="ta-card-sub">${stats.count} events</div>
-                </div>
-                <div class="ta-card">
-                    <div class="ta-card-lbl">Avg per Event</div>
-                    <div class="ta-card-val">${escHtml(fmt.money(stats.avg))}</div>
-                    <div class="ta-card-sub">Best single: ${escHtml(fmt.money(stats.best))}</div>
-                </div>
-                <div class="ta-card">
-                    <div class="ta-card-lbl">Daily Average</div>
-                    <div class="ta-card-val">${escHtml(fmt.money(dAvg))}</div>
-                    <div class="ta-card-sub">over ${escHtml(label.toLowerCase())}</div>
-                </div>
-                <div class="ta-card">
-                    <div class="ta-card-lbl">All-Time Total</div>
-                    <div class="ta-card-val">${escHtml(fmt.money(allTot))}</div>
-                    <div class="ta-card-sub">${allEvts.length} events tracked</div>
-                </div>
-            </div>`;
+            const snapDelta = (field) => {
+                if (!first || first[field] == null || !s || s[field] == null) return null;
+                return s[field] - first[field];
+            };
+            const fmtDelta = (val, isMoney) => {
+                if (val == null) return null;
+                return (val >= 0 ? "+" : "") + (isMoney ? fmt.money(val) : val.toLocaleString());
+            };
+            const sinceLbl = first ? `since ${fmt.date(first.ts)}` : "";
+            const sub = (d, money) => d != null ? `${fmtDelta(d, money)} ${sinceLbl}` : "all-time cumulative";
 
-            // Always show at least 7 days in the bar chart for readability
-            const chartDays = days <= 1 ? 7 : Math.min(days, 30);
+            let cardsHTML;
+            if (s) {
+                const mug  = s.moneymugged      ?? 0;
+                const nw   = s.networth         ?? 0;
+                const atk  = s.attackswon       ?? 0;
+                const cr   = s.criminaloffenses ?? 0;
+                const dMug = snapDelta("moneymugged");
+                const dNw  = snapDelta("networth");
+                const dAtk = snapDelta("attackswon");
+                const dCr  = snapDelta("criminaloffenses");
+
+                cardsHTML = `<div class="ta-cards">
+                    <div class="ta-card">
+                        <div class="ta-card-lbl">Total Mugged</div>
+                        <div class="ta-card-val">${escHtml(fmt.money(mug))}</div>
+                        <div class="ta-card-sub">${escHtml(sub(dMug, true))}</div>
+                    </div>
+                    <div class="ta-card">
+                        <div class="ta-card-lbl">Networth</div>
+                        <div class="ta-card-val">${escHtml(fmt.money(nw))}</div>
+                        <div class="ta-card-sub">${escHtml(sub(dNw, true))}</div>
+                    </div>
+                    <div class="ta-card">
+                        <div class="ta-card-lbl">Attacks Won</div>
+                        <div class="ta-card-val">${escHtml(atk.toLocaleString())}</div>
+                        <div class="ta-card-sub">${escHtml(sub(dAtk, false))}</div>
+                    </div>
+                    <div class="ta-card">
+                        <div class="ta-card-lbl">Criminal Offenses</div>
+                        <div class="ta-card-val">${escHtml(cr.toLocaleString())}</div>
+                        <div class="ta-card-sub">${escHtml(sub(dCr, false))}</div>
+                    </div>
+                </div>`;
+
+                const xtra = [
+                    ["People Mugged", s.peoplemugged != null ? s.peoplemugged.toLocaleString() : null],
+                    ["Bazaar Profit", s.bazaarprofit != null ? fmt.money(s.bazaarprofit) : null],
+                    ["Attacks Lost",  s.attackslost  != null ? s.attackslost.toLocaleString() : null],
+                ].filter(([, v]) => v != null);
+
+                if (xtra.length) {
+                    cardsHTML += `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                        ${xtra.map(([k, v]) => `<div style="flex:1;min-width:90px;background:#1f1f1f;border-radius:5px;padding:6px 10px;border:1px solid #2a2a2a">
+                            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.5px">${escHtml(k)}</div>
+                            <div style="font-size:14px;font-weight:700;color:#bbb;margin-top:2px">${escHtml(v)}</div>
+                        </div>`).join("")}
+                    </div>`;
+                }
+            } else {
+                cardsHTML = `<div class="ta-empty"><div class="ta-empty-icon">📊</div>No data yet.<br>Click ⟳ Sync to load your stats.</div>`;
+            }
+
+            const { days } = getRange(this.period);
+            const chartDays   = days <= 1 ? 7 : Math.min(days, 30);
             const chartPeriod = chartDays <= 7 ? "week" : chartDays <= 30 ? "month" : "3month";
-            const chart = this._barChart(filterByPeriod(loadEvents(), chartPeriod, this.settings), chartDays);
+            const chart  = this._barChart(filterByPeriod(loadEvents(), chartPeriod, this.settings), chartDays);
+            const recent = loadEvents().filter(e => (e.amount||0) > 0 || e.type === EVENT_TYPES.ATTACK).slice(0, 12);
 
-            const recent = events.filter(e => (e.amount||0) > 0 || e.type === EVENT_TYPES.ATTACK).slice(0, 12);
-
-            const statsHTML = this._personalStatsHTML();
-
-            return `${this._periodRow()}${cards}
-                <div class="ta-section-hd">Daily Trend</div>
+            return `${this._periodRow()}${cardsHTML}
+                <div class="ta-section-hd">Event History</div>
                 ${chart}
-                ${statsHTML}
                 <div class="ta-section-hd">Recent Activity</div>
                 ${this._eventListHTML(recent)}`;
         }
