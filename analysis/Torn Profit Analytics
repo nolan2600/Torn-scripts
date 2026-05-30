@@ -800,8 +800,8 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
                 const xtra = [
                     ["People Mugged", s.peoplemugged != null ? s.peoplemugged.toLocaleString() : null],
-                    ["Bazaar Profit", s.bazaarprofit != null ? fmt.money(s.bazaarprofit) : null],
                     ["Attacks Lost",  s.attackslost  != null ? s.attackslost.toLocaleString() : null],
+                    ["Nerve Refills", s.nerverefills  != null ? s.nerverefills.toLocaleString() : null],
                 ].filter(([, v]) => v != null);
 
                 if (xtra.length) {
@@ -822,9 +822,21 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             const chart  = this._barChart(filterByPeriod(loadEvents(), chartPeriod, this.settings), chartDays);
             const recent = loadEvents().filter(e => (e.amount||0) > 0 || e.type === EVENT_TYPES.ATTACK).slice(0, 12);
 
+            const topMugged = groupByTarget(loadEvents().filter(e => e.type === EVENT_TYPES.MUGGING)).slice(0, 10);
+            const mugRankHTML = topMugged.length > 0
+                ? `<div class="ta-section-hd">Top Mugged Targets</div>
+                    <div class="ta-event-list">${topMugged.map((t, i) => `<div class="ta-event-row">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-lbl">${escHtml(t.name)}</div>
+                        <div class="ta-event-amt pos">${escHtml(fmt.money(t.total))}</div>
+                        <div class="ta-event-time">${t.count}×</div>
+                    </div>`).join("")}</div>`
+                : "";
+
             return `${this._periodRow()}${cardsHTML}
                 <div class="ta-section-hd">Event History</div>
                 ${chart}
+                ${mugRankHTML}
                 <div class="ta-section-hd">Recent Activity</div>
                 ${this._eventListHTML(recent)}`;
         }
@@ -837,7 +849,6 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 ["People Mugged",            s.peoplemugged  != null ? s.peoplemugged.toLocaleString()  : null],
                 ["Attacks Won",              s.attackswon    != null ? s.attackswon.toLocaleString()    : null],
                 ["Criminal Offenses",        s.criminaloffenses != null ? s.criminaloffenses.toLocaleString() : null],
-                ["Bazaar Profit (all time)", s.bazaarprofit  != null ? fmt.money(s.bazaarprofit)       : null],
                 ["Networth",                 s.networth      != null ? fmt.money(s.networth)            : null],
             ].filter(([, v]) => v != null);
             if (rows.length === 0) return "";
