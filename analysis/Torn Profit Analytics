@@ -29,8 +29,8 @@
         events:        "ta_events_v1",
         snapshots:     "ta_snapshots_v1",
         lastAttackTs:  "ta_last_attack_ts",
-        lastCrimeTs:   "ta_last_crime_ts",
         lastSnapTs:    "ta_last_snap_ts",
+        myId:          "ta_my_id",
     };
 
     const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", CRIME:"crime", ATTACK:"attack" };
@@ -47,7 +47,7 @@
         includeBounties:  true,
         includeCrimes:    true,
         includeAttacks:   true,
-        refreshSec:       300,
+        refreshSec:       600,
         retentionDays:    90,
         maxEvents:        5000,
         snapEvery:        3600, // personalstats snapshot interval (seconds)
@@ -565,11 +565,11 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             this.syncing     = false;
             this.lastSync    = 0;
             this.lastErr     = null;
-            this.myId        = null;
+            this.myId        = parseInt(localStorage.getItem(LS.myId) || "0", 10) || null;
             this._ticker     = null;
             this._syncTmr    = null;
-            this.syncReport  = null; // { attacksFetched, muggings, bounties, crimes }
-            this.cachedStats = null; // latest personalstats snapshot
+            this.syncReport  = null;
+            this.cachedStats = null;
         }
 
         init() {
@@ -675,7 +675,7 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             if (this.lastSync > 0) {
                 const events = loadEvents();
                 const r = this.syncReport;
-                const detail = r ? ` · ${r.attacksFetched} attacks fetched, ${r.muggings} muggings, ${r.crimes} crimes` : "";
+                const detail = r ? ` · ${r.attacksFetched} attacks, ${r.muggings} muggings` : "";
                 el.textContent = `${events.length} events · synced ${fmt.relTime(Math.floor(this.lastSync/1000))}${detail}`;
             } else {
                 el.textContent = "No data yet — click ⟳ Sync";
@@ -1240,7 +1240,7 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
             // Re-fetch history (reset timestamps so next sync pulls 90 days)
             body.querySelector("#ta-s-refetch").addEventListener("click", () => {
-                [LS.lastAttackTs, LS.lastCrimeTs].forEach(k => { try { localStorage.removeItem(k); } catch {} });
+                try { localStorage.removeItem(LS.lastAttackTs); } catch {}
                 msg.className = "ta-save-status ta-save-ok";
                 msg.textContent = "✓ Timestamps reset — click ⟳ Sync to re-fetch 90 days of history.";
                 setTimeout(() => { msg.textContent = ""; }, 4000);
@@ -1262,12 +1262,15 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             // Clear data
             body.querySelector("#ta-s-clear").addEventListener("click", () => {
                 if (!confirm("Clear ALL tracked profit data? This cannot be undone.")) return;
-                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastCrimeTs, LS.lastSnapTs].forEach(k => {
+                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastSnapTs, LS.myId].forEach(k => {
                     try { localStorage.removeItem(k); } catch {}
                 });
+                this.myId = null;
+                this.cachedStats = null;
+                this.syncReport = null;
+                this.lastSync = 0;
                 msg.className = "ta-save-status ta-save-err";
                 msg.textContent = "All data cleared.";
-                this.lastSync = 0;
                 this._tickFooter();
                 setTimeout(() => this._renderBody(), 1500);
             });
@@ -1284,19 +1287,20 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             this._tickFooter();
 
             try {
-                // Validate key + get own ID
-                const prof = await api.validateKey();
-                if (!prof) throw new Error("API key invalid or expired.");
-                this.myId = prof.id || prof.player_id;
+                // Only validate key (1 extra call) when we don't yet have the player ID
+                if (!this.myId) {
+                    const prof = await api.validateKey();
+                    if (!prof) throw new Error("API key invalid or expired.");
+                    this.myId = prof.id || prof.player_id;
+                    try { localStorage.setItem(LS.myId, String(this.myId)); } catch {}
+                }
 
                 const lastAtkTs  = getTs(LS.lastAttackTs);
-                const lastCrTs   = getTs(LS.lastCrimeTs);
                 const lastSnapTs = getTs(LS.lastSnapTs);
                 let newEvents    = [];
                 let newAtkTs     = lastAtkTs;
-                let newCrTs      = lastCrTs;
 
-                const report = { attacksFetched: 0, muggings: 0, bounties: 0, crimes: 0 };
+                const report = { attacksFetched: 0, muggings: 0, bounties: 0 };
 
                 // ── Fetch attacks (v1 API) ─────────────────────
                 try {
@@ -1313,24 +1317,12 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                     if (e.tornCode !== 18) throw e; // 18 = empty, normal
                 }
 
-                // ── Fetch crimes ───────────────────────────────
-                if (this.settings.includeCrimes) {
-                    const crimes = await api.fetchCrimes(lastCrTs);
-                    if (crimes.length > 0) {
-                        const crEvents = processCrimes(crimes, this.settings);
-                        report.crimes = crEvents.length;
-                        newEvents.push(...crEvents);
-                        newCrTs = Math.max(...crimes.map(c => c.time_completed || c.ended || c.timestamp || 0), newCrTs);
-                    }
-                }
-
                 this.syncReport = report;
 
                 // ── Merge & save events ────────────────────────
                 const merged = mergeEvents(loadEvents(), newEvents);
                 saveEvents(pruneEvents(merged, this.settings));
                 if (newAtkTs > lastAtkTs) setTs(LS.lastAttackTs, newAtkTs);
-                if (newCrTs  > lastCrTs)  setTs(LS.lastCrimeTs,  newCrTs);
 
                 // ── PersonalStats snapshot (once per hour) ─────
                 const now = Math.floor(Date.now()/1000);
