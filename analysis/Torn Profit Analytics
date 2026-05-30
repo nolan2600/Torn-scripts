@@ -46,7 +46,7 @@
         includeMuggings:  true,
         includeBounties:  true,
         includeCrimes:    true,
-        includeAttacks:   false,
+        includeAttacks:   true,
         refreshSec:       300,
         retentionDays:    90,
         maxEvents:        5000,
@@ -305,14 +305,15 @@
                 });
             }
 
-            if (settings.includeAttacks && a.moneyMugged === 0 && a.respect > 0) {
+            if (settings.includeAttacks) {
+                const respStr = a.respect > 0 ? ` (+${a.respect.toFixed(2)} resp)` : "";
                 events.push({
                     id:     `atk_${uid}`,
                     type:   EVENT_TYPES.ATTACK,
                     amount: 0,
                     ts:     a.ts,
-                    label:  `${a.result || "Win"} vs ${a.defenderName || "Player"} (+${a.respect.toFixed(2)} resp)`,
-                    meta:   { targetId: a.defenderId, targetName: a.defenderName, respect: a.respect },
+                    label:  `${a.result || "Attack"} vs ${a.defenderName || "Player"}${respStr}`,
+                    meta:   { targetId: a.defenderId, targetName: a.defenderName, respect: a.respect, result: a.result },
                 });
             }
         }
@@ -422,6 +423,18 @@
             t[id].count++;
         }
         return Object.values(t).sort((a,b) => b.total - a.total);
+    }
+
+    function rankByCount(events) {
+        const t = {};
+        for (const e of events) {
+            if (!e.meta?.targetId) continue;
+            const id = e.meta.targetId;
+            if (!t[id]) t[id] = { id, name: e.meta.targetName || `Player ${id}`, total:0, count:0 };
+            t[id].total += e.amount || 0;
+            t[id].count++;
+        }
+        return Object.values(t).sort((a,b) => b.count - a.count);
     }
 
     function buildWeeklyComparison(events) {
@@ -904,7 +917,27 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
             const grandTot = events.reduce((s,e) => s + e.amount, 0);
 
             if (Object.keys(groups).length === 0) {
-                return `${this._periodRow()}<div class="ta-empty"><div class="ta-empty-icon">📊</div>No profitable events for this period.</div>`;
+                const s = this.cachedStats;
+                if (s) {
+                    const rows = [
+                        { icon:"💰", label:"Muggings",    val: fmt.money(s.moneymugged ?? 0),                          sub: `${(s.peoplemugged ?? 0).toLocaleString()} targets hit` },
+                        { icon:"⚔️",  label:"Attacks",     val: `${(s.attackswon ?? 0).toLocaleString()} wins`,         sub: `${(s.attackslost ?? 0).toLocaleString()} losses` },
+                        { icon:"🔪", label:"Crimes",      val: `${(s.criminaloffenses ?? 0).toLocaleString()} offenses`, sub: "per-crime rewards not tracked by Torn API" },
+                    ];
+                    return `${this._periodRow()}
+                        <div style="font-size:11px;color:#555;margin-bottom:12px">No profitable events in this period yet — showing all-time lifetime totals from your personal stats.</div>
+                        <div style="display:flex;flex-direction:column;gap:8px">
+                            ${rows.map(r => `<div style="display:flex;align-items:center;gap:12px;background:#1f1f1f;border-radius:6px;padding:10px 14px;border:1px solid #2a2a2a">
+                                <div style="font-size:22px;flex-shrink:0">${r.icon}</div>
+                                <div style="flex:1">
+                                    <div style="font-size:13px;font-weight:700;color:#ccc">${escHtml(r.label)}</div>
+                                    <div style="font-size:10px;color:#555;margin-top:2px">${escHtml(r.sub)}</div>
+                                </div>
+                                <div style="font-size:16px;font-weight:700;color:#4fc3f7">${escHtml(r.val)}</div>
+                            </div>`).join("")}
+                        </div>`;
+                }
+                return `${this._periodRow()}<div class="ta-empty"><div class="ta-empty-icon">📊</div>No data yet. Click ⟳ Sync to load your stats.</div>`;
             }
 
             const rows = Object.entries(groups)
@@ -964,23 +997,36 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                     </div>`;
                 }).join("");
 
-            const tgtHTML = topTargets.length === 0
-                ? `<div style="padding:6px;color:#666;font-size:12px">No target data available.</div>`
-                : topTargets.map((t, i) =>
+            const tgtHTML = topTargets.length > 0
+                ? topTargets.map((t, i) =>
                     `<div class="ta-top-item">
                         <div class="ta-top-rank">#${i+1}</div>
-                        <div class="ta-event-icon">🎯</div>
+                        <div class="ta-event-icon">💰</div>
                         <div class="ta-top-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
                         <div class="ta-top-amt">${escHtml(fmt.money(t.total))}</div>
                         <div class="ta-top-meta">${t.count} hit${t.count===1?"":"s"}</div>
-                    </div>`
-                ).join("");
+                    </div>`).join("")
+                : "";
+
+            const atkEvents = filterByPeriod(loadEvents(), this.period, this.settings).filter(e => e.type === EVENT_TYPES.ATTACK);
+            const topAtkTargets = rankByCount(atkEvents).slice(0, 10);
+            const atkTgtHTML = topAtkTargets.length > 0
+                ? topAtkTargets.map((t, i) =>
+                    `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">⚔️</div>
+                        <div class="ta-top-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
+                        <div class="ta-top-amt" style="color:#4fc3f7">${t.count} attack${t.count===1?"":"s"}</div>
+                        <div class="ta-top-meta">${t.total > 0 ? escHtml(fmt.money(t.total)) : "—"}</div>
+                    </div>`).join("")
+                : `<div style="padding:6px;color:#666;font-size:12px">No attack data — click ⟳ Sync to fetch.</div>`;
 
             return `${this._periodRow()}
                 <div class="ta-section-hd">Top Individual Events</div>
                 ${evtHTML}
-                <div class="ta-section-hd">Most Profitable Targets</div>
-                ${tgtHTML}`;
+                ${tgtHTML ? `<div class="ta-section-hd">Most Profitable Targets</div>${tgtHTML}` : ""}
+                <div class="ta-section-hd">Most Attacked Targets</div>
+                ${atkTgtHTML}`;
         }
 
         // ── Trends ────────────────────────────────────────────
@@ -1046,17 +1092,42 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 </div>`;
             };
 
-            const snapHTML = snaps.length >= 2 ? `
-                <div class="ta-section-hd">Personal Stats Deltas</div>
-                <div style="font-size:10px;color:#555;margin-bottom:8px">${snaps.length} snapshots · last: ${fmt.relTime(snaps[snaps.length-1]?.ts||0)}</div>
-                ${snapField("Attacks Won",   "attackswon",   delta7, delta30)}
-                ${snapField("Money Mugged",  "moneymugged",  delta7, delta30)}
-                ${snapField("Crimes",        "criminaloffenses", delta7, delta30)}
-                ${snapField("Bazaar Sales",  "bazaarsales",  delta7, delta30)}
-                ${snapField("Bazaar Profit", "bazaarprofit", delta7, delta30)}
-                ${snapField("Nerve Refills", "nerverefills", delta7, delta30)}
-            ` : `<div class="ta-section-hd">Personal Stats Deltas</div>
-                <div style="font-size:11px;color:#666;padding:8px 0">Syncing periodically to track stat deltas — check back after a few sessions.</div>`;
+            const s = this.cachedStats;
+            let snapHTML;
+            if (s && snaps.length >= 1) {
+                const first    = snaps[0];
+                const since    = fmt.date(first.ts);
+                const dSince   = (key, money) => {
+                    if (first[key] == null || s[key] == null) return "—";
+                    const v = s[key] - first[key];
+                    return (v >= 0 ? "+" : "") + (money ? fmt.money(v) : v.toLocaleString());
+                };
+                const sinceRows = [
+                    ["Money Mugged",       "moneymugged",      true],
+                    ["Attacks Won",        "attackswon",       false],
+                    ["Criminal Offenses",  "criminaloffenses", false],
+                    ["Nerve Refills",      "nerverefills",     false],
+                    ["Networth Change",    "networth",         true],
+                ].map(([lbl, key, money]) => `<div class="ta-snap-row">
+                    <div class="ta-snap-key">${escHtml(lbl)}</div>
+                    <div class="ta-snap-val">${escHtml(dSince(key, money))}</div>
+                </div>`).join("");
+
+                const recentDeltaRows = snaps.length >= 2 ? [
+                    ["Attacks Won",       "attackswon",       false],
+                    ["Money Mugged",      "moneymugged",      true],
+                    ["Crimes",            "criminaloffenses", false],
+                    ["Nerve Refills",     "nerverefills",     false],
+                ].map(([lbl, key, money]) => snapField(lbl, key, delta7, delta30)).join("") : "";
+
+                snapHTML = `<div class="ta-section-hd">Changes Since ${escHtml(since)}</div>
+                    <div style="font-size:10px;color:#555;margin-bottom:8px">${snaps.length} snapshot${snaps.length===1?"":"s"} · tracking started ${escHtml(since)}</div>
+                    ${sinceRows}
+                    ${snaps.length >= 2 ? `<div class="ta-section-hd" style="margin-top:8px">Recent Deltas <span style="font-weight:400;text-transform:none;font-size:10px">(7d · 30d)</span></div>${recentDeltaRows}` : ""}`;
+            } else {
+                snapHTML = `<div class="ta-section-hd">Personal Stats Deltas</div>
+                    <div style="font-size:11px;color:#666;padding:8px 0">Click ⟳ Sync to start tracking stat changes over time.</div>`;
+            }
 
             return `<div class="ta-section-hd">Weekly Comparison</div>
                 ${weekRows}
