@@ -400,17 +400,19 @@
 
     function groupByDay(events, days) {
         const now = Math.floor(Date.now()/1000);
-        return Array.from({length: days}, (_, i) => {
+        const buckets = Array.from({length: days}, (_, i) => {
             const dayEnd   = now - i*86400;
             const dayStart = dayEnd - 86400;
-            const dayEvts  = events.filter(e => e.ts >= dayStart && e.ts < dayEnd && (e.amount||0) > 0);
-            const total    = dayEvts.reduce((s,e) => s + e.amount, 0);
+            const dayEvts  = events.filter(e => e.ts >= dayStart && e.ts < dayEnd);
+            const total    = dayEvts.reduce((s,e) => s + (e.amount||0), 0);
             const mid      = new Date((dayStart + 43200)*1000);
             return {
                 label: mid.toLocaleDateString([], {month:"short", day:"numeric"}),
                 total, count: dayEvts.length,
             };
         }).reverse();
+        const hasValue = buckets.some(b => b.total > 0);
+        return buckets.map(b => ({ ...b, displayVal: hasValue ? b.total : b.count, isCounts: !hasValue }));
     }
 
     function groupByTarget(events) {
@@ -441,10 +443,10 @@
         const now   = Math.floor(Date.now()/1000);
         const weeks = [];
         for (let w = 0; w < 4; w++) {
-            const from = now - (w+1)*7*86400;
-            const to   = now - w*7*86400;
-            const evts = events.filter(e => e.ts >= from && e.ts < to && (e.amount||0) > 0);
-            const total = evts.reduce((s,e) => s + e.amount, 0);
+            const from  = now - (w+1)*7*86400;
+            const to    = now - w*7*86400;
+            const evts  = events.filter(e => e.ts >= from && e.ts < to);
+            const total = evts.reduce((s,e) => s + (e.amount||0), 0);
             const lbl   = w === 0 ? "This Week" : w === 1 ? "Last Week" : `${w+1} Weeks Ago`;
             weeks.push({ label: lbl, total, count: evts.length });
         }
@@ -876,15 +878,21 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
         }
 
         _barChart(events, days) {
-            const buckets = groupByDay(events, days);
-            const maxVal  = Math.max(...buckets.map(b => b.total), 1);
-            const bars    = buckets.map(b => {
-                const h = Math.max(2, Math.round((b.total / maxVal) * 100));
-                return `<div class="ta-bar-col" title="${escHtml(b.label)}: ${escHtml(fmt.money(b.total))} (${b.count} events)">
-                    <div class="ta-bar-fill${b.total===0?" ta-bar-zero":""}" style="height:${h}%"></div>
+            const buckets  = groupByDay(events, days);
+            const isCounts = buckets.some(b => b.isCounts);
+            const maxVal   = Math.max(...buckets.map(b => b.displayVal), 1);
+            const bars     = buckets.map(b => {
+                const h   = Math.max(2, Math.round((b.displayVal / maxVal) * 100));
+                const tip = isCounts
+                    ? `${b.label}: ${b.count} event${b.count===1?"":"s"}`
+                    : `${b.label}: ${fmt.money(b.total)} (${b.count} events)`;
+                return `<div class="ta-bar-col" title="${escHtml(tip)}">
+                    <div class="ta-bar-fill${b.displayVal===0?" ta-bar-zero":""}" style="height:${h}%"></div>
                 </div>`;
             }).join("");
+            const lbl = isCounts ? `<div class="ta-chart-lbl">Activity per day (events)</div>` : "";
             return `<div class="ta-chart">
+                ${lbl}
                 <div class="ta-bars">${bars}</div>
                 <div class="ta-chart-axis">
                     <span>${escHtml(buckets[0]?.label||"")}</span>
@@ -899,7 +907,7 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 const tc   = TYPE_CONFIG[e.type] || {icon:"•"};
                 const pos  = (e.amount||0) > 0;
                 const amtS = pos ? "+" + fmt.money(e.amount)
-                           : e.type === EVENT_TYPES.ATTACK ? fmt.money(e.meta?.respect||0) + " resp"
+                           : e.type === EVENT_TYPES.ATTACK ? (+(e.meta?.respect||0)).toFixed(2) + " resp"
                            : fmt.money(0);
                 return `<div class="ta-event-row">
                     <div class="ta-event-icon">${tc.icon}</div>
@@ -1031,25 +1039,29 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
         // ── Trends ────────────────────────────────────────────
         _trendsHTML() {
-            const allEvts = loadEvents().filter(e => (e.amount||0) > 0 &&
+            const allEvts = loadEvents().filter(e =>
                 (this.settings.includeMuggings && e.type===EVENT_TYPES.MUGGING ||
                  this.settings.includeBounties && e.type===EVENT_TYPES.BOUNTY  ||
                  this.settings.includeCrimes   && e.type===EVENT_TYPES.CRIME   ||
                  this.settings.includeAttacks  && e.type===EVENT_TYPES.ATTACK));
 
-            const weeks   = buildWeeklyComparison(allEvts);
-            const maxWeek = Math.max(...weeks.map(w => w.total), 1);
-            const weekRows = weeks.map(w => `
-                <div class="ta-cmp-row">
+            const weeks        = buildWeeklyComparison(allEvts);
+            const hasWeekMoney = weeks.some(w => w.total > 0);
+            const maxWeek      = Math.max(...weeks.map(w => hasWeekMoney ? w.total : w.count), 1);
+            const weekRows = weeks.map(w => {
+                const barVal = hasWeekMoney ? w.total : w.count;
+                const dispAmt = hasWeekMoney ? fmt.money(w.total) : `${w.count} events`;
+                return `<div class="ta-cmp-row">
                     <div class="ta-cmp-lbl">${escHtml(w.label)}</div>
                     <div class="ta-cmp-bar-wrap">
                         <div class="ta-cmp-bar-bg">
-                            <div class="ta-cmp-bar-fill" style="width:${(w.total/maxWeek*100).toFixed(1)}%"></div>
+                            <div class="ta-cmp-bar-fill" style="width:${(barVal/maxWeek*100).toFixed(1)}%"></div>
                         </div>
-                        <div style="font-size:10px;color:#555;margin-top:1px">${w.count} events</div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${w.count} event${w.count===1?"":"s"}</div>
                     </div>
-                    <div class="ta-cmp-amt">${escHtml(fmt.money(w.total))}</div>
-                </div>`).join("");
+                    <div class="ta-cmp-amt">${escHtml(dispAmt)}</div>
+                </div>`;
+            }).join("");
 
             // Monthly bars (last 6 months)
             const now = Math.floor(Date.now()/1000);
@@ -1057,22 +1069,26 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 const to   = now - i*30*86400;
                 const from = to - 30*86400;
                 const evts = allEvts.filter(e => e.ts >= from && e.ts < to);
-                const tot  = evts.reduce((s,e) => s + e.amount, 0);
+                const tot  = evts.reduce((s,e) => s + (e.amount||0), 0);
                 const d    = new Date((from + 15*86400)*1000);
                 return { label: d.toLocaleDateString([], {month:"short", year:"2-digit"}), total: tot, count: evts.length };
             }).reverse();
-            const maxMo = Math.max(...months.map(m => m.total), 1);
-            const moRows = months.map(m => `
-                <div class="ta-cmp-row">
+            const hasMoMoney = months.some(m => m.total > 0);
+            const maxMo      = Math.max(...months.map(m => hasMoMoney ? m.total : m.count), 1);
+            const moRows = months.map(m => {
+                const barVal  = hasMoMoney ? m.total : m.count;
+                const dispAmt = hasMoMoney ? fmt.money(m.total) : `${m.count} events`;
+                return `<div class="ta-cmp-row">
                     <div class="ta-cmp-lbl">${escHtml(m.label)}</div>
                     <div class="ta-cmp-bar-wrap">
                         <div class="ta-cmp-bar-bg">
-                            <div class="ta-cmp-bar-fill" style="width:${(m.total/maxMo*100).toFixed(1)}%"></div>
+                            <div class="ta-cmp-bar-fill" style="width:${(barVal/maxMo*100).toFixed(1)}%"></div>
                         </div>
-                        <div style="font-size:10px;color:#555;margin-top:1px">${m.count} events</div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${m.count} event${m.count===1?"":"s"}</div>
                     </div>
-                    <div class="ta-cmp-amt">${escHtml(fmt.money(m.total))}</div>
-                </div>`).join("");
+                    <div class="ta-cmp-amt">${escHtml(dispAmt)}</div>
+                </div>`;
+            }).join("");
 
             const snaps   = loadSnapshots();
             const delta7  = computeSnapDelta(snaps, 7*86400);
