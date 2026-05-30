@@ -173,13 +173,19 @@
             return (data && data.profile) || (data && data.id ? data : null);
         }
 
-        // Use v1 API for attacks — v2 /user/attacks is unreliable/unsupported
+        // Use v1 API for attacks — always send a `from` param.
+        // Default to 90 days ago on first run so we pull full history, not just today.
         async fetchAttacks(fromTs = 0) {
+            const NINETY_DAYS = 90 * 86400;
+            const effectiveFrom = fromTs > 0
+                ? fromTs
+                : Math.floor(Date.now() / 1000) - NINETY_DAYS;
+
             await this._rateLimit();
             const url = new URL("https://api.torn.com/user/");
             url.searchParams.set("selections", "attacks");
             url.searchParams.set("key", this.key);
-            if (fromTs > 0) url.searchParams.set("from", fromTs);
+            url.searchParams.set("from", effectiveFrom);
             const data = await httpGetJson(url.toString());
             if (data && data.error) {
                 const e = new Error(data.error.error || "Torn API error");
@@ -191,14 +197,19 @@
             return Array.isArray(raw) ? raw : Object.values(raw);
         }
 
-        // Use v2 crimes endpoint with v1 fallback
+        // Fetch crimes — try v2, fall back to v1
         async fetchCrimes(fromTs = 0) {
+            const NINETY_DAYS = 90 * 86400;
+            const effectiveFrom = fromTs > 0
+                ? fromTs
+                : Math.floor(Date.now() / 1000) - NINETY_DAYS;
+
             // Try v2 first
             try {
                 await this._rateLimit();
                 const url = new URL(API_BASE + "/user/crimes");
                 url.searchParams.set("key", this.key);
-                if (fromTs > 0) url.searchParams.set("from", fromTs);
+                url.searchParams.set("from", effectiveFrom);
                 const data = await httpGetJson(url.toString());
                 if (!data || data.error) throw new Error("v2 crimes unavailable");
                 const raw = data.crimes;
@@ -211,7 +222,7 @@
                     const url = new URL("https://api.torn.com/user/");
                     url.searchParams.set("selections", "crimes");
                     url.searchParams.set("key", this.key);
-                    if (fromTs > 0) url.searchParams.set("from", fromTs);
+                    url.searchParams.set("from", effectiveFrom);
                     const data = await httpGetJson(url.toString());
                     if (!data || data.error) return [];
                     const raw = data.crimes;
@@ -1059,6 +1070,7 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
                     <button class="ta-btn ta-btn-primary" id="ta-s-save">Save Settings</button>
+                    <button class="ta-btn ta-btn-muted ta-btn-sm" id="ta-s-refetch">🔄 Re-fetch History</button>
                     <button class="ta-btn ta-btn-muted ta-btn-sm" id="ta-s-export">⬇ Export CSV</button>
                     <button class="ta-btn ta-btn-danger ta-btn-sm" id="ta-s-clear">🗑 Clear All Data</button>
                 </div>
@@ -1109,6 +1121,14 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 msg.className = "ta-save-status ta-save-ok";
                 msg.textContent = "✓ Settings saved.";
                 setTimeout(() => { msg.textContent = ""; }, 2000);
+            });
+
+            // Re-fetch history (reset timestamps so next sync pulls 90 days)
+            body.querySelector("#ta-s-refetch").addEventListener("click", () => {
+                [LS.lastAttackTs, LS.lastCrimeTs].forEach(k => { try { localStorage.removeItem(k); } catch {} });
+                msg.className = "ta-save-status ta-save-ok";
+                msg.textContent = "✓ Timestamps reset — click ⟳ Sync to re-fetch 90 days of history.";
+                setTimeout(() => { msg.textContent = ""; }, 4000);
             });
 
             // Export CSV
