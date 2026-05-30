@@ -168,50 +168,69 @@
         }
 
         async validateKey() {
+            // v2 profile for key validation
             const data = await this._get("/user/profile");
             return (data && data.profile) || (data && data.id ? data : null);
         }
 
+        // Use v1 API for attacks — v2 /user/attacks is unreliable/unsupported
         async fetchAttacks(fromTs = 0) {
-            const all = []; let offset = 0; let pages = 0;
-            while (pages < 20) {
-                const params = { limit: 100, offset };
-                if (fromTs > 0) params.from = fromTs + 1; // +1 avoids re-fetching the last seen
-                const data = await this._get("/user/attacks", params);
-                const raw = data.attacks;
-                if (!raw) break;
-                const arr = Array.isArray(raw) ? raw : Object.values(raw);
-                if (arr.length === 0) break;
-                all.push(...arr);
-                if (arr.length < 100) break;
-                offset += 100; pages++;
+            await this._rateLimit();
+            const url = new URL("https://api.torn.com/user/");
+            url.searchParams.set("selections", "attacks");
+            url.searchParams.set("key", this.key);
+            if (fromTs > 0) url.searchParams.set("from", fromTs);
+            const data = await httpGetJson(url.toString());
+            if (data && data.error) {
+                const e = new Error(data.error.error || "Torn API error");
+                e.tornCode = data.error.code;
+                throw e;
             }
-            return all;
+            const raw = data.attacks;
+            if (!raw) return [];
+            return Array.isArray(raw) ? raw : Object.values(raw);
         }
 
+        // Use v2 crimes endpoint with v1 fallback
         async fetchCrimes(fromTs = 0) {
-            const all = []; let offset = 0; let pages = 0;
-            while (pages < 10) {
-                const params = { limit: 100, offset };
-                if (fromTs > 0) params.from = fromTs + 1;
+            // Try v2 first
+            try {
+                await this._rateLimit();
+                const url = new URL(API_BASE + "/user/crimes");
+                url.searchParams.set("key", this.key);
+                if (fromTs > 0) url.searchParams.set("from", fromTs);
+                const data = await httpGetJson(url.toString());
+                if (!data || data.error) throw new Error("v2 crimes unavailable");
+                const raw = data.crimes;
+                if (!raw) return [];
+                return Array.isArray(raw) ? raw : Object.values(raw);
+            } catch {
+                // Fall back to v1
                 try {
-                    const data = await this._get("/user/crimes", params);
+                    await this._rateLimit();
+                    const url = new URL("https://api.torn.com/user/");
+                    url.searchParams.set("selections", "crimes");
+                    url.searchParams.set("key", this.key);
+                    if (fromTs > 0) url.searchParams.set("from", fromTs);
+                    const data = await httpGetJson(url.toString());
+                    if (!data || data.error) return [];
                     const raw = data.crimes;
-                    if (!raw) break;
-                    const arr = Array.isArray(raw) ? raw : Object.values(raw);
-                    if (arr.length === 0) break;
-                    all.push(...arr);
-                    if (arr.length < 100) break;
-                    offset += 100; pages++;
-                } catch { break; } // crimes endpoint may not exist — skip silently
+                    if (!raw) return [];
+                    return Array.isArray(raw) ? raw : Object.values(raw);
+                } catch { return []; }
             }
-            return all;
         }
 
+        // Use v1 API for personalstats — most reliable
         async fetchPersonalStats() {
             try {
-                const data = await this._get("/user/personalstats");
-                return data.personalstats || data || null;
+                await this._rateLimit();
+                const url = new URL("https://api.torn.com/user/");
+                url.searchParams.set("selections", "personalstats");
+                url.searchParams.set("key", this.key);
+                const data = await httpGetJson(url.toString());
+                if (!data || data.error) return null;
+                return data.personalstats || null;
             } catch { return null; }
         }
     }
@@ -514,17 +533,19 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
     // ── UI ─────────────────────────────────────────────────────
     class AnalyticsUI {
         constructor() {
-            this._panel   = null;
-            this._overlay = null;
-            this.tab      = "overview";
-            this.period   = "week";
-            this.settings = loadSettings();
-            this.syncing  = false;
-            this.lastSync = 0;
-            this.lastErr  = null;
-            this.myId     = null;
-            this._ticker  = null;
-            this._syncTmr = null;
+            this._panel      = null;
+            this._overlay    = null;
+            this.tab         = "overview";
+            this.period      = "week";
+            this.settings    = loadSettings();
+            this.syncing     = false;
+            this.lastSync    = 0;
+            this.lastErr     = null;
+            this.myId        = null;
+            this._ticker     = null;
+            this._syncTmr    = null;
+            this.syncReport  = null; // { attacksFetched, muggings, bounties, crimes }
+            this.cachedStats = null; // latest personalstats snapshot
         }
 
         init() {
@@ -625,11 +646,13 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
         _tickFooter() {
             const el = this._panel && this._panel.querySelector("#ta-status-txt");
             if (!el) return;
-            if (this.syncing) { el.textContent = "⟳ Syncing…"; return; }
+            if (this.syncing) { el.textContent = "⟳ Syncing… (check console for details)"; return; }
             if (this.lastErr) { el.textContent = `❌ ${this.lastErr}`; return; }
             if (this.lastSync > 0) {
                 const events = loadEvents();
-                el.textContent = `${events.length} events · synced ${fmt.relTime(Math.floor(this.lastSync/1000))}`;
+                const r = this.syncReport;
+                const detail = r ? ` · ${r.attacksFetched} attacks fetched, ${r.muggings} muggings, ${r.crimes} crimes` : "";
+                el.textContent = `${events.length} events · synced ${fmt.relTime(Math.floor(this.lastSync/1000))}${detail}`;
             } else {
                 el.textContent = "No data yet — click ⟳ Sync";
             }
@@ -752,11 +775,36 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
             const recent = events.filter(e => (e.amount||0) > 0 || e.type === EVENT_TYPES.ATTACK).slice(0, 12);
 
+            const statsHTML = this._personalStatsHTML();
+
             return `${this._periodRow()}${cards}
                 <div class="ta-section-hd">Daily Trend</div>
                 ${chart}
+                ${statsHTML}
                 <div class="ta-section-hd">Recent Activity</div>
                 ${this._eventListHTML(recent)}`;
+        }
+
+        _personalStatsHTML() {
+            const s = this.cachedStats;
+            if (!s) return "";
+            const rows = [
+                ["Total Mugged (all time)",  s.moneymugged   != null ? fmt.money(s.moneymugged)       : null],
+                ["People Mugged",            s.peoplemugged  != null ? s.peoplemugged.toLocaleString()  : null],
+                ["Attacks Won",              s.attackswon    != null ? s.attackswon.toLocaleString()    : null],
+                ["Criminal Offenses",        s.criminaloffenses != null ? s.criminaloffenses.toLocaleString() : null],
+                ["Bazaar Profit (all time)", s.bazaarprofit  != null ? fmt.money(s.bazaarprofit)       : null],
+                ["Networth",                 s.networth      != null ? fmt.money(s.networth)            : null],
+            ].filter(([, v]) => v != null);
+            if (rows.length === 0) return "";
+            return `<div class="ta-section-hd">All-Time Personal Stats <span style="font-size:10px;color:#555;font-weight:400;text-transform:none">(cumulative)</span></div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 16px">
+                    ${rows.map(([k, v]) => `
+                        <div class="ta-snap-row">
+                            <div class="ta-snap-key">${escHtml(k)}</div>
+                            <div class="ta-snap-val">${escHtml(v)}</div>
+                        </div>`).join("")}
+                </div>`;
         }
 
         _barChart(events, days) {
@@ -1113,27 +1161,35 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
                 let newAtkTs     = lastAtkTs;
                 let newCrTs      = lastCrTs;
 
-                // ── Fetch attacks ──────────────────────────────
+                const report = { attacksFetched: 0, muggings: 0, bounties: 0, crimes: 0 };
+
+                // ── Fetch attacks (v1 API) ─────────────────────
                 try {
                     const attacks = await api.fetchAttacks(lastAtkTs);
+                    report.attacksFetched = attacks.length;
                     if (attacks.length > 0) {
-                        newEvents.push(...processAttacks(attacks, this.myId, this.settings));
-                        newAtkTs = Math.max(...attacks.map(a => a.ended || a.timestamp_ended || a.timestamp || 0), newAtkTs);
+                        const atkEvents = processAttacks(attacks, this.myId, this.settings);
+                        report.muggings = atkEvents.filter(e => e.type === EVENT_TYPES.MUGGING).length;
+                        report.bounties = atkEvents.filter(e => e.type === EVENT_TYPES.BOUNTY).length;
+                        newEvents.push(...atkEvents);
+                        newAtkTs = Math.max(...attacks.map(a => a.timestamp_ended || a.ended || a.timestamp || 0), newAtkTs);
                     }
                 } catch (e) {
-                    if (e.tornCode === 18) { /* no attacks — normal */ } else throw e;
+                    if (e.tornCode !== 18) throw e; // 18 = empty, normal
                 }
 
                 // ── Fetch crimes ───────────────────────────────
                 if (this.settings.includeCrimes) {
-                    try {
-                        const crimes = await api.fetchCrimes(lastCrTs);
-                        if (crimes.length > 0) {
-                            newEvents.push(...processCrimes(crimes, this.settings));
-                            newCrTs = Math.max(...crimes.map(c => c.time_completed || c.ended || c.timestamp || 0), newCrTs);
-                        }
-                    } catch { /* crimes endpoint not available — skip */ }
+                    const crimes = await api.fetchCrimes(lastCrTs);
+                    if (crimes.length > 0) {
+                        const crEvents = processCrimes(crimes, this.settings);
+                        report.crimes = crEvents.length;
+                        newEvents.push(...crEvents);
+                        newCrTs = Math.max(...crimes.map(c => c.time_completed || c.ended || c.timestamp || 0), newCrTs);
+                    }
                 }
+
+                this.syncReport = report;
 
                 // ── Merge & save events ────────────────────────
                 const merged = mergeEvents(loadEvents(), newEvents);
@@ -1143,9 +1199,10 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
                 // ── PersonalStats snapshot (once per hour) ─────
                 const now = Math.floor(Date.now()/1000);
-                if ((now - lastSnapTs) >= this.settings.snapEvery) {
-                    const stats = await api.fetchPersonalStats();
-                    if (stats) {
+                const stats = await api.fetchPersonalStats();
+                if (stats) {
+                    this.cachedStats = stats;
+                    if ((now - lastSnapTs) >= this.settings.snapEvery) {
                         const snap = { ts: now };
                         for (const f of SNAP_FIELDS) { if (stats[f] != null) snap[f] = stats[f]; }
                         const snaps = loadSnapshots();
