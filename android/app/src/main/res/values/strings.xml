@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Bounty Hunter</string>
+
+    <!-- Settings labels -->
+    <string name="settings_title">Settings</string>
+    <string name="section_api_keys">API Keys</string>
+    <string name="section_filters">Filters</string>
+    <string name="section_options">Options</string>
+    <string name="section_bs_ranges">Blood Street Ranges</string>
+
+    <string name="label_torn_key">Torn API Key</string>
+    <string name="hint_torn_key">16-character API key</string>
+    <string name="label_ff_key">FFScouter Key (optional)</string>
+    <string name="hint_ff_key">16-character FFScouter key</string>
+    <string name="btn_validate">Validate</string>
+    <string name="btn_save">Save Settings</string>
+
+    <string name="label_min_reward">Minimum Reward ($)</string>
+    <string name="hint_min_reward">e.g. 500000</string>
+    <string name="label_min_ff">Min Fair Fight</string>
+    <string name="hint_min_ff">e.g. 1.0</string>
+    <string name="label_max_ff">Max Fair Fight</string>
+    <string name="hint_max_ff">e.g. 3.0</string>
+    <string name="label_hosp_max_min">Hospital Max Minutes</string>
+    <string name="hint_hosp_max_min">e.g. 5</string>
+    <string name="label_refresh_sec">Refresh Interval (seconds)</string>
+    <string name="hint_refresh_sec">e.g. 60</string>
+
+    <string name="label_include_unknown_ff">Include targets with unknown FF</string>
+    <string name="label_revivable_only">Hospital: Revivable targets only</string>
+    <string name="label_hide_war_targets">Hide targets in faction wars</string>
+    <string name="label_hosp_alerts">Hospital exit alerts (1 min warning)</string>
+
+    <string name="bs_2k">2k – 25k</string>
+    <string name="bs_20k">20k – 250k</string>
+    <string name="bs_200k">200k – 2.5m</string>
+    <string name="bs_2m">2m – 25m</string>
+    <string name="bs_20m">20m – 250m</string>
+    <string name="bs_200m">200m+</string>
+
+    <!-- Main screen -->
+    <string name="menu_settings">Settings</string>
+    <string name="menu_refresh">Refresh now</string>
+    <string name="btn_attack">Attack</string>
+    <string name="no_api_key">No API key set. Tap ⚙ to configure.</string>
+    <string name="no_matches">No matches found.\nAdjust filters or wait for next refresh.</string>
+
+    <!-- Notifications -->
+    <string name="notif_channel_name">Hospital Exit Alerts</string>
+    <string name="notif_channel_desc">Alerts when a bounty target is about to leave hospital</string>
+</resources>
