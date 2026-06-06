@@ -12,7 +12,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.torn.bountyhunter.data.BountyMatch
+import com.torn.bountyhunter.data.SortMode
+import com.torn.bountyhunter.data.StatusFilter
 import com.torn.bountyhunter.databinding.ActivityMainBinding
 import com.torn.bountyhunter.ui.BountyAdapter
 import com.torn.bountyhunter.ui.MainViewModel
@@ -36,6 +37,7 @@ class MainActivity : AppCompatActivity() {
         adapter = BountyAdapter(
             onAttack  = { openUrl("https://www.torn.com/page.php?sid=attack&user2ID=${it.targetId}") },
             onProfile = { openUrl("https://www.torn.com/profiles.php?XID=${it.targetId}") },
+            onWatch   = { vm.toggleWatch(it) },
             formatMoney = vm::formatMoney
         )
         binding.recyclerView.adapter = adapter
@@ -46,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         binding.swipeRefresh.setProgressBackgroundColorSchemeResource(R.color.surface_dark)
         binding.swipeRefresh.setOnRefreshListener { vm.triggerRefreshNow() }
 
+        initFilterChips()
         observeViewModel()
         requestNotifPermissionIfNeeded()
     }
@@ -53,7 +56,6 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (vm.prefs.tornApiKey.isNotBlank()) {
-            // Only start if not already running (avoid double-start)
             if (vm.bounties.value.isNullOrEmpty()) vm.startAutoRefresh()
         } else {
             binding.tvError.text = getString(R.string.no_api_key)
@@ -64,6 +66,33 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         vm.stopAutoRefresh()
+    }
+
+    private fun initFilterChips() {
+        // Restore saved state
+        when (vm.prefs.sortMode) {
+            SortMode.REWARD    -> binding.chipSortReward.isChecked = true
+            SortMode.TIME_LEFT -> binding.chipSortTime.isChecked = true
+        }
+        when (vm.prefs.statusFilter) {
+            StatusFilter.ALL      -> binding.chipFilterAll.isChecked = true
+            StatusFilter.OKAY     -> binding.chipFilterOkay.isChecked = true
+            StatusFilter.HOSPITAL -> binding.chipFilterHosp.isChecked = true
+        }
+
+        binding.chipGroupSort.setOnCheckedStateChangeListener { _, ids ->
+            when (ids.firstOrNull()) {
+                R.id.chipSortReward -> vm.setSortMode(SortMode.REWARD)
+                R.id.chipSortTime   -> vm.setSortMode(SortMode.TIME_LEFT)
+            }
+        }
+        binding.chipGroupFilter.setOnCheckedStateChangeListener { _, ids ->
+            when (ids.firstOrNull()) {
+                R.id.chipFilterAll  -> vm.setStatusFilter(StatusFilter.ALL)
+                R.id.chipFilterOkay -> vm.setStatusFilter(StatusFilter.OKAY)
+                R.id.chipFilterHosp -> vm.setStatusFilter(StatusFilter.HOSPITAL)
+            }
+        }
     }
 
     private fun observeViewModel() {
@@ -111,6 +140,10 @@ class MainActivity : AppCompatActivity() {
             } else {
                 binding.tvCounts.text = ""
             }
+        }
+
+        vm.watchedIds.observe(this) { ids ->
+            adapter.watchedIds = ids
         }
     }
 

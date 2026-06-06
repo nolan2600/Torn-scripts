@@ -36,6 +36,18 @@
                 android:textSize="15sp"
                 android:fontFamily="sans-serif-medium" />
 
+            <ImageButton
+                android:id="@+id/btnWatch"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginStart="6dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:src="@drawable/ic_bell"
+                android:contentDescription="Watch target"
+                android:tint="@color/text_secondary"
+                android:padding="2dp"
+                android:visibility="gone" />
+
             <TextView
                 android:id="@+id/tvReward"
                 android:layout_width="wrap_content"

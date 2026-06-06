@@ -1,21 +1,19 @@
 package com.torn.bountyhunter.ui
 
 import android.Manifest
+import android.app.AlarmManager
 import android.app.Application
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
-import com.torn.bountyhunter.MainActivity
+import com.torn.bountyhunter.HospAlertReceiver
 import com.torn.bountyhunter.api.ApiClient
 import com.torn.bountyhunter.data.*
 import kotlinx.coroutines.*
@@ -45,6 +43,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _counts = MutableLiveData<RefreshCounts>(RefreshCounts())
     val counts: LiveData<RefreshCounts> = _counts
 
+    private val _watchedIds = MutableLiveData<Set<Int>>(emptySet())
+    val watchedIds: LiveData<Set<Int>> = _watchedIds
+
+    private val _sortMode = MutableLiveData<SortMode>()
+    val sortMode: LiveData<SortMode> = _sortMode
+
+    private val _statusFilter = MutableLiveData<StatusFilter>()
+    val statusFilter: LiveData<StatusFilter> = _statusFilter
+
+    private var rawMatches = listOf<BountyMatch>()
+
     private var myUserId: Int? = null
     private var myAge: Int? = null
     private var myCountry: String? = null
@@ -54,9 +63,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var refreshJob: Job? = null
     private var countdownJob: Job? = null
-
-    // Hospital alert tracking: targetId -> hospUntil at time of scheduling
-    private val hospAlertJobs = ConcurrentHashMap<Int, Pair<Job, Long>>()
 
     data class CachedProfile(
         val status: PlayerStatus?,
@@ -72,7 +78,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val FACTION_CACHE_MS = 5 * 60 * 1000L
         const val CONCURRENCY = 3
         const val NPP_DAYS = 14
-        const val NOTIF_CHANNEL_ID = "bh_hosp_alerts"
         const val API_RATE_MS = 750L
 
         val BS_RANGES = listOf(
@@ -93,7 +98,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
-        createNotificationChannel()
+        _sortMode.value = prefs.sortMode
+        _statusFilter.value = prefs.statusFilter
+        _watchedIds.value = prefs.watchedTargetIds.mapNotNull { it.toIntOrNull() }.toSet()
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
@@ -132,6 +139,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setSortMode(mode: SortMode) {
+        prefs.sortMode = mode
+        _sortMode.value = mode
+        applyDisplayFilter()
+    }
+
+    fun setStatusFilter(filter: StatusFilter) {
+        prefs.statusFilter = filter
+        _statusFilter.value = filter
+        applyDisplayFilter()
+    }
+
+    fun toggleWatch(match: BountyMatch) {
+        val watched = prefs.watchedTargetIds.toMutableSet()
+        val idStr = match.targetId.toString()
+        if (watched.contains(idStr)) {
+            watched.remove(idStr)
+            cancelWatchAlarm(match.targetId)
+        } else {
+            watched.add(idStr)
+            if (match.statusState == "Hospital" && match.hospUntil > 0) {
+                scheduleWatchAlarm(match)
+            }
+        }
+        prefs.watchedTargetIds = watched
+        _watchedIds.postValue(watched.mapNotNull { it.toIntOrNull() }.toSet())
+    }
+
     // ── Countdown ──────────────────────────────────────────────────────────
 
     private fun startCountdown(secs: Int) {
@@ -142,6 +177,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 delay(1_000L)
             }
         }
+    }
+
+    // ── Display filter ─────────────────────────────────────────────────────
+
+    private fun applyDisplayFilter() {
+        val filter = _statusFilter.value ?: StatusFilter.ALL
+        val sort = _sortMode.value ?: SortMode.REWARD
+
+        var list: List<BountyMatch> = when (filter) {
+            StatusFilter.ALL      -> rawMatches
+            StatusFilter.OKAY     -> rawMatches.filter { it.statusState == "Okay" }
+            StatusFilter.HOSPITAL -> rawMatches.filter { it.statusState == "Hospital" }
+        }
+
+        list = when (sort) {
+            SortMode.REWARD    -> list.sortedByDescending { it.reward }
+            SortMode.TIME_LEFT -> list.sortedWith(
+                compareBy(
+                    { if (it.statusState == "Hospital") 0 else 1 },
+                    { it.hospUntil }
+                )
+            )
+        }
+
+        _bounties.postValue(list)
     }
 
     // ── Main refresh pipeline ──────────────────────────────────────────────
@@ -157,15 +217,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _error.postValue(null)
 
         try {
-            // Step 1: validate key + get own profile for country / age / id
             tryGetMyProfile(apiKey)
 
-            // Step 2: fetch all bounty pages
             _statusText.postValue("Fetching bounties…")
             val allBounties = fetchAllBounties(apiKey)
             _statusText.postValue("Fetched ${allBounties.size} bounties")
 
-            // Step 3: deduplicate by target (keep highest reward, sum counts)
             val grouped = LinkedHashMap<Int, BountyEntry>()
             val countMap = HashMap<Int, Int>()
             for (b in allBounties) {
@@ -180,15 +237,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             val deduped = grouped.values.toList()
-
             val counts = RefreshCounts(total = allBounties.size)
 
-            // Step 4: basic filter — min reward + exclude self
+            val maxP = prefs.maxPrice
             val byBasic = deduped.filter { b ->
-                b.reward >= prefs.minPrice && (myUserId == null || b.target_id != myUserId)
+                b.reward >= prefs.minPrice &&
+                (maxP <= 0 || b.reward <= maxP) &&
+                (myUserId == null || b.target_id != myUserId)
             }
 
-            // Step 5: FF / BS filter
             _statusText.postValue("Fetching FF scores for ${byBasic.size} targets…")
             val ffMap = fetchFFScores(prefs.ffScouterKey.trim(), byBasic.map { it.target_id })
             val includeUnknown = prefs.includeUnknownFF || (ffMap.isEmpty() && prefs.ffScouterKey.isNotBlank())
@@ -198,7 +255,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 when {
                     entry != null -> Pair(b, entry)
                     includeUnknown -> Pair(b, null)
-                    prefs.ffScouterKey.isBlank() -> Pair(b, null)  // no key = no filtering
+                    prefs.ffScouterKey.isBlank() -> Pair(b, null)
                     else -> null
                 }
             }.filter { (_, entry) ->
@@ -219,7 +276,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            // Step 6: profile status check
             _statusText.postValue("Checking ${byBS.size} target statuses…")
             val profiles = fetchProfiles(byBS.map { it.first.target_id }, apiKey)
             val warFactions = fetchWarFactions(apiKey)
@@ -271,9 +327,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            matches.sortByDescending { it.reward }
-
-            _bounties.postValue(matches)
+            rawMatches = matches
             _counts.postValue(counts.copy(
                 afterBasic = byBasic.size,
                 afterFF = byFF.size,
@@ -282,7 +336,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             ))
             _statusText.postValue("${matches.size} matches · last refresh ${timeLabel()}")
 
-            if (prefs.hospAlertsEnabled) scheduleHospAlerts(matches)
+            syncWatchAlarms(matches)
+            applyDisplayFilter()
 
         } catch (e: CancellationException) {
             throw e
@@ -291,6 +346,67 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _statusText.postValue("Error · ${e.message}")
         } finally {
             _loading.postValue(false)
+        }
+    }
+
+    // ── AlarmManager watch alerts ──────────────────────────────────────────
+
+    private fun scheduleWatchAlarm(match: BountyMatch) {
+        val alertAtMs = (match.hospUntil - 60L) * 1_000L
+        val nowMs = System.currentTimeMillis()
+        if (alertAtMs < nowMs - 5_000L) return
+
+        val intent = Intent(getApplication(), HospAlertReceiver::class.java).apply {
+            putExtra("target_id", match.targetId)
+            putExtra("target_name", match.targetName)
+            putExtra("reward", match.reward)
+            putExtra("hosp_until", match.hospUntil)
+            putExtra("revivable", match.revivable == true)
+        }
+        val pi = PendingIntent.getBroadcast(
+            getApplication(), match.targetId, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val am = getApplication<Application>().getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, alertAtMs, pi)
+    }
+
+    private fun cancelWatchAlarm(targetId: Int) {
+        val intent = Intent(getApplication(), HospAlertReceiver::class.java)
+        val pi = PendingIntent.getBroadcast(
+            getApplication(), targetId, intent,
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+        ) ?: return
+        val am = getApplication<Application>().getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        am.cancel(pi)
+        pi.cancel()
+    }
+
+    private fun syncWatchAlarms(matches: List<BountyMatch>) {
+        val hospMap = matches.filter { it.statusState == "Hospital" }.associateBy { it.targetId }
+        val watched = prefs.watchedTargetIds.toMutableSet()
+        var changed = false
+
+        // Remove watches for targets that left hospital / left the list
+        val toRemove = watched.filter { idStr ->
+            val id = idStr.toIntOrNull() ?: return@filter true
+            hospMap[id] == null
+        }
+        for (idStr in toRemove) {
+            idStr.toIntOrNull()?.let { cancelWatchAlarm(it) }
+            watched.remove(idStr)
+            changed = true
+        }
+
+        // Re-arm alarms for still-hospitalized watched targets (handles app restart)
+        for (idStr in watched) {
+            val id = idStr.toIntOrNull() ?: continue
+            hospMap[id]?.let { scheduleWatchAlarm(it) }
+        }
+
+        if (changed) {
+            prefs.watchedTargetIds = watched
+            _watchedIds.postValue(watched.mapNotNull { it.toIntOrNull() }.toSet())
         }
     }
 
@@ -425,87 +541,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return ids
     }
 
-    // ── Hospital exit alerts ───────────────────────────────────────────────
-
-    private fun scheduleHospAlerts(matches: List<BountyMatch>) {
-        val hospNow = matches.filter { it.statusState == "Hospital" && it.hospUntil > 0 }
-            .associateBy { it.targetId }
-        val nowSec = System.currentTimeMillis() / 1_000L
-
-        // Cancel alerts for targets no longer on the board
-        val removed = hospAlertJobs.keys - hospNow.keys
-        for (id in removed) {
-            hospAlertJobs.remove(id)?.first?.cancel()
-        }
-
-        for (m in hospNow.values) {
-            val existing = hospAlertJobs[m.targetId]
-            // Don't reschedule if same hospital stint (hospUntil within 5s jitter)
-            if (existing != null && Math.abs(existing.second - m.hospUntil) <= 5) continue
-            existing?.first?.cancel()
-
-            val alertAtSec = m.hospUntil - 60
-            if (alertAtSec < nowSec - 10) continue  // window already passed
-
-            val delayMs = maxOf(0L, (alertAtSec - nowSec) * 1_000L)
-            val snapUntil = m.hospUntil
-            val job = viewModelScope.launch {
-                delay(delayMs)
-                fireHospAlert(m)
-            }
-            hospAlertJobs[m.targetId] = Pair(job, snapUntil)
-        }
-    }
-
-    private fun fireHospAlert(m: BountyMatch) {
-        val app = getApplication<Application>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED
-        ) return
-
-        val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val remSec = maxOf(0L, m.hospUntil - System.currentTimeMillis() / 1_000L)
-        val remLabel = if (remSec <= 0) "out NOW" else "~${remSec}s"
-
-        val intent = Intent(app, MainActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        val pi = PendingIntent.getActivity(
-            app, m.targetId, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notif = NotificationCompat.Builder(app, NOTIF_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("${m.targetName} exits hospital $remLabel")
-            .setContentText(buildString {
-                append("Reward: ${formatMoney(m.reward)}")
-                m.ff?.let { append(" · FF: ${"%.2f".format(it)}") }
-                if (m.revivable == true) append(" · Revivable")
-            })
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setContentIntent(pi)
-            .build()
-
-        nm.notify(m.targetId, notif)
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                NOTIF_CHANNEL_ID,
-                "Hospital Exit Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply { description = "Alerts when a bounty target is about to leave hospital" }
-            (getApplication<Application>()
-                .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(ch)
-        }
-    }
-
-    // ── Filter helpers (mirror the web script logic) ───────────────────────
+    // ── Utility ────────────────────────────────────────────────────────────
 
     private fun playerCountry(status: PlayerStatus?): String? {
         val state = status?.state ?: return null
@@ -558,6 +594,5 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         super.onCleared()
-        hospAlertJobs.values.forEach { it.first.cancel() }
     }
 }

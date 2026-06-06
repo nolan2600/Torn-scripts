@@ -30,6 +30,10 @@
             android:parentActivityName=".MainActivity"
             android:windowSoftInputMode="adjustResize" />
 
+        <receiver
+            android:name=".HospAlertReceiver"
+            android:exported="false" />
+
     </application>
 
 </manifest>

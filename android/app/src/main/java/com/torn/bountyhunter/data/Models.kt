@@ -123,3 +123,6 @@ data class RefreshCounts(
     val matches: Int = 0,
     val ffError: String? = null
 )
+
+enum class SortMode { REWARD, TIME_LEFT }
+enum class StatusFilter { ALL, OKAY, HOSPITAL }

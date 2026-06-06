@@ -55,4 +55,20 @@ class Prefs(context: Context) {
     var bsRanges: Set<String>
         get() = sp.getStringSet("bs_ranges", emptySet()) ?: emptySet()
         set(v) = sp.edit().putStringSet("bs_ranges", v).apply()
+
+    var watchedTargetIds: Set<String>
+        get() = sp.getStringSet("watched_ids", emptySet()) ?: emptySet()
+        set(v) = sp.edit().putStringSet("watched_ids", v).apply()
+
+    var maxPrice: Long
+        get() = sp.getLong("max_price", 0L)
+        set(v) = sp.edit().putLong("max_price", v).apply()
+
+    var sortMode: SortMode
+        get() = try { SortMode.valueOf(sp.getString("sort_mode", "REWARD") ?: "REWARD") } catch (_: Exception) { SortMode.REWARD }
+        set(v) = sp.edit().putString("sort_mode", v.name).apply()
+
+    var statusFilter: StatusFilter
+        get() = try { StatusFilter.valueOf(sp.getString("status_filter", "ALL") ?: "ALL") } catch (_: Exception) { StatusFilter.ALL }
+        set(v) = sp.edit().putString("status_filter", v.name).apply()
 }
