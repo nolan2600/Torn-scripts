@@ -1,7 +1,6 @@
 package com.torn.bountyhunter.api
 
 import com.torn.bountyhunter.data.BountiesResponse
-import com.torn.bountyhunter.data.RankedWarsResponse
 import com.torn.bountyhunter.data.UserProfileResponse
 import retrofit2.http.GET
 import retrofit2.http.Path
@@ -30,7 +29,4 @@ interface TornApiService {
     @GET("v2/user/profile")
     suspend fun getMyProfile(@Query("key") key: String): UserProfileResponse
 
-    /** v1 full-URL endpoint — v2 does not expose rankedwars/territorywars selections. */
-    @GET
-    suspend fun getWarFactionsV1(@Url url: String): RankedWarsResponse
 }

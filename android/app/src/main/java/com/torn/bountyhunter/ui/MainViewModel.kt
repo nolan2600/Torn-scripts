@@ -533,17 +533,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         val ids = HashSet<Int>()
         try {
-            val url = "https://api.torn.com/torn/?selections=rankedwars%2Cterritorywars&key=$apiKey"
-            val data = ApiClient.torn.getWarFactionsV1(url)
-            data.rankedwars?.values?.forEach { war ->
-                war.factions?.keys?.forEach { fid -> fid.toIntOrNull()?.let { if (it > 0) ids.add(it) } }
+            // Use raw JSONObject parsing — Torn API returns [] for empty war lists which
+            // causes Gson to throw JsonSyntaxException when trying to parse into Map<String,*>.
+            val url = "https://api.torn.com/torn/?selections=rankedwars,territorywars&key=$apiKey"
+            val root = org.json.JSONObject(ApiClient.rawGet(url))
+
+            // rankedwars: {} when wars exist, [] when none — optJSONObject returns null for []
+            root.optJSONObject("rankedwars")?.let { rw ->
+                rw.keys().forEach { warId ->
+                    rw.optJSONObject(warId)?.optJSONObject("factions")?.let { factions ->
+                        factions.keys().forEach { fid ->
+                            fid.toIntOrNull()?.takeIf { it > 0 }?.let { ids.add(it) }
+                        }
+                    }
+                }
             }
-            data.territorywars?.values?.forEach { war ->
-                war.assaulting_faction?.takeIf { it > 0 }?.let { ids.add(it) }
-                war.defending_faction?.takeIf { it > 0 }?.let { ids.add(it) }
+
+            // territorywars: same pattern
+            root.optJSONObject("territorywars")?.let { tw ->
+                tw.keys().forEach { warId ->
+                    tw.optJSONObject(warId)?.let { war ->
+                        val atk = war.optInt("assaulting_faction", 0)
+                        val def = war.optInt("defending_faction", 0)
+                        if (atk > 0) ids.add(atk)
+                        if (def > 0) ids.add(def)
+                    }
+                }
             }
         } catch (e: Exception) {
-            warCache = null  // don't cache on failure; retry next refresh
+            warCache = null
             return ids
         }
 

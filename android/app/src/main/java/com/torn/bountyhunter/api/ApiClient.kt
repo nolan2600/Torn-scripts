@@ -1,5 +1,7 @@
 package com.torn.bountyhunter.api
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -26,4 +28,10 @@ object ApiClient {
         .addConverterFactory(GsonConverterFactory.create())
         .build()
         .create(FFScouterApiService::class.java)
+
+    /** Raw GET returning the response body as a String. Bypasses Gson. */
+    suspend fun rawGet(url: String): String = withContext(Dispatchers.IO) {
+        val req = okhttp3.Request.Builder().url(url).build()
+        okHttp.newCall(req).execute().use { it.body!!.string() }
+    }
 }

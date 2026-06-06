@@ -70,19 +70,6 @@ data class UserProfileResponse(
     ) else null
 }
 
-data class RankedWar(
-    val factions: Map<String, Any?>?
-)
-
-data class TerritoryWar(
-    val assaulting_faction: Int?,
-    val defending_faction: Int?
-)
-
-data class RankedWarsResponse(
-    val rankedwars: Map<String, RankedWar>?,
-    val territorywars: Map<String, TerritoryWar>?
-)
 
 // ── FFScouter API response ─────────────────────────────────────────────────
 
