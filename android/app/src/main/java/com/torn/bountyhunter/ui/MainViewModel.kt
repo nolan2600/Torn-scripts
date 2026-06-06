@@ -151,6 +151,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         applyDisplayFilter()
     }
 
+    fun setHideWar(hide: Boolean) {
+        prefs.hideWarTargets = hide
+        applyDisplayFilter()
+    }
+
     fun toggleWatch(match: BountyMatch) {
         val watched = prefs.watchedTargetIds.toMutableSet()
         val idStr = match.targetId.toString()

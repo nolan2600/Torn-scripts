@@ -93,6 +93,11 @@ class MainActivity : AppCompatActivity() {
                 R.id.chipFilterHosp -> vm.setStatusFilter(StatusFilter.HOSPITAL)
             }
         }
+
+        binding.chipHideWar.isChecked = vm.prefs.hideWarTargets
+        binding.chipHideWar.setOnCheckedChangeListener { _, checked ->
+            vm.setHideWar(checked)
+        }
     }
 
     private fun observeViewModel() {
