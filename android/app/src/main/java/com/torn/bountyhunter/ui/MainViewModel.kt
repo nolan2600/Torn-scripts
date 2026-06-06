@@ -341,7 +341,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 afterBS = byBS.size,
                 matches = matches.size
             ))
-            _statusText.postValue("${matches.size} matches · last refresh ${timeLabel()}")
+            val warInfo = if (warFactions.isNotEmpty()) " · ${warFactions.size} factions at war" else ""
+            _statusText.postValue("${matches.size} matches$warInfo · last refresh ${timeLabel()}")
 
             syncWatchAlarms(matches)
             applyDisplayFilter()
@@ -505,8 +506,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                                 .getUserProfile(id, apiKey)
                                 .resolvedProfile() ?: return@withPermit
 
-                            val factionId = profile.faction?.faction_id
-                                ?: profile.faction?.id
+                            // Match script priority: faction.id → faction.faction_id → profile.faction_id
+                            val factionId = profile.faction?.id
+                                ?: profile.faction?.faction_id
+                                ?: profile.faction_id
 
                             val data = CachedProfile(
                                 status = profile.status,

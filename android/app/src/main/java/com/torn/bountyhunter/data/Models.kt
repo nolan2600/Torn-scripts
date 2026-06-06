@@ -50,6 +50,7 @@ data class UserProfile(
     val age: Int?,
     val status: PlayerStatus?,
     val faction: PlayerFaction?,
+    val faction_id: Int?,   // some v2 responses expose this at the top level
     val revivable: Boolean?
 )
 
@@ -62,11 +63,12 @@ data class UserProfileResponse(
     val age: Int?,
     val status: PlayerStatus?,
     val faction: PlayerFaction?,
+    val faction_id: Int?,
     val revivable: Boolean?
 ) {
     fun resolvedProfile(): UserProfile? = profile ?: if (id != null) UserProfile(
         id = id, name = name, level = level, age = age,
-        status = status, faction = faction, revivable = revivable
+        status = status, faction = faction, faction_id = faction_id, revivable = revivable
     ) else null
 }
 
