@@ -17,9 +17,9 @@ class BountyHunterApp : Application() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+            val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
             val audioAttr = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
 
@@ -31,7 +31,7 @@ class BountyHunterApp : Application() {
                 description = "Alerts when a watched bounty target is about to leave hospital"
                 setSound(soundUri, audioAttr)
                 enableVibration(true)
-                vibrationPattern = longArrayOf(0, 400, 150, 400, 150, 600)
+                vibrationPattern = longArrayOf(0, 250)
                 enableLights(true)
                 lightColor = 0xFFFF6B2B.toInt()
             }
@@ -41,6 +41,6 @@ class BountyHunterApp : Application() {
     }
 
     companion object {
-        const val NOTIF_CHANNEL_ID = "bh_hosp_alerts_v2"
+        const val NOTIF_CHANNEL_ID = "bh_hosp_alerts_v3"
     }
 }
