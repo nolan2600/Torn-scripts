@@ -30,10 +30,7 @@ interface TornApiService {
     @GET("v2/user/profile")
     suspend fun getMyProfile(@Query("key") key: String): UserProfileResponse
 
-    /** Clean v2 endpoint — avoids manual URL construction. */
-    @GET("v2/torn")
-    suspend fun getWarFactions(
-        @Query("key") key: String,
-        @Query(value = "selections", encoded = true) selections: String = "rankedwars,territorywars"
-    ): RankedWarsResponse
+    /** v1 full-URL endpoint — v2 does not expose rankedwars/territorywars selections. */
+    @GET
+    suspend fun getWarFactionsV1(@Url url: String): RankedWarsResponse
 }

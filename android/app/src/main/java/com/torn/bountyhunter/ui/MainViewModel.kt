@@ -215,6 +215,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         _loading.postValue(true)
         _error.postValue(null)
+        warCache = null  // always re-fetch war factions on each refresh
 
         try {
             tryGetMyProfile(apiKey)
@@ -526,7 +527,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         val ids = HashSet<Int>()
         try {
-            val data = ApiClient.torn.getWarFactions(apiKey)
+            val url = "https://api.torn.com/torn/?selections=rankedwars%2Cterritorywars&key=$apiKey"
+            val data = ApiClient.torn.getWarFactionsV1(url)
             data.rankedwars?.values?.forEach { war ->
                 war.factions?.keys?.forEach { fid -> fid.toIntOrNull()?.let { if (it > 0) ids.add(it) } }
             }
@@ -534,7 +536,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 war.assaulting_faction?.takeIf { it > 0 }?.let { ids.add(it) }
                 war.defending_faction?.takeIf { it > 0 }?.let { ids.add(it) }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            warCache = null  // don't cache on failure; retry next refresh
+            return ids
+        }
 
         warCache = Pair(ids, now)
         return ids
