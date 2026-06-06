@@ -191,6 +191,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             StatusFilter.HOSPITAL -> rawMatches.filter { it.statusState == "Hospital" }
         }
 
+        if (prefs.hideWarTargets) list = list.filter { !it.inFactionWar }
+
         list = when (sort) {
             SortMode.REWARD    -> list.sortedByDescending { it.reward }
             SortMode.TIME_LEFT -> list.sortedWith(
@@ -295,7 +297,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (myCountry != null && targetCountry != null && targetCountry != myCountry) continue
 
                 val inWar = p.factionId != null && warFactions.contains(p.factionId)
-                if (prefs.hideWarTargets && inWar) continue
 
                 val state = status.state ?: continue
                 val until = status.until ?: 0L
