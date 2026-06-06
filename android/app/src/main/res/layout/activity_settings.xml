@@ -10,12 +10,15 @@
     <androidx.appcompat.widget.Toolbar
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
-        android:layout_height="?attr/actionBarSize"
+        android:layout_height="52dp"
         android:background="@color/surface_dark"
         app:navigationIcon="@drawable/ic_back"
         app:navigationIconTint="@color/text_primary"
-        app:title="@string/settings_title"
-        app:titleTextColor="@color/text_primary" />
+        app:title="Settings"
+        app:titleTextColor="@color/text_primary"
+        app:titleTextAppearance="@style/ToolbarTitle" />
+
+    <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/divider" />
 
     <ScrollView
         android:layout_width="match_parent"
@@ -27,105 +30,98 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:paddingHorizontal="16dp"
-            android:paddingBottom="24dp">
+            android:paddingHorizontal="14dp"
+            android:paddingBottom="32dp">
 
             <!-- ── API Keys ── -->
             <TextView
                 style="@style/SectionHeader"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/section_api_keys" />
+                android:text="API Keys" />
 
-            <com.google.android.material.textfield.TextInputLayout
+            <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:hint="@string/label_torn_key"
-                app:endIconMode="password_toggle"
-                app:boxStrokeColor="@color/accent"
-                app:hintTextColor="@color/text_secondary"
-                style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                app:cardBackgroundColor="@color/surface_card"
+                app:cardCornerRadius="6dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/divider"
+                app:strokeWidth="1dp">
 
-                <com.google.android.material.textfield.TextInputEditText
-                    android:id="@+id/etTornKey"
+                <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:inputType="textVisiblePassword"
-                    android:maxLength="16"
-                    android:textColor="@color/text_primary"
-                    android:fontFamily="monospace" />
+                    android:orientation="vertical"
+                    android:padding="14dp">
 
-            </com.google.android.material.textfield.TextInputLayout>
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/label_torn_key"
+                        app:endIconMode="password_toggle"
+                        app:boxStrokeColor="@color/accent"
+                        app:hintTextColor="@color/text_secondary"
+                        style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etTornKey"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="textVisiblePassword"
+                            android:maxLength="16"
+                            android:textColor="@color/text_primary"
+                            android:fontFamily="monospace" />
+                    </com.google.android.material.textfield.TextInputLayout>
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:orientation="horizontal"
-                android:gravity="end">
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:gravity="end" android:layout_marginTop="4dp">
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnValidateTorn"
+                            style="@style/Widget.MaterialComponents.Button.TextButton"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="@string/btn_validate" android:textColor="@color/accent" />
+                    </LinearLayout>
 
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnValidateTorn"
-                    style="@style/Widget.MaterialComponents.Button.TextButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/btn_validate"
-                    android:textColor="@color/accent" />
+                    <TextView android:id="@+id/tvTornKeyStatus"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:textSize="12sp" android:visibility="gone" />
 
-            </LinearLayout>
+                    <View android:layout_width="match_parent" android:layout_height="1dp"
+                        android:layout_marginVertical="12dp" android:background="@color/divider" />
 
-            <TextView
-                android:id="@+id/tvTornKeyStatus"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:textSize="12sp"
-                android:visibility="gone" />
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/label_ff_key"
+                        app:endIconMode="password_toggle"
+                        app:boxStrokeColor="@color/accent"
+                        app:hintTextColor="@color/text_secondary"
+                        style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etFfKey"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="textVisiblePassword"
+                            android:maxLength="16"
+                            android:textColor="@color/text_primary"
+                            android:fontFamily="monospace" />
+                    </com.google.android.material.textfield.TextInputLayout>
 
-            <com.google.android.material.textfield.TextInputLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:hint="@string/label_ff_key"
-                app:endIconMode="password_toggle"
-                app:boxStrokeColor="@color/accent"
-                app:hintTextColor="@color/text_secondary"
-                style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:gravity="end" android:layout_marginTop="4dp">
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnValidateFF"
+                            style="@style/Widget.MaterialComponents.Button.TextButton"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="@string/btn_validate" android:textColor="@color/accent" />
+                    </LinearLayout>
 
-                <com.google.android.material.textfield.TextInputEditText
-                    android:id="@+id/etFfKey"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:inputType="textVisiblePassword"
-                    android:maxLength="16"
-                    android:textColor="@color/text_primary"
-                    android:fontFamily="monospace" />
+                    <TextView android:id="@+id/tvFfKeyStatus"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:textSize="12sp" android:visibility="gone" />
 
-            </com.google.android.material.textfield.TextInputLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:orientation="horizontal"
-                android:gravity="end">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnValidateFF"
-                    style="@style/Widget.MaterialComponents.Button.TextButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/btn_validate"
-                    android:textColor="@color/accent" />
-
-            </LinearLayout>
-
-            <TextView
-                android:id="@+id/tvFfKeyStatus"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:textSize="12sp"
-                android:visibility="gone" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
             <!-- ── Filters ── -->
             <TextView
@@ -134,113 +130,87 @@
                 android:layout_height="wrap_content"
                 android:text="@string/section_filters" />
 
-            <com.google.android.material.textfield.TextInputLayout
+            <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:hint="@string/label_min_reward"
-                app:boxStrokeColor="@color/accent"
-                app:hintTextColor="@color/text_secondary"
-                style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                app:cardBackgroundColor="@color/surface_card"
+                app:cardCornerRadius="6dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/divider"
+                app:strokeWidth="1dp">
 
-                <com.google.android.material.textfield.TextInputEditText
-                    android:id="@+id/etMinReward"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:inputType="number"
-                    android:textColor="@color/text_primary" />
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:padding="14dp">
 
-            </com.google.android.material.textfield.TextInputLayout>
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="@string/label_min_reward"
+                        app:boxStrokeColor="@color/accent" app:hintTextColor="@color/text_secondary"
+                        style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etMinReward"
+                            android:layout_width="match_parent" android:layout_height="wrap_content"
+                            android:inputType="number" android:textColor="@color/text_primary" />
+                    </com.google.android.material.textfield.TextInputLayout>
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:orientation="horizontal">
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp" android:orientation="horizontal">
 
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="@string/label_min_ff"
-                    app:boxStrokeColor="@color/accent"
-                    app:hintTextColor="@color/text_secondary"
-                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:hint="@string/label_min_ff"
+                            app:boxStrokeColor="@color/accent" app:hintTextColor="@color/text_secondary"
+                            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/etMinFF"
+                                android:layout_width="match_parent" android:layout_height="wrap_content"
+                                android:inputType="numberDecimal" android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
 
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/etMinFF"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="numberDecimal"
-                        android:textColor="@color/text_primary" />
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:layout_marginStart="8dp"
+                            android:hint="@string/label_max_ff"
+                            app:boxStrokeColor="@color/accent" app:hintTextColor="@color/text_secondary"
+                            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/etMaxFF"
+                                android:layout_width="match_parent" android:layout_height="wrap_content"
+                                android:inputType="numberDecimal" android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
 
-                </com.google.android.material.textfield.TextInputLayout>
+                    </LinearLayout>
 
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginStart="8dp"
-                    android:hint="@string/label_max_ff"
-                    app:boxStrokeColor="@color/accent"
-                    app:hintTextColor="@color/text_secondary"
-                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp" android:orientation="horizontal">
 
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/etMaxFF"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="numberDecimal"
-                        android:textColor="@color/text_primary" />
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:hint="@string/label_hosp_max_min"
+                            app:boxStrokeColor="@color/accent" app:hintTextColor="@color/text_secondary"
+                            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/etHospMaxMin"
+                                android:layout_width="match_parent" android:layout_height="wrap_content"
+                                android:inputType="number" android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
 
-                </com.google.android.material.textfield.TextInputLayout>
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:layout_marginStart="8dp"
+                            android:hint="@string/label_refresh_sec"
+                            app:boxStrokeColor="@color/accent" app:hintTextColor="@color/text_secondary"
+                            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/etRefreshSec"
+                                android:layout_width="match_parent" android:layout_height="wrap_content"
+                                android:inputType="number" android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
 
-            </LinearLayout>
+                    </LinearLayout>
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="@string/label_hosp_max_min"
-                    app:boxStrokeColor="@color/accent"
-                    app:hintTextColor="@color/text_secondary"
-                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/etHospMaxMin"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:textColor="@color/text_primary" />
-
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginStart="8dp"
-                    android:hint="@string/label_refresh_sec"
-                    app:boxStrokeColor="@color/accent"
-                    app:hintTextColor="@color/text_secondary"
-                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/etRefreshSec"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:textColor="@color/text_primary" />
-
-                </com.google.android.material.textfield.TextInputLayout>
-
-            </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
             <!-- ── Options ── -->
             <TextView
@@ -249,107 +219,70 @@
                 android:layout_height="wrap_content"
                 android:text="@string/section_options" />
 
-            <LinearLayout
+            <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
+                app:cardBackgroundColor="@color/surface_card"
+                app:cardCornerRadius="6dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/divider"
+                app:strokeWidth="1dp">
 
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/label_include_unknown_ff"
-                    android:textColor="@color/text_primary"
-                    android:textSize="14sp" />
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:paddingHorizontal="14dp" android:paddingVertical="4dp">
 
-                <com.google.android.material.switchmaterial.SwitchMaterial
-                    android:id="@+id/switchUnknownFF"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:thumbTint="@color/accent"
-                    android:trackTint="#55FF6B2B" />
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="48dp"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/label_include_unknown_ff"
+                            android:textColor="@color/text_primary" android:textSize="13sp" />
+                        <com.google.android.material.switchmaterial.SwitchMaterial
+                            android:id="@+id/switchUnknownFF"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:thumbTint="@color/accent" android:trackTint="#55FF6B2B" />
+                    </LinearLayout>
 
-            </LinearLayout>
+                    <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/divider" />
 
-            <View android:layout_width="match_parent" android:layout_height="1dp"
-                android:layout_marginVertical="6dp" android:background="@color/divider" />
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="48dp"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/label_revivable_only"
+                            android:textColor="@color/text_primary" android:textSize="13sp" />
+                        <com.google.android.material.switchmaterial.SwitchMaterial
+                            android:id="@+id/switchRevivableOnly"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:thumbTint="@color/accent" android:trackTint="#55FF6B2B" />
+                    </LinearLayout>
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
+                    <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/divider" />
 
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/label_revivable_only"
-                    android:textColor="@color/text_primary"
-                    android:textSize="14sp" />
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="48dp"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/label_hide_war_targets"
+                            android:textColor="@color/text_primary" android:textSize="13sp" />
+                        <com.google.android.material.switchmaterial.SwitchMaterial
+                            android:id="@+id/switchHideWar"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:thumbTint="@color/accent" android:trackTint="#55FF6B2B" />
+                    </LinearLayout>
 
-                <com.google.android.material.switchmaterial.SwitchMaterial
-                    android:id="@+id/switchRevivableOnly"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:thumbTint="@color/accent"
-                    android:trackTint="#55FF6B2B" />
+                    <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/divider" />
 
-            </LinearLayout>
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="48dp"
+                        android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/label_hosp_alerts"
+                            android:textColor="@color/text_primary" android:textSize="13sp" />
+                        <com.google.android.material.switchmaterial.SwitchMaterial
+                            android:id="@+id/switchHospAlerts"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:thumbTint="@color/accent" android:trackTint="#55FF6B2B" />
+                    </LinearLayout>
 
-            <View android:layout_width="match_parent" android:layout_height="1dp"
-                android:layout_marginVertical="6dp" android:background="@color/divider" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/label_hide_war_targets"
-                    android:textColor="@color/text_primary"
-                    android:textSize="14sp" />
-
-                <com.google.android.material.switchmaterial.SwitchMaterial
-                    android:id="@+id/switchHideWar"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:thumbTint="@color/accent"
-                    android:trackTint="#55FF6B2B" />
-
-            </LinearLayout>
-
-            <View android:layout_width="match_parent" android:layout_height="1dp"
-                android:layout_marginVertical="6dp" android:background="@color/divider" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/label_hosp_alerts"
-                    android:textColor="@color/text_primary"
-                    android:textSize="14sp" />
-
-                <com.google.android.material.switchmaterial.SwitchMaterial
-                    android:id="@+id/switchHospAlerts"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:thumbTint="@color/accent"
-                    android:trackTint="#55FF6B2B" />
-
-            </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
             <!-- ── Blood Street Ranges ── -->
             <TextView
@@ -358,30 +291,49 @@
                 android:layout_height="wrap_content"
                 android:text="@string/section_bs_ranges" />
 
-            <TextView
+            <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Only show targets in these BS brackets (leave all unchecked = no BS filter)"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp"
-                android:layout_marginBottom="6dp" />
+                app:cardBackgroundColor="@color/surface_card"
+                app:cardCornerRadius="6dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/divider"
+                app:strokeWidth="1dp">
 
-            <CheckBox android:id="@+id/cbBs2k"    android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_2k"    android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
-            <CheckBox android:id="@+id/cbBs20k"   android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_20k"   android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
-            <CheckBox android:id="@+id/cbBs200k"  android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_200k"  android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
-            <CheckBox android:id="@+id/cbBs2m"    android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_2m"    android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
-            <CheckBox android:id="@+id/cbBs20m"   android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_20m"   android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
-            <CheckBox android:id="@+id/cbBs200m"  android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/bs_200m"  android:textColor="@color/text_primary" android:buttonTint="@color/accent" />
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:paddingHorizontal="14dp" android:paddingVertical="8dp">
+
+                    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:text="Filter by Blood Street bracket — leave all unchecked for no BS filter"
+                        android:textColor="@color/text_secondary" android:textSize="12sp"
+                        android:layout_marginBottom="6dp" />
+
+                    <CheckBox android:id="@+id/cbBs2k" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_2k" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+                    <CheckBox android:id="@+id/cbBs20k" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_20k" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+                    <CheckBox android:id="@+id/cbBs200k" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_200k" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+                    <CheckBox android:id="@+id/cbBs2m" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_2m" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+                    <CheckBox android:id="@+id/cbBs20m" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_20m" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+                    <CheckBox android:id="@+id/cbBs200m" android:layout_width="match_parent" android:layout_height="40dp"
+                        android:text="@string/bs_200m" android:textColor="@color/text_primary" android:buttonTint="@color/accent" android:gravity="center_vertical" />
+
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
             <!-- Save button -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnSave"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
+                android:layout_marginTop="20dp"
                 android:text="@string/btn_save"
                 android:textColor="@color/text_primary"
-                app:backgroundTint="@color/accent" />
+                app:backgroundTint="@color/accent"
+                app:cornerRadius="6dp" />
 
         </LinearLayout>
 

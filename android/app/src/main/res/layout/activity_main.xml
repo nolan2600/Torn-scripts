@@ -11,96 +11,125 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@color/surface_dark"
-        app:elevation="4dp">
+        app:elevation="0dp">
 
         <androidx.appcompat.widget.Toolbar
             android:id="@+id/toolbar"
             android:layout_width="match_parent"
-            android:layout_height="?attr/actionBarSize"
+            android:layout_height="52dp"
             android:background="@color/surface_dark"
-            app:title="@string/app_name"
-            app:titleTextColor="@color/text_primary" />
+            app:navigationIcon="@drawable/ic_target"
+            app:navigationIconTint="@color/accent"
+            app:title="BOUNTY HUNTER"
+            app:titleTextColor="@color/text_primary"
+            app:titleTextAppearance="@style/ToolbarTitle" />
 
-        <!-- Stats bar -->
+        <!-- Stats + countdown row -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:paddingHorizontal="14dp"
-            android:paddingBottom="4dp">
+            android:paddingBottom="4dp"
+            android:gravity="center_vertical">
 
             <TextView
                 android:id="@+id/tvCounts"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:textColor="@color/accent"
-                android:textSize="12sp" />
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp" />
 
             <TextView
                 android:id="@+id/tvCountdown"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp"
+                android:textColor="@color/accent"
+                android:textSize="11sp"
+                android:fontFamily="sans-serif-medium"
                 android:visibility="gone" />
 
         </LinearLayout>
 
-        <!-- Filter / sort chips -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/divider" />
+
+        <!-- Filter / sort chip bar -->
         <HorizontalScrollView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:scrollbars="none"
-            android:paddingBottom="6dp">
+            android:paddingVertical="6dp">
 
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
-                android:paddingHorizontal="10dp"
+                android:paddingHorizontal="12dp"
                 android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="SORT"
+                    android:textColor="@color/text_tertiary"
+                    android:textSize="10sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.1"
+                    android:layout_marginEnd="6dp" />
 
                 <com.google.android.material.chip.ChipGroup
                     android:id="@+id/chipGroupSort"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     app:singleSelection="true"
-                    app:selectionRequired="true">
+                    app:selectionRequired="true"
+                    app:chipSpacingHorizontal="4dp">
 
                     <com.google.android.material.chip.Chip
                         android:id="@+id/chipSortReward"
-                        style="@style/Widget.MaterialComponents.Chip.Choice"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="↓ Reward"
+                        android:text="Reward"
                         android:checked="true" />
 
                     <com.google.android.material.chip.Chip
                         android:id="@+id/chipSortTime"
-                        style="@style/Widget.MaterialComponents.Chip.Choice"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="↓ Time Left" />
+                        android:text="Time Left" />
 
                 </com.google.android.material.chip.ChipGroup>
 
                 <View
                     android:layout_width="1dp"
-                    android:layout_height="20dp"
-                    android:layout_marginHorizontal="8dp"
+                    android:layout_height="16dp"
+                    android:layout_marginHorizontal="10dp"
                     android:background="@color/divider" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="SHOW"
+                    android:textColor="@color/text_tertiary"
+                    android:textSize="10sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.1"
+                    android:layout_marginEnd="6dp" />
 
                 <com.google.android.material.chip.ChipGroup
                     android:id="@+id/chipGroupFilter"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     app:singleSelection="true"
-                    app:selectionRequired="true">
+                    app:selectionRequired="true"
+                    app:chipSpacingHorizontal="4dp">
 
                     <com.google.android.material.chip.Chip
                         android:id="@+id/chipFilterAll"
-                        style="@style/Widget.MaterialComponents.Chip.Choice"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="All"
@@ -108,14 +137,12 @@
 
                     <com.google.android.material.chip.Chip
                         android:id="@+id/chipFilterOkay"
-                        style="@style/Widget.MaterialComponents.Chip.Choice"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="Okay" />
 
                     <com.google.android.material.chip.Chip
                         android:id="@+id/chipFilterHosp"
-                        style="@style/Widget.MaterialComponents.Chip.Choice"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="Hospital" />
@@ -134,15 +161,14 @@
         android:orientation="vertical"
         app:layout_behavior="@string/appbar_scrolling_view_behavior">
 
-        <!-- Status / Error bar -->
         <TextView
             android:id="@+id/tvStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:paddingHorizontal="14dp"
-            android:paddingVertical="4dp"
+            android:paddingVertical="5dp"
             android:textColor="@color/text_secondary"
-            android:textSize="12sp"
+            android:textSize="11sp"
             android:visibility="gone" />
 
         <TextView
@@ -160,7 +186,7 @@
             android:id="@+id/progressBar"
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
-            android:layout_height="3dp"
+            android:layout_height="2dp"
             android:indeterminate="true"
             android:indeterminateTint="@color/accent"
             android:visibility="gone" />
@@ -180,7 +206,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"
                     android:clipToPadding="false"
-                    android:paddingBottom="12dp" />
+                    android:paddingTop="4dp"
+                    android:paddingBottom="16dp" />
 
                 <TextView
                     android:id="@+id/tvEmpty"

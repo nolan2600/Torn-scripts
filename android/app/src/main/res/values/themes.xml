@@ -1,22 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- NoActionBar is required when using a custom Toolbar with setSupportActionBar -->
     <style name="Theme.BountyHunter" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="colorPrimary">@color/accent</item>
         <item name="colorPrimaryDark">@color/surface_dark</item>
         <item name="colorAccent">@color/accent</item>
         <item name="android:windowBackground">@color/bg_dark</item>
         <item name="android:statusBarColor">@color/surface_dark</item>
-        <item name="android:navigationBarColor">@color/surface_dark</item>
+        <item name="android:navigationBarColor">@color/bg_dark</item>
         <item name="android:textColorPrimary">@color/text_primary</item>
         <item name="android:textColorSecondary">@color/text_secondary</item>
         <item name="materialButtonStyle">@style/Widget.BountyHunter.Button</item>
         <item name="textInputStyle">@style/Widget.BountyHunter.TextInputLayout</item>
+        <item name="chipStyle">@style/Widget.BountyHunter.Chip</item>
     </style>
 
     <style name="Widget.BountyHunter.Button" parent="Widget.MaterialComponents.Button">
         <item name="backgroundTint">@color/accent</item>
         <item name="android:textColor">@color/text_primary</item>
+        <item name="cornerRadius">4dp</item>
     </style>
 
     <style name="Widget.BountyHunter.TextInputLayout" parent="Widget.MaterialComponents.TextInputLayout.OutlinedBox">
@@ -25,14 +26,31 @@
         <item name="android:textColorHint">@color/text_secondary</item>
     </style>
 
+    <style name="Widget.BountyHunter.Chip" parent="Widget.MaterialComponents.Chip.Choice">
+        <item name="chipBackgroundColor">@color/chip_bg</item>
+        <item name="android:textColor">@color/chip_text_color</item>
+        <item name="chipStrokeWidth">0dp</item>
+        <item name="checkedIconVisible">false</item>
+        <item name="chipCornerRadius">4dp</item>
+        <item name="chipMinHeight">28dp</item>
+        <item name="android:textSize">12sp</item>
+    </style>
+
     <style name="SectionHeader">
         <item name="android:textColor">@color/accent</item>
-        <item name="android:textSize">13sp</item>
+        <item name="android:textSize">11sp</item>
         <item name="android:fontFamily">sans-serif-medium</item>
         <item name="android:textAllCaps">true</item>
-        <item name="android:letterSpacing">0.08</item>
-        <item name="android:paddingTop">16dp</item>
-        <item name="android:paddingBottom">4dp</item>
+        <item name="android:letterSpacing">0.1</item>
+        <item name="android:paddingTop">20dp</item>
+        <item name="android:paddingBottom">6dp</item>
         <item name="android:paddingStart">0dp</item>
+    </style>
+
+    <style name="ToolbarTitle" parent="TextAppearance.Widget.AppCompat.Toolbar.Title">
+        <item name="android:textSize">15sp</item>
+        <item name="android:letterSpacing">0.12</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textColor">@color/text_primary</item>
     </style>
 </resources>

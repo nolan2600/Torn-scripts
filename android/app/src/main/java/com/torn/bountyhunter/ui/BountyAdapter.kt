@@ -35,27 +35,34 @@ class BountyAdapter(
         private var boundHospUntil = 0L
 
         fun bind(m: BountyMatch, isWatched: Boolean) {
+            val ctx = b.root.context
+
             b.tvName.text = buildString {
                 append(m.targetName)
-                append(" L${m.targetLevel}")
-                if (m.bountyCount > 1) append(" ×${m.bountyCount}")
+                append("  L${m.targetLevel}")
+                if (m.bountyCount > 1) append("  ×${m.bountyCount}")
             }
 
             b.tvReward.text = formatMoney(m.reward)
 
-            val ffStr = m.ff?.let { "FF ${"%.2f".format(it)}" } ?: "FF ?"
-            val bsStr = m.bs?.let { " · BS $it" } ?: ""
+            val ffStr = m.ff?.let { "FF ${"%.2f".format(it)}" } ?: "FF —"
+            val bsStr = m.bs?.let { "  ·  BS $it" } ?: ""
             b.tvFfBs.text = "$ffStr$bsStr"
 
             when (m.statusState) {
                 "Okay" -> {
                     stopCountdown()
-                    b.tvStatus.text = "Okay"
-                    b.tvStatus.setTextColor(ContextCompat.getColor(b.root.context, R.color.status_ok))
+                    b.statusStrip.setBackgroundColor(ContextCompat.getColor(ctx, R.color.status_ok))
+                    b.tvStatus.text = "✓  OKAY"
+                    b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.status_ok))
+                    b.tvStatus.setBackgroundResource(R.drawable.badge_status_ok)
                     b.tvRevivable.visibility = View.GONE
                     b.btnWatch.visibility = View.GONE
                 }
                 "Hospital" -> {
+                    b.statusStrip.setBackgroundColor(ContextCompat.getColor(ctx, R.color.status_hosp))
+                    b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.status_hosp))
+                    b.tvStatus.setBackgroundResource(R.drawable.badge_status_hosp)
                     startCountdown(m.hospUntil)
                     when (m.revivable) {
                         true  -> { b.tvRevivable.text = "Revivable"; b.tvRevivable.visibility = View.VISIBLE }
@@ -67,8 +74,10 @@ class BountyAdapter(
                 }
                 else -> {
                     stopCountdown()
+                    b.statusStrip.setBackgroundColor(ContextCompat.getColor(ctx, R.color.divider))
                     b.tvStatus.text = m.statusState
-                    b.tvStatus.setTextColor(ContextCompat.getColor(b.root.context, R.color.text_secondary))
+                    b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.text_secondary))
+                    b.tvStatus.background = null
                     b.tvRevivable.visibility = View.GONE
                     b.btnWatch.visibility = View.GONE
                 }
@@ -89,7 +98,7 @@ class BountyAdapter(
         }
 
         private fun bindWatchButton(isWatched: Boolean, m: BountyMatch) {
-            val tint = if (isWatched) R.color.accent else R.color.text_secondary
+            val tint = if (isWatched) R.color.accent else R.color.text_tertiary
             b.btnWatch.imageTintList = ColorStateList.valueOf(
                 ContextCompat.getColor(b.root.context, tint)
             )
@@ -104,8 +113,7 @@ class BountyAdapter(
                 override fun run() {
                     val nowSec = System.currentTimeMillis() / 1_000L
                     val rem = maxOf(0L, boundHospUntil - nowSec)
-                    b.tvStatus.text = "Hospital · ${formatTime(rem)}"
-                    b.tvStatus.setTextColor(ContextCompat.getColor(b.root.context, R.color.status_hosp))
+                    b.tvStatus.text = "⚕  HOSP  ${formatTime(rem)}"
                     if (rem > 0) handler.postDelayed(this, 1_000L)
                 }
             }
@@ -120,7 +128,7 @@ class BountyAdapter(
         }
 
         private fun formatTime(rem: Long): String = when {
-            rem <= 0    -> "Out now"
+            rem <= 0    -> "out now"
             rem >= 3600 -> "${rem / 3600}h ${(rem % 3600) / 60}m"
             rem >= 60   -> "${rem / 60}m ${rem % 60}s"
             else        -> "${rem}s"

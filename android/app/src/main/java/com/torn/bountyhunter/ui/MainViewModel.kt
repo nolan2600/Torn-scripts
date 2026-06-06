@@ -526,14 +526,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         val ids = HashSet<Int>()
         try {
-            val url = "https://api.torn.com/torn/?selections=rankedwars,territorywars&key=$apiKey"
-            val data = ApiClient.torn.getRankedWars(url)
+            val data = ApiClient.torn.getWarFactions(apiKey)
             data.rankedwars?.values?.forEach { war ->
-                war.factions?.keys?.forEach { fid -> fid.toIntOrNull()?.let { ids.add(it) } }
+                war.factions?.keys?.forEach { fid -> fid.toIntOrNull()?.let { if (it > 0) ids.add(it) } }
             }
             data.territorywars?.values?.forEach { war ->
-                war.assaulting_faction?.let { ids.add(it) }
-                war.defending_faction?.let { ids.add(it) }
+                war.assaulting_faction?.takeIf { it > 0 }?.let { ids.add(it) }
+                war.defending_faction?.takeIf { it > 0 }?.let { ids.add(it) }
             }
         } catch (_: Exception) {}
 
