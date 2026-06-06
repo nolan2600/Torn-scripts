@@ -20,14 +20,14 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal">
 
-        <!-- Left status strip (color set in code) -->
+        <!-- Left status colour strip -->
         <View
             android:id="@+id/statusStrip"
             android:layout_width="3dp"
             android:layout_height="match_parent"
-            android:background="@color/status_ok" />
+            android:background="@color/divider" />
 
-        <!-- Card content -->
+        <!-- Main content -->
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
@@ -35,9 +35,9 @@
             android:orientation="vertical"
             android:paddingHorizontal="12dp"
             android:paddingTop="10dp"
-            android:paddingBottom="8dp">
+            android:paddingBottom="6dp">
 
-            <!-- Row 1: Name + Watch bell + Reward -->
+            <!-- ── Row 1: Name · Level  ·············  Reward ── -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -52,20 +52,8 @@
                     android:ellipsize="end"
                     android:maxLines="1"
                     android:textColor="@color/text_primary"
-                    android:textSize="14sp"
+                    android:textSize="15sp"
                     android:fontFamily="sans-serif-medium" />
-
-                <ImageButton
-                    android:id="@+id/btnWatch"
-                    android:layout_width="30dp"
-                    android:layout_height="30dp"
-                    android:layout_marginStart="4dp"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:src="@drawable/ic_bell"
-                    android:tint="@color/text_tertiary"
-                    android:contentDescription="Watch target"
-                    android:padding="3dp"
-                    android:visibility="gone" />
 
                 <TextView
                     android:id="@+id/tvReward"
@@ -73,21 +61,12 @@
                     android:layout_height="wrap_content"
                     android:layout_marginStart="8dp"
                     android:textColor="@color/reward_gold"
-                    android:textSize="14sp"
+                    android:textSize="15sp"
                     android:fontFamily="sans-serif-medium" />
 
             </LinearLayout>
 
-            <!-- Row 2: FF + BS -->
-            <TextView
-                android:id="@+id/tvFfBs"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:textColor="@color/text_secondary"
-                android:textSize="11sp" />
-
-            <!-- Row 3: Status pill + Revivable + War badge -->
+            <!-- ── Row 2: Status pill  ···············  War badge ── -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -104,21 +83,11 @@
                     android:textSize="11sp"
                     android:fontFamily="sans-serif-medium" />
 
-                <TextView
-                    android:id="@+id/tvRevivable"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:textColor="@color/status_ok"
-                    android:textSize="11sp"
-                    android:visibility="gone" />
-
                 <Space
                     android:layout_width="0dp"
                     android:layout_height="1dp"
                     android:layout_weight="1" />
 
-                <!-- War badge (LinearLayout so it shows shield icon + text) -->
                 <LinearLayout
                     android:id="@+id/tvWarBadge"
                     android:layout_width="wrap_content"
@@ -149,33 +118,35 @@
 
             </LinearLayout>
 
-            <!-- Divider -->
-            <View
+            <!-- ── Row 3: FF · BS · Revivable (all one line) ── -->
+            <TextView
+                android:id="@+id/tvFfBs"
                 android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:layout_marginTop="8dp"
-                android:background="@color/divider" />
+                android:layout_height="wrap_content"
+                android:layout_marginTop="5dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
 
-            <!-- Row 4: Buttons -->
+            <!-- ── Row 4: Profile  Attack  ··············  Bell ── -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:gravity="end"
-                android:orientation="horizontal">
+                android:layout_marginTop="6dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnProfile"
                     style="@style/Widget.MaterialComponents.Button.TextButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="32dp"
+                    android:layout_height="30dp"
                     android:text="Profile"
                     android:textColor="@color/text_secondary"
                     android:textSize="11sp"
                     android:minWidth="0dp"
-                    android:paddingHorizontal="10dp"
+                    android:paddingHorizontal="8dp"
                     app:icon="@drawable/ic_profile"
-                    app:iconSize="14dp"
+                    app:iconSize="13dp"
                     app:iconTint="@color/text_secondary"
                     app:iconPadding="4dp" />
 
@@ -183,19 +154,36 @@
                     android:id="@+id/btnAttack"
                     style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="32dp"
+                    android:layout_height="30dp"
                     android:layout_marginStart="6dp"
                     android:text="Attack"
                     android:textColor="@color/accent"
                     android:textSize="11sp"
                     android:minWidth="0dp"
-                    android:paddingHorizontal="12dp"
+                    android:paddingHorizontal="10dp"
                     app:strokeColor="@color/accent"
                     app:icon="@drawable/ic_attack"
-                    app:iconSize="14dp"
+                    app:iconSize="13dp"
                     app:iconTint="@color/accent"
                     app:iconPadding="4dp"
                     app:cornerRadius="4dp" />
+
+                <Space
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <!-- Bell — right-aligned, only visible for Hospital targets -->
+                <ImageButton
+                    android:id="@+id/btnWatch"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:src="@drawable/ic_bell"
+                    android:tint="@color/text_tertiary"
+                    android:contentDescription="Watch target"
+                    android:padding="5dp"
+                    android:visibility="gone" />
 
             </LinearLayout>
 

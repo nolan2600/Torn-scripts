@@ -50,6 +50,7 @@ class HospAlertReceiver : BroadcastReceiver() {
         }
 
         val notif = NotificationCompat.Builder(context, BountyHunterApp.NOTIF_CHANNEL_ID)
+            .setSound(null)  // channel handles sound
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setContentTitle("★ $targetName exits hospital $remLabel")
             .setContentText(body)

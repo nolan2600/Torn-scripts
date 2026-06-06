@@ -37,18 +37,15 @@ class BountyAdapter(
         fun bind(m: BountyMatch, isWatched: Boolean) {
             val ctx = b.root.context
 
+            // ── Row 1: Name + Level (+ bounty count)  |  Reward ──
             b.tvName.text = buildString {
                 append(m.targetName)
                 append("  L${m.targetLevel}")
                 if (m.bountyCount > 1) append("  ×${m.bountyCount}")
             }
-
             b.tvReward.text = formatMoney(m.reward)
 
-            val ffStr = m.ff?.let { "FF ${"%.2f".format(it)}" } ?: "FF —"
-            val bsStr = m.bs?.let { "  ·  BS $it" } ?: ""
-            b.tvFfBs.text = "$ffStr$bsStr"
-
+            // ── Row 2: Status pill  |  War badge ──
             when (m.statusState) {
                 "Okay" -> {
                     stopCountdown()
@@ -56,7 +53,6 @@ class BountyAdapter(
                     b.tvStatus.text = "✓  OKAY"
                     b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.status_ok))
                     b.tvStatus.setBackgroundResource(R.drawable.badge_status_ok)
-                    b.tvRevivable.visibility = View.GONE
                     b.btnWatch.visibility = View.GONE
                 }
                 "Hospital" -> {
@@ -64,11 +60,6 @@ class BountyAdapter(
                     b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.status_hosp))
                     b.tvStatus.setBackgroundResource(R.drawable.badge_status_hosp)
                     startCountdown(m.hospUntil)
-                    when (m.revivable) {
-                        true  -> { b.tvRevivable.text = "Revivable"; b.tvRevivable.visibility = View.VISIBLE }
-                        false -> { b.tvRevivable.text = "Not revivable"; b.tvRevivable.visibility = View.VISIBLE }
-                        null  -> b.tvRevivable.visibility = View.GONE
-                    }
                     b.btnWatch.visibility = View.VISIBLE
                     bindWatchButton(isWatched, m)
                 }
@@ -78,13 +69,23 @@ class BountyAdapter(
                     b.tvStatus.text = m.statusState
                     b.tvStatus.setTextColor(ContextCompat.getColor(ctx, R.color.text_secondary))
                     b.tvStatus.background = null
-                    b.tvRevivable.visibility = View.GONE
                     b.btnWatch.visibility = View.GONE
                 }
             }
 
             b.tvWarBadge.visibility = if (m.inFactionWar) View.VISIBLE else View.GONE
 
+            // ── Row 3: FF · BS · Revivable (single info line) ──
+            val ffStr = m.ff?.let { "FF ${"%.2f".format(it)}" } ?: "FF —"
+            val bsStr = m.bs?.let { "  ·  BS $it" } ?: ""
+            val revStr = when {
+                m.statusState == "Hospital" && m.revivable == true  -> "  ·  Revivable"
+                m.statusState == "Hospital" && m.revivable == false -> "  ·  Not revivable"
+                else -> ""
+            }
+            b.tvFfBs.text = "$ffStr$bsStr$revStr"
+
+            // ── Row 4: Buttons ──
             b.btnAttack.setOnClickListener { onAttack(m) }
             b.btnProfile.setOnClickListener { onProfile(m) }
             b.root.setOnClickListener { onProfile(m) }
@@ -98,9 +99,11 @@ class BountyAdapter(
         }
 
         private fun bindWatchButton(isWatched: Boolean, m: BountyMatch) {
-            val tint = if (isWatched) R.color.accent else R.color.text_tertiary
             b.btnWatch.imageTintList = ColorStateList.valueOf(
-                ContextCompat.getColor(b.root.context, tint)
+                ContextCompat.getColor(
+                    b.root.context,
+                    if (isWatched) R.color.accent else R.color.text_tertiary
+                )
             )
             b.btnWatch.setOnClickListener { onWatch(m) }
         }
@@ -111,8 +114,7 @@ class BountyAdapter(
             boundHospUntil = hospUntil
             val run = object : Runnable {
                 override fun run() {
-                    val nowSec = System.currentTimeMillis() / 1_000L
-                    val rem = maxOf(0L, boundHospUntil - nowSec)
+                    val rem = maxOf(0L, boundHospUntil - System.currentTimeMillis() / 1_000L)
                     b.tvStatus.text = "⚕  HOSP  ${formatTime(rem)}"
                     if (rem > 0) handler.postDelayed(this, 1_000L)
                 }
@@ -138,16 +140,12 @@ class BountyAdapter(
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH =
         VH(ItemBountyBinding.inflate(LayoutInflater.from(parent.context), parent, false))
 
-    override fun onBindViewHolder(holder: VH, position: Int) {
+    override fun onBindViewHolder(holder: VH, position: Int) =
         holder.bind(getItem(position), watchedIds.contains(getItem(position).targetId))
-    }
 
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
-        if (payloads.isEmpty()) {
-            onBindViewHolder(holder, position)
-        } else {
-            holder.bindWatchOnly(getItem(position), watchedIds.contains(getItem(position).targetId))
-        }
+        if (payloads.isEmpty()) onBindViewHolder(holder, position)
+        else holder.bindWatchOnly(getItem(position), watchedIds.contains(getItem(position).targetId))
     }
 
     override fun onViewDetachedFromWindow(holder: VH) {

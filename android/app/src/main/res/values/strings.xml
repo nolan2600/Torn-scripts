@@ -7,7 +7,7 @@
     <string name="section_api_keys">API Keys</string>
     <string name="section_filters">Filters</string>
     <string name="section_options">Options</string>
-    <string name="section_bs_ranges">Blood Street Ranges</string>
+    <string name="section_bs_ranges">Battle Stats Ranges</string>
 
     <string name="label_torn_key">Torn API Key</string>
     <string name="hint_torn_key">16-character API key</string>
