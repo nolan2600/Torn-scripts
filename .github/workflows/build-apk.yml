@@ -3,13 +3,10 @@ name: Build PhoneRecon APK
 on:
   push:
     paths:
-      - 'phone-recon/App.js'
+      - 'phone-recon/**'
 
 permissions:
   contents: write
-
-env:
-  CI: true
 
 jobs:
   build:
@@ -42,45 +39,29 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-rn073-${{ runner.os }}
-          restore-keys: gradle-rn073-
+          key: gradle-cap-${{ runner.os }}-${{ hashFiles('phone-recon/android/**/*.gradle*') }}
+          restore-keys: gradle-cap-${{ runner.os }}-
 
-      # CocoaPods isn't installed on Linux runners — react-native init treats
-      # pod install failure as a fatal template error and rolls back all files.
-      # Stubbing pod with an exit-0 script lets the template copy complete.
-      - name: Stub CocoaPods so template copy succeeds
-        run: |
-          printf '#!/bin/bash\necho "pod stub: $*"\nexit 0\n' | sudo tee /usr/local/bin/pod
-          sudo chmod +x /usr/local/bin/pod
+      - name: Install Capacitor dependencies
+        working-directory: phone-recon
+        run: npm install
 
-      - name: Init React Native project
-        run: |
-          cd /tmp
-          npx --yes react-native@0.73.6 init PhoneRecon || true
-          echo "=== PhoneRecon contents ==="
-          ls /tmp/PhoneRecon/
-          echo "=== android/ ==="
-          ls /tmp/PhoneRecon/android/
-
-      - name: Copy App.js into project
-        run: cp $GITHUB_WORKSPACE/phone-recon/App.js /tmp/PhoneRecon/App.js
-
-      - name: Install AsyncStorage
-        working-directory: /tmp/PhoneRecon
-        run: npm install @react-native-async-storage/async-storage
+      - name: Sync web assets into android
+        working-directory: phone-recon
+        run: npx cap sync android
 
       - name: Make gradlew executable
-        run: chmod +x /tmp/PhoneRecon/android/gradlew
+        run: chmod +x phone-recon/android/gradlew
 
       - name: Build debug APK
-        working-directory: /tmp/PhoneRecon/android
+        working-directory: phone-recon/android
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Stage APK for release
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          cp /tmp/PhoneRecon/android/app/build/outputs/apk/debug/app-debug.apk \
-             $GITHUB_WORKSPACE/PhoneRecon-${SHORT_SHA}.apk
+          cp phone-recon/android/app/build/outputs/apk/debug/app-debug.apk \
+             PhoneRecon-${SHORT_SHA}.apk
           echo "APK_NAME=PhoneRecon-${SHORT_SHA}.apk" >> $GITHUB_ENV
 
       - name: Publish to GitHub Releases
@@ -93,13 +74,10 @@ jobs:
             **Automated build** — sideload onto any Android device.
 
             **Commit:** `${{ github.sha }}`
-            **Branch:** `${{ github.ref_name }}`
             **Built:** ${{ github.event.head_commit.timestamp }}
 
             ### Install
             1. Transfer the APK to your Android device
             2. Settings → Install unknown apps → allow your file manager
             3. Tap the APK to install
-
-            > Debug build — no signing required for personal use.
           files: ${{ env.APK_NAME }}

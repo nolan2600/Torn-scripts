@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>PhoneRecon</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0a0a;--surface:#111;--border:#1e1e1e;--border2:#2a2a2a;
+  --cyan:#00e5ff;--green:#00e676;--orange:#ff9800;--red:#ff1744;
+  --yellow:#ffea00;--muted:#555;--text:#e0e0e0;--dim:#888;
+  --mono:'Courier New',monospace
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--mono);-webkit-tap-highlight-color:transparent}
+body{display:flex;flex-direction:column;max-width:600px;margin:0 auto}
+
+/* HEADER */
+#header{display:flex;justify-content:space-between;align-items:flex-end;padding:48px 20px 16px;border-bottom:1px solid var(--border);flex-shrink:0}
+#header-left h1{font-size:22px;font-weight:700;color:var(--cyan);letter-spacing:6px}
+#header-left p{font-size:10px;color:var(--muted);letter-spacing:4px;margin-top:2px}
+#keys-btn{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:2px;background:none;border:none;cursor:pointer;padding:4px;position:relative}
+#keys-btn.active{color:var(--cyan)}
+#alert-dot{width:7px;height:7px;border-radius:50%;background:var(--orange);position:absolute;top:0;right:-4px}
+
+/* INPUT */
+#input-row{display:flex;gap:10px;padding:12px 16px;flex-shrink:0}
+#phone-input{flex:1;height:48px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:0 14px;font-family:var(--mono);font-size:16px;color:var(--text);outline:none}
+#phone-input::placeholder{color:var(--muted)}
+#run-btn{width:72px;height:48px;background:var(--cyan);border:none;border-radius:4px;font-family:var(--mono);font-size:13px;font-weight:700;color:#000;letter-spacing:2px;cursor:pointer}
+#run-btn:disabled{background:#004d5e;color:#007a8a;cursor:default}
+
+/* BANNERS */
+#keys-banner{display:none;margin:0 16px 4px;padding:12px;background:#1a0f00;border:1px solid var(--orange);border-radius:4px;font-size:12px;color:var(--orange);cursor:pointer;letter-spacing:1px}
+#error-banner{display:none;margin:0 16px 4px;padding:12px;background:#1a0007;border:1px solid var(--red);border-radius:4px;font-size:12px;color:var(--red)}
+#loading-row{display:none;align-items:center;gap:10px;padding:4px 20px;font-size:11px;color:var(--cyan);letter-spacing:2px;flex-shrink:0}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* RESULTS */
+#results{flex:1;overflow-y:auto;padding-bottom:40px}
+#empty-state{flex:1;display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--muted);letter-spacing:1px}
+
+.target-block{margin:16px;padding:16px;background:var(--surface);border:1px solid var(--cyan);border-radius:4px}
+.target-label{font-size:9px;color:var(--muted);letter-spacing:4px;margin-bottom:4px}
+.target-number{font-size:28px;color:var(--cyan);font-weight:700;letter-spacing:2px;word-break:break-all}
+.target-ts{font-size:9px;color:var(--muted);margin-top:6px}
+
+.section{margin:0 16px 12px;background:var(--surface);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.section-head{border-left:3px solid var(--cyan);padding:8px 14px;border-bottom:1px solid var(--border)}
+.section-title{font-size:10px;font-weight:700;letter-spacing:3px}
+.row{display:flex;justify-content:space-between;padding:7px 14px;border-bottom:1px solid var(--border);gap:8px}
+.row-label{font-size:11px;color:var(--muted);flex-shrink:0}
+.row-value{font-size:12px;color:var(--text);text-align:right;word-break:break-all}
+.badge-row{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px}
+.badge{border:1px solid;border-radius:3px;padding:3px 8px;font-size:9px;font-weight:700;letter-spacing:2px}
+.breach-card{border-top:1px solid var(--border);padding:10px 14px}
+.breach-name{font-size:13px;color:var(--red);font-weight:700}
+.breach-meta{font-size:10px;color:var(--dim);margin-top:2px}
+.breach-classes{font-size:10px;color:var(--orange);margin-top:4px}
+.err-text{font-size:11px;color:var(--orange);padding:14px}
+
+/* SETTINGS */
+#settings{display:none;flex:1;overflow-y:auto;padding:12px 16px 40px}
+.settings-intro{font-size:10px;color:var(--muted);line-height:1.7;margin-bottom:16px;border-left:2px solid var(--border);padding-left:12px}
+.key-card{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:14px;margin-bottom:12px}
+.key-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.key-label{font-size:10px;font-weight:700;color:var(--cyan);letter-spacing:2px}
+.key-dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.key-dot.set{background:var(--green)}
+.key-url{font-size:9px;color:var(--muted);letter-spacing:1px;margin-bottom:10px}
+.key-input-row{display:flex;gap:8px}
+.key-input{flex:1;height:42px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;padding:0 12px;font-family:var(--mono);font-size:13px;color:var(--text);outline:none}
+.reveal-btn{height:42px;padding:0 12px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:2px;cursor:pointer;white-space:nowrap}
+.masked-preview{font-size:10px;color:var(--muted);margin-top:8px;letter-spacing:2px}
+#save-btn{width:100%;height:52px;background:var(--cyan);border:none;border-radius:4px;font-family:var(--mono);font-size:14px;font-weight:700;color:#000;letter-spacing:3px;cursor:pointer;margin-top:4px}
+#save-btn.saved{background:var(--green)}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div id="header">
+  <div id="header-left">
+    <h1>PHONE RECON</h1>
+    <p>CARRIER · GEO · BREACH</p>
+  </div>
+  <button id="keys-btn" onclick="toggleScreen()">⚙ KEYS</button>
+</div>
+
+<!-- LOOKUP SCREEN -->
+<div id="lookup-screen">
+  <div id="input-row">
+    <input id="phone-input" type="tel" placeholder="+1 555 000 0000" autocomplete="off">
+    <button id="run-btn" onclick="runLookup()">RUN</button>
+  </div>
+  <div id="keys-banner" onclick="toggleScreen()">⚠  API keys not configured — tap to set up</div>
+  <div id="error-banner"></div>
+  <div id="loading-row"><div class="spinner"></div>QUERYING 3 SOURCES…</div>
+  <div id="results"></div>
+  <div id="empty-state">&gt; ENTER TARGET NUMBER</div>
+</div>
+
+<!-- SETTINGS SCREEN -->
+<div id="settings">
+  <p class="settings-intro">Keys stored on-device only via localStorage.<br>Never sent anywhere except the respective API.</p>
+  <div id="key-fields"></div>
+  <button id="save-btn" onclick="saveKeys()">SAVE KEYS</button>
+</div>
+
+<script>
+// ── CONFIG ─────────────────────────────────────────────────────────────────
+const KEY_FIELDS = [
+  { id:'twilioSid',    label:'TWILIO ACCOUNT SID', hint:'ACxxxxxxxxxxxxxxx', url:'twilio.com → Console → Account Info' },
+  { id:'twilioToken',  label:'TWILIO AUTH TOKEN',   hint:'xxxxxxxxxxxxxxxx',  url:'twilio.com → Console → Account Info' },
+  { id:'numLookupKey', label:'NUMLOOKUP API KEY',   hint:'xxxxxxxxxxxxxxxx',  url:'numlookupapi.com → Dashboard' },
+  { id:'hibpKey',      label:'HAVEIBEENPWNED KEY',  hint:'xxxx ($3.50/mo)',   url:'haveibeenpwned.com/API/Key' },
+];
+
+const LINE_COLOR = { mobile:'#00e676', landline:'#555', voip:'#ff9800', 'toll-free':'#ffea00', premium:'#ff1744' };
+
+// ── STATE ──────────────────────────────────────────────────────────────────
+let keys = {};
+let screen = 'lookup';
+let revealed = {};
+let draftKeys = {};
+
+// ── INIT ───────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  try { keys = JSON.parse(localStorage.getItem('phonerecon_keys') || '{}'); } catch(e) {}
+  renderKeyFields();
+  updateHeaderState();
+});
+
+// ── SCREEN TOGGLE ──────────────────────────────────────────────────────────
+function toggleScreen() {
+  screen = screen === 'lookup' ? 'settings' : 'lookup';
+  document.getElementById('lookup-screen').style.display = screen === 'lookup' ? 'flex' : 'none';
+  document.getElementById('lookup-screen').style.flexDirection = 'column';
+  document.getElementById('settings').style.display = screen === 'settings' ? 'block' : 'none';
+  const btn = document.getElementById('keys-btn');
+  btn.textContent = screen === 'settings' ? '← BACK' : '⚙ KEYS';
+  btn.classList.toggle('active', screen === 'settings');
+  if (screen === 'settings') {
+    draftKeys = { ...keys };
+    renderKeyFields();
+  }
+}
+
+function updateHeaderState() {
+  const allSet = KEY_FIELDS.every(f => keys[f.id]?.trim());
+  const dot = document.getElementById('alert-dot');
+  const banner = document.getElementById('keys-banner');
+  const emptyState = document.getElementById('empty-state');
+  if (!allSet) {
+    if (!dot) {
+      const d = document.createElement('span');
+      d.id = 'alert-dot';
+      d.className = '';
+      d.style.cssText = 'width:7px;height:7px;border-radius:50%;background:#ff9800;position:absolute;top:0;right:-4px;display:inline-block';
+      document.getElementById('keys-btn').appendChild(d);
+    }
+    banner.style.display = 'block';
+    emptyState.textContent = '> CONFIGURE API KEYS TO BEGIN';
+  } else {
+    const dot2 = document.getElementById('alert-dot');
+    if (dot2) dot2.remove();
+    banner.style.display = 'none';
+    emptyState.textContent = '> ENTER TARGET NUMBER';
+  }
+}
+
+// ── SETTINGS ──────────────────────────────────────────────────────────────
+function renderKeyFields() {
+  const container = document.getElementById('key-fields');
+  container.innerHTML = '';
+  KEY_FIELDS.forEach(field => {
+    const val = draftKeys[field.id] || keys[field.id] || '';
+    const isSet = val.trim().length > 0;
+    const isRevealed = revealed[field.id];
+    container.innerHTML += `
+      <div class="key-card">
+        <div class="key-card-header">
+          <span class="key-label">${field.label}</span>
+          <span class="key-dot${isSet ? ' set' : ''}"></span>
+        </div>
+        <div class="key-url">${field.url}</div>
+        <div class="key-input-row">
+          <input class="key-input" type="${isRevealed ? 'text' : 'password'}"
+            id="input-${field.id}" value="${esc(val)}"
+            placeholder="${field.hint}" autocomplete="off" autocorrect="off"
+            oninput="draftKeys['${field.id}']=this.value;refreshDot('${field.id}',this.value)">
+          <button class="reveal-btn" onclick="toggleReveal('${field.id}')">
+            ${isRevealed ? 'HIDE' : 'SHOW'}
+          </button>
+        </div>
+        ${isSet && !isRevealed ? `<div class="masked-preview">${mask(val)}</div>` : ''}
+      </div>`;
+  });
+}
+
+function toggleReveal(id) {
+  revealed[id] = !revealed[id];
+  renderKeyFields();
+}
+
+function refreshDot(id, val) {
+  // live dot update handled on save
+}
+
+function saveKeys() {
+  KEY_FIELDS.forEach(f => {
+    const el = document.getElementById('input-' + f.id);
+    if (el) draftKeys[f.id] = el.value;
+  });
+  keys = { ...draftKeys };
+  localStorage.setItem('phonerecon_keys', JSON.stringify(keys));
+  const btn = document.getElementById('save-btn');
+  btn.textContent = '✓  SAVED';
+  btn.classList.add('saved');
+  setTimeout(() => { btn.textContent = 'SAVE KEYS'; btn.classList.remove('saved'); }, 2000);
+  updateHeaderState();
+  renderKeyFields();
+}
+
+// ── HELPERS ────────────────────────────────────────────────────────────────
+function esc(s) { return (s||'').replace(/"/g,'&quot;'); }
+function mask(v) {
+  if (!v || v.length <= 6) return '•'.repeat(v?.length || 0);
+  return v.slice(0,4) + '•'.repeat(v.length-6) + v.slice(-2);
+}
+function b64(s) { return btoa(s); }
+function e164(raw) {
+  const d = raw.replace(/\D/g,'');
+  if (d.length === 10) return `+1${d}`;
+  if (d.length === 11 && d.startsWith('1')) return `+${d}`;
+  return `+${d}`;
+}
+
+// ── HTTP (native via Capacitor if available, fetch fallback) ───────────────
+async function http(url, opts = {}) {
+  if (window.Capacitor?.isNativePlatform?.() && window.Capacitor?.Plugins?.CapacitorHttp) {
+    const r = await Capacitor.Plugins.CapacitorHttp.request({
+      url, method: opts.method || 'GET', headers: opts.headers || {}
+    });
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: () => r.data };
+  }
+  const r = await fetch(url, opts);
+  const json = () => r.json();
+  return { ok: r.ok, status: r.status, json };
+}
+
+// ── API CALLS ──────────────────────────────────────────────────────────────
+async function fetchTwilio(phone) {
+  const creds = b64(`${keys.twilioSid}:${keys.twilioToken}`);
+  const url = `https://lookups.twilio.com/v2/PhoneNumbers/${encodeURIComponent(phone)}?Fields=line_type_intelligence,caller_name`;
+  try {
+    const r = await http(url, { headers: { Authorization: `Basic ${creds}` } });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.message || `HTTP ${r.status}`);
+    return {
+      valid: d.valid,
+      countryCode: d.country_code,
+      nationalFormat: d.national_format,
+      lineType: d.line_type_intelligence?.type,
+      carrier: d.line_type_intelligence?.carrier_name,
+      callerName: d.caller_name?.caller_name,
+      callerType: d.caller_name?.caller_type,
+    };
+  } catch(e) { return { error: e.message }; }
+}
+
+async function fetchNumLookup(phone) {
+  const url = `https://api.numlookupapi.com/v1/info/${encodeURIComponent(phone)}?apikey=${keys.numLookupKey}`;
+  try {
+    const r = await http(url);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.message || `HTTP ${r.status}`);
+    return { country: d.country_name, location: d.location, carrier: d.carrier, lineType: d.line_type, localFormat: d.local_format };
+  } catch(e) { return { error: e.message }; }
+}
+
+async function fetchHIBP(phone) {
+  const url = `https://haveibeenpwned.com/api/v3/breachedaccount/${encodeURIComponent(phone)}`;
+  try {
+    const r = await http(url, { headers: { 'hibp-api-key': keys.hibpKey, 'user-agent': 'PhoneRecon/1.0' } });
+    if (r.status === 404) return { breached: false, count: 0, breaches: [] };
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    return { breached: true, count: d.length, breaches: d.map(b => ({ name: b.Name, domain: b.Domain, date: b.BreachDate, classes: b.DataClasses })) };
+  } catch(e) { return { error: e.message }; }
+}
+
+// ── LOOKUP ─────────────────────────────────────────────────────────────────
+async function runLookup() {
+  const raw = document.getElementById('phone-input').value.trim();
+  if (!raw) return;
+  if (!KEY_FIELDS.every(f => keys[f.id]?.trim())) { toggleScreen(); return; }
+
+  setLoading(true);
+  document.getElementById('error-banner').style.display = 'none';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('empty-state').style.display = 'none';
+
+  try {
+    const phone = e164(raw);
+    const [tw, nl, hibp] = await Promise.all([fetchTwilio(phone), fetchNumLookup(phone), fetchHIBP(phone)]);
+    renderResults(phone, tw, nl, hibp);
+  } catch(e) {
+    showError(e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('phone-input').addEventListener('keydown', e => { if (e.key === 'Enter') runLookup(); });
+});
+
+function setLoading(on) {
+  document.getElementById('run-btn').disabled = on;
+  document.getElementById('run-btn').textContent = on ? '···' : 'RUN';
+  document.getElementById('loading-row').style.display = on ? 'flex' : 'none';
+}
+
+function showError(msg) {
+  const b = document.getElementById('error-banner');
+  b.textContent = 'ERROR: ' + msg;
+  b.style.display = 'block';
+}
+
+// ── RENDER ─────────────────────────────────────────────────────────────────
+function renderResults(phone, tw, nl, hibp) {
+  const r = document.getElementById('results');
+  r.innerHTML = `
+    <div class="target-block">
+      <div class="target-label">TARGET</div>
+      <div class="target-number">${phone}</div>
+      <div class="target-ts">${new Date().toISOString()}</div>
+    </div>
+    ${renderTwilio(tw)}
+    ${renderNumLookup(nl)}
+    ${renderHIBP(hibp)}
+  `;
+}
+
+function section(title, accent, content) {
+  return `<div class="section">
+    <div class="section-head" style="border-left-color:${accent}">
+      <div class="section-title" style="color:${accent}">${title}</div>
+    </div>
+    ${content}
+  </div>`;
+}
+
+function badge(label, color) {
+  return `<span class="badge" style="color:${color};border-color:${color}">${label.toUpperCase()}</span>`;
+}
+
+function row(label, value, color) {
+  if (!value) return '';
+  return `<div class="row"><span class="row-label">${label}</span><span class="row-value" style="${color?`color:${color}`:''}">${value}</span></div>`;
+}
+
+function renderTwilio(d) {
+  if (!d) return '';
+  const acc = d.error ? '#ff9800' : '#00e5ff';
+  if (d.error) return section('CARRIER / LINE', acc, `<div class="err-text">Twilio: ${d.error}</div>`);
+  const ltColor = LINE_COLOR[d.lineType?.toLowerCase()] || '#555';
+  return section('CARRIER / LINE', acc, `
+    <div class="badge-row">
+      ${d.lineType ? badge(d.lineType, ltColor) : ''}
+      ${d.valid === false ? badge('INVALID','#ff1744') : ''}
+    </div>
+    ${row('Carrier', d.carrier)}
+    ${row('Caller Name', d.callerName)}
+    ${row('Caller Type', d.callerType)}
+    ${row('Country', d.countryCode)}
+    ${row('National Format', d.nationalFormat)}
+  `);
+}
+
+function renderNumLookup(d) {
+  if (!d) return '';
+  const acc = d.error ? '#ff9800' : '#00e5ff';
+  if (d.error) return section('GEO / NETWORK', acc, `<div class="err-text">NumLookup: ${d.error}</div>`);
+  return section('GEO / NETWORK', acc, `
+    ${row('Country', d.country)}
+    ${row('Location', d.location)}
+    ${row('Carrier', d.carrier)}
+    ${row('Line Type', d.lineType)}
+    ${row('Local Format', d.localFormat)}
+  `);
+}
+
+function renderHIBP(d) {
+  if (!d) return '';
+  if (d.error) return section('BREACH CHECK', '#ff9800', `<div class="err-text">HIBP: ${d.error}</div>`);
+  if (!d.breached) return section('BREACH CHECK', '#00e676', `<div class="badge-row">${badge('NO BREACHES FOUND','#00e676')}</div>`);
+  const cards = d.breaches.map(b => `
+    <div class="breach-card">
+      <div class="breach-name">${b.name}</div>
+      <div class="breach-meta">${b.domain} · ${b.date}</div>
+      <div class="breach-classes">${(b.classes||[]).join(', ')}</div>
+    </div>`).join('');
+  return section('BREACH CHECK', '#ff1744', `<div class="badge-row">${badge(`${d.count} BREACH${d.count>1?'ES':''}`, '#ff1744')}</div>${cards}`);
+}
+</script>
+</body>
+</html>

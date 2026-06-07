@@ -1,0 +1,10 @@
+{
+  "appId": "com.phonerecon.app",
+  "appName": "PhoneRecon",
+  "webDir": "www",
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
