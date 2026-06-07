@@ -45,33 +45,36 @@ jobs:
           key: gradle-rn073-${{ runner.os }}
           restore-keys: gradle-rn073-
 
-      - name: Init React Native 0.73.6 project
+      # Run init in /tmp so react-native doesn't detect the parent git repo
+      # and abort the template copy step
+      - name: Init React Native project
         run: |
-          npx --yes react-native@0.73.6 init PhoneRecon --verbose
-          echo "=== PhoneRecon contents ==="
-          ls -la PhoneRecon/
-          echo "=== PhoneRecon/android contents ==="
-          ls -la PhoneRecon/android/
+          cd /tmp
+          npx --yes react-native@0.73.6 init PhoneRecon
+          echo "=== /tmp/PhoneRecon ==="
+          ls /tmp/PhoneRecon/
+          echo "=== /tmp/PhoneRecon/android ==="
+          ls /tmp/PhoneRecon/android/
 
-      - name: Replace App.js
-        run: cp phone-recon/App.js PhoneRecon/App.js
+      - name: Copy App.js into project
+        run: cp $GITHUB_WORKSPACE/phone-recon/App.js /tmp/PhoneRecon/App.js
 
       - name: Install AsyncStorage
-        working-directory: PhoneRecon
+        working-directory: /tmp/PhoneRecon
         run: npm install @react-native-async-storage/async-storage
 
       - name: Make gradlew executable
-        run: chmod +x PhoneRecon/android/gradlew
+        run: chmod +x /tmp/PhoneRecon/android/gradlew
 
       - name: Build debug APK
-        working-directory: PhoneRecon/android
+        working-directory: /tmp/PhoneRecon/android
         run: ./gradlew assembleDebug --no-daemon
 
-      - name: Rename APK
+      - name: Stage APK for release
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          cp PhoneRecon/android/app/build/outputs/apk/debug/app-debug.apk \
-             PhoneRecon/android/app/build/outputs/apk/debug/PhoneRecon-${SHORT_SHA}.apk
+          cp /tmp/PhoneRecon/android/app/build/outputs/apk/debug/app-debug.apk \
+             $GITHUB_WORKSPACE/PhoneRecon-${SHORT_SHA}.apk
           echo "APK_NAME=PhoneRecon-${SHORT_SHA}.apk" >> $GITHUB_ENV
 
       - name: Publish to GitHub Releases
@@ -93,4 +96,4 @@ jobs:
             3. Tap the APK to install
 
             > Debug build — no signing required for personal use.
-          files: PhoneRecon/android/app/build/outputs/apk/debug/${{ env.APK_NAME }}
+          files: ${{ env.APK_NAME }}
