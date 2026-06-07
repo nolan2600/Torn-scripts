@@ -45,28 +45,15 @@ jobs:
           key: gradle-rn074-${{ runner.os }}
           restore-keys: gradle-rn074-
 
-      - name: Cache npm global
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-rn074-${{ runner.os }}
-
       - name: Init React Native project
-        run: |
-          npx --yes react-native@0.74.6 init PhoneRecon --skip-install
-          echo "--- PhoneRecon root ---"
-          ls PhoneRecon/
-          echo "--- PhoneRecon/android ---"
-          ls PhoneRecon/android/
+        run: npx --yes react-native@0.74 init PhoneRecon
 
       - name: Replace App.js with repo version
         run: cp phone-recon/App.js PhoneRecon/App.js
 
-      - name: Install dependencies
+      - name: Install AsyncStorage
         working-directory: PhoneRecon
-        run: |
-          npm install
-          npm install @react-native-async-storage/async-storage
+        run: npm install @react-native-async-storage/async-storage
 
       - name: Make gradlew executable
         run: chmod +x PhoneRecon/android/gradlew
