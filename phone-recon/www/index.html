@@ -68,7 +68,8 @@ body{display:flex;flex-direction:column;max-width:600px;margin:0 auto}
 .key-label{font-size:10px;font-weight:700;color:var(--cyan);letter-spacing:2px}
 .key-dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
 .key-dot.set{background:var(--green)}
-.key-url{font-size:9px;color:var(--muted);letter-spacing:1px;margin-bottom:10px}
+.key-url{display:inline-block;font-size:9px;color:var(--cyan);letter-spacing:1px;margin-bottom:10px;text-decoration:none;opacity:0.75}
+.key-url:active{opacity:1}
 .key-input-row{display:flex;gap:8px}
 .key-input{flex:1;height:42px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;padding:0 12px;font-family:var(--mono);font-size:13px;color:var(--text);outline:none}
 .reveal-btn{height:42px;padding:0 12px;background:var(--bg);border:1px solid var(--border2);border-radius:4px;font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:2px;cursor:pointer;white-space:nowrap}
@@ -111,10 +112,10 @@ body{display:flex;flex-direction:column;max-width:600px;margin:0 auto}
 <script>
 // ── CONFIG ─────────────────────────────────────────────────────────────────
 const KEY_FIELDS = [
-  { id:'twilioSid',    label:'TWILIO ACCOUNT SID', hint:'ACxxxxxxxxxxxxxxx', url:'twilio.com → Console → Account Info' },
-  { id:'twilioToken',  label:'TWILIO AUTH TOKEN',   hint:'xxxxxxxxxxxxxxxx',  url:'twilio.com → Console → Account Info' },
-  { id:'numLookupKey', label:'NUMLOOKUP API KEY',   hint:'xxxxxxxxxxxxxxxx',  url:'numlookupapi.com → Dashboard' },
-  { id:'hibpKey',      label:'HAVEIBEENPWNED KEY',  hint:'xxxx ($3.50/mo)',   url:'haveibeenpwned.com/API/Key' },
+  { id:'twilioSid',    label:'TWILIO ACCOUNT SID', hint:'ACxxxxxxxxxxxxxxx', url:'https://www.twilio.com/try-twilio',         urlLabel:'Sign up / get keys →' },
+  { id:'twilioToken',  label:'TWILIO AUTH TOKEN',   hint:'xxxxxxxxxxxxxxxx',  url:'https://console.twilio.com',               urlLabel:'Open Twilio Console →' },
+  { id:'numLookupKey', label:'NUMLOOKUP API KEY',   hint:'xxxxxxxxxxxxxxxx',  url:'https://numlookupapi.com/dashboard',        urlLabel:'Get free API key →' },
+  { id:'hibpKey',      label:'HAVEIBEENPWNED KEY',  hint:'xxxx ($3.50/mo)',   url:'https://haveibeenpwned.com/API/Key',        urlLabel:'Subscribe for API key →' },
 ];
 
 const LINE_COLOR = { mobile:'#00e676', landline:'#555', voip:'#ff9800', 'toll-free':'#ffea00', premium:'#ff1744' };
@@ -184,7 +185,7 @@ function renderKeyFields() {
           <span class="key-label">${field.label}</span>
           <span class="key-dot${isSet ? ' set' : ''}"></span>
         </div>
-        <div class="key-url">${field.url}</div>
+        <a class="key-url" href="${field.url}" target="_blank" onclick="openLink(event,'${field.url}')">${field.urlLabel}</a>
         <div class="key-input-row">
           <input class="key-input" type="${isRevealed ? 'text' : 'password'}"
             id="input-${field.id}" value="${esc(val)}"
@@ -224,6 +225,15 @@ function saveKeys() {
 }
 
 // ── HELPERS ────────────────────────────────────────────────────────────────
+function openLink(e, url) {
+  e.preventDefault();
+  if (window.Capacitor?.isNativePlatform?.()) {
+    // Opens in the system browser (Chrome) on device
+    window.open(url, '_system');
+  } else {
+    window.open(url, '_blank');
+  }
+}
 function esc(s) { return (s||'').replace(/"/g,'&quot;'); }
 function mask(v) {
   if (!v || v.length <= 6) return '•'.repeat(v?.length || 0);
