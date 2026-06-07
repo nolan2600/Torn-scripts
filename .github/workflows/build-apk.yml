@@ -42,13 +42,18 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-rn074-${{ runner.os }}
-          restore-keys: gradle-rn074-
+          key: gradle-rn073-${{ runner.os }}
+          restore-keys: gradle-rn073-
 
-      - name: Init React Native project
-        run: npx --yes react-native@0.74 init PhoneRecon
+      - name: Init React Native 0.73.6 project
+        run: |
+          npx --yes react-native@0.73.6 init PhoneRecon --verbose
+          echo "=== PhoneRecon contents ==="
+          ls -la PhoneRecon/
+          echo "=== PhoneRecon/android contents ==="
+          ls -la PhoneRecon/android/
 
-      - name: Replace App.js with repo version
+      - name: Replace App.js
         run: cp phone-recon/App.js PhoneRecon/App.js
 
       - name: Install AsyncStorage
@@ -76,7 +81,7 @@ jobs:
           name: PhoneRecon — Latest Build
           prerelease: true
           body: |
-            **Automated build** — sideload this APK onto any Android device.
+            **Automated build** — sideload onto any Android device.
 
             **Commit:** `${{ github.sha }}`
             **Branch:** `${{ github.ref_name }}`
@@ -85,7 +90,7 @@ jobs:
             ### Install
             1. Transfer the APK to your Android device
             2. Settings → Install unknown apps → allow your file manager
-            3. Tap the APK file to install
+            3. Tap the APK to install
 
             > Debug build — no signing required for personal use.
           files: PhoneRecon/android/app/build/outputs/apk/debug/${{ env.APK_NAME }}
