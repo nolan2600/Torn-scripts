@@ -45,15 +45,21 @@ jobs:
           key: gradle-rn073-${{ runner.os }}
           restore-keys: gradle-rn073-
 
-      # Run init in /tmp so react-native doesn't detect the parent git repo
-      # and abort the template copy step
+      # CocoaPods isn't installed on Linux runners — react-native init treats
+      # pod install failure as a fatal template error and rolls back all files.
+      # Stubbing pod with an exit-0 script lets the template copy complete.
+      - name: Stub CocoaPods so template copy succeeds
+        run: |
+          printf '#!/bin/bash\necho "pod stub: $*"\nexit 0\n' | sudo tee /usr/local/bin/pod
+          sudo chmod +x /usr/local/bin/pod
+
       - name: Init React Native project
         run: |
           cd /tmp
-          npx --yes react-native@0.73.6 init PhoneRecon
-          echo "=== /tmp/PhoneRecon ==="
+          npx --yes react-native@0.73.6 init PhoneRecon || true
+          echo "=== PhoneRecon contents ==="
           ls /tmp/PhoneRecon/
-          echo "=== /tmp/PhoneRecon/android ==="
+          echo "=== android/ ==="
           ls /tmp/PhoneRecon/android/
 
       - name: Copy App.js into project

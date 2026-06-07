@@ -1,4 +1,4 @@
-// v1.3
+// v1.4
 import React, {useState, useRef, useEffect, useCallback} from 'react';
 import {
   View,
