@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  CI: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,10 +25,10 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Node 18
+      - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -48,15 +51,25 @@ jobs:
           path: ~/.npm
           key: npm-rn074-${{ runner.os }}
 
-      - name: Init React Native 0.74 project
-        run: npx --yes react-native@0.74 init PhoneRecon
+      - name: Init React Native project
+        run: |
+          npx --yes react-native@0.74.6 init PhoneRecon --skip-install
+          echo "--- PhoneRecon root ---"
+          ls PhoneRecon/
+          echo "--- PhoneRecon/android ---"
+          ls PhoneRecon/android/
 
       - name: Replace App.js with repo version
         run: cp phone-recon/App.js PhoneRecon/App.js
 
-      - name: Install AsyncStorage
+      - name: Install dependencies
         working-directory: PhoneRecon
-        run: npm install @react-native-async-storage/async-storage
+        run: |
+          npm install
+          npm install @react-native-async-storage/async-storage
+
+      - name: Make gradlew executable
+        run: chmod +x PhoneRecon/android/gradlew
 
       - name: Build debug APK
         working-directory: PhoneRecon/android
