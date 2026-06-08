@@ -250,14 +250,38 @@ class TornApiService {
   }
 
   Future<Map<int, TornItem>> fetchAllItems() async {
-    final data = await _get('$_tornBase/torn/items?key=$apiKey');
-    final raw = data['items'] as Map<String, dynamic>? ?? {};
     final result = <int, TornItem>{};
-    for (final entry in raw.entries) {
-      final id = int.tryParse(entry.key);
-      if (id == null) continue;
-      result[id] = TornItem.fromJson(id, entry.value as Map<String, dynamic>);
+    String? nextUrl = '$_tornBase/torn/items?key=$apiKey';
+    int safety = 20;
+
+    while (nextUrl != null && safety-- > 0) {
+      final data = await _get(nextUrl);
+      final rawItems = data['items'];
+
+      if (rawItems is Map) {
+        for (final entry in (rawItems as Map).entries) {
+          final id = int.tryParse(entry.key.toString());
+          if (id == null) continue;
+          result[id] = TornItem.fromJson(id, entry.value as Map<String, dynamic>);
+        }
+      } else if (rawItems is List) {
+        for (final e in rawItems) {
+          final m = e as Map<String, dynamic>;
+          final id = (m['id'] as num?)?.toInt();
+          if (id == null) continue;
+          result[id] = TornItem.fromJson(id, m);
+        }
+      }
+
+      final meta = data['_metadata'] as Map<String, dynamic>?;
+      final links = meta?['links'] as Map<String, dynamic>?;
+      nextUrl = links?['next'] as String?;
+      if (rawItems == null || (rawItems is List && rawItems.isEmpty) ||
+          (rawItems is Map && rawItems.isEmpty)) {
+        nextUrl = null;
+      }
     }
+
     return result;
   }
 
