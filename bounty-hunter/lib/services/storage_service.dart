@@ -9,6 +9,10 @@ class StorageService {
   static const _kSettings = 'bh_settings';
   static const _kTargets = 'bh_targets';
   static const _kAlertIds = 'bh_alertIds';
+  static const _kWatchedItems = 'bh_watched_items';
+  static const _kPriceHistory = 'bh_price_history';
+  static const _kItemsCache = 'bh_items_cache';
+  static const _kItemsCacheTs = 'bh_items_cache_ts';
 
   SharedPreferences? _prefs;
 
@@ -43,4 +47,20 @@ class StorageService {
       _p.getStringList(_kAlertIds) ?? const [];
   Future<void> saveAlertIds(List<String> ids) =>
       _p.setStringList(_kAlertIds, ids);
+
+  // --- Market Watch ---
+  String? getWatchedItemsJson() => _p.getString(_kWatchedItems);
+  Future<void> saveWatchedItemsJson(String json) =>
+      _p.setString(_kWatchedItems, json);
+
+  String? getPriceHistoryJson() => _p.getString(_kPriceHistory);
+  Future<void> savePriceHistoryJson(String json) =>
+      _p.setString(_kPriceHistory, json);
+
+  String? getItemsCacheJson() => _p.getString(_kItemsCache);
+  Future<void> saveItemsCacheJson(String json) =>
+      _p.setString(_kItemsCache, json);
+
+  int? getItemsCacheTs() => _p.getInt(_kItemsCacheTs);
+  Future<void> saveItemsCacheTs(int ts) => _p.setInt(_kItemsCacheTs, ts);
 }

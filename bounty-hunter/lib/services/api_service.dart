@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../models/market_models.dart';
 
 const _tornBase = 'https://api.torn.com/v2';
 const _ffBase = 'https://ffscouter.com/api/v1';
@@ -246,6 +247,47 @@ class TornApiService {
     final mins = durations[plane] ?? durations['airliner'] ?? 0;
     if (mins == 0) return 0;
     return DateTime.now().millisecondsSinceEpoch ~/ 1000 + mins * 60;
+  }
+
+  Future<Map<int, TornItem>> fetchAllItems() async {
+    final data = await _get('$_tornBase/torn/items?key=$apiKey');
+    final raw = data['items'] as Map<String, dynamic>? ?? {};
+    final result = <int, TornItem>{};
+    for (final entry in raw.entries) {
+      final id = int.tryParse(entry.key);
+      if (id == null) continue;
+      result[id] = TornItem.fromJson(id, entry.value as Map<String, dynamic>);
+    }
+    return result;
+  }
+
+  Future<LiveItemData?> fetchItemMarket(int itemId) async {
+    try {
+      final data = await _get('$_tornBase/market/$itemId/itemmarket?key=$apiKey');
+      final raw = data['itemmarket'] as List<dynamic>? ?? [];
+      final listings = <MarketListing>[];
+      for (final e in raw) {
+        final m = e as Map<String, dynamic>;
+        final price = (m['price'] as num?)?.toInt() ?? 0;
+        final qty = (m['quantity'] as num?)?.toInt() ?? 1;
+        final seller = m['seller'] as Map<String, dynamic>?;
+        if (price > 0) {
+          listings.add(MarketListing(
+            price: price,
+            quantity: qty,
+            sellerName: seller?['name'] as String?,
+          ));
+        }
+      }
+      listings.sort((a, b) => a.price.compareTo(b.price));
+      return LiveItemData(
+        cheapestPrice: listings.isNotEmpty ? listings.first.price : 0,
+        listings: listings,
+        fetchedAt: DateTime.now(),
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   static String? _resolveCountry(String desc) {

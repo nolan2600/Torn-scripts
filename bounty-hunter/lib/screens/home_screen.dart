@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/settings_provider.dart';
 import '../providers/hunter_provider.dart';
+import '../providers/market_provider.dart';
 import 'bounty_screen.dart';
+import 'market_screen.dart';
 import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -133,11 +135,47 @@ class _HomeScreenState extends State<HomeScreen> {
                 },
               ),
               const SizedBox(height: 12),
-              // Coming soon cards
-              _ComingSoonCard(
+              // Market Watch card
+              _FeatureCard(
                 icon: '📊',
                 title: 'Market Watch',
-                subtitle: 'Track item prices and bazaar deals',
+                subtitle: 'Track item prices, set alerts and calculate flip profits',
+                accentColor: const Color(0xFF4CAF50),
+                badgeBuilder: settings.hasKey
+                    ? (ctx) => Consumer<MarketProvider>(
+                          builder: (_, market, __) {
+                            final count = market.watchedItems.length;
+                            if (count == 0) return const SizedBox.shrink();
+                            return Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF4CAF50),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                '$count',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            );
+                          },
+                        )
+                    : null,
+                onTap: () {
+                  if (!settings.hasKey) {
+                    Navigator.push(context,
+                        MaterialPageRoute(
+                            builder: (_) => const SettingsScreen()));
+                    return;
+                  }
+                  Navigator.push(context,
+                      MaterialPageRoute(
+                          builder: (_) => const MarketScreen()));
+                },
               ),
               const SizedBox(height: 12),
               _ComingSoonCard(

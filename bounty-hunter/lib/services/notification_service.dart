@@ -14,6 +14,10 @@ class NotificationService {
   static const _channelName = 'Bounty Alerts';
   static const _channelDesc = 'Hospital exit and travel landing alerts';
 
+  static const _marketChannelId = 'bh_market';
+  static const _marketChannelName = 'Market Alerts';
+  static const _marketChannelDesc = 'Price drop alerts for watched items';
+
   Future<void> initialize() async {
     if (_initialized) return;
     tz.initializeTimeZones();
@@ -137,6 +141,30 @@ class NotificationService {
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
       uiLocalNotificationDateInterpretation:
           UILocalNotificationDateInterpretation.absoluteTime,
+    );
+  }
+
+  Future<void> showPriceAlert({
+    required int itemId,
+    required String itemName,
+    required int price,
+    required int threshold,
+  }) async {
+    await _plugin.show(
+      500000 + itemId,
+      '💰 $itemName price drop!',
+      'Now ${_fmt(price)} — below your alert of ${_fmt(threshold)}',
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          _marketChannelId,
+          _marketChannelName,
+          channelDescription: _marketChannelDesc,
+          importance: Importance.high,
+          priority: Priority.high,
+          enableVibration: true,
+          playSound: true,
+        ),
+      ),
     );
   }
 

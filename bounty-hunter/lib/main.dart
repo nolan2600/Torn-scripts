@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'providers/settings_provider.dart';
 import 'providers/hunter_provider.dart';
+import 'providers/market_provider.dart';
 import 'services/notification_service.dart';
 import 'screens/home_screen.dart';
 
@@ -35,14 +36,17 @@ class _Bootstrap extends StatefulWidget {
 class _BootstrapState extends State<_Bootstrap> {
   late final SettingsProvider _settings;
   late final HunterProvider _hunter;
+  late final MarketProvider _market;
 
   @override
   void initState() {
     super.initState();
     _settings = SettingsProvider();
     _hunter = HunterProvider(_settings);
+    _market = MarketProvider(_settings);
     _settings.load().then((_) {
       _hunter.onSettingsChanged();
+      _market.onSettingsChanged();
       if (_settings.hasKey) _hunter.startPolling();
     });
     // Deep-link from notifications
@@ -59,6 +63,7 @@ class _BootstrapState extends State<_Bootstrap> {
       providers: [
         ChangeNotifierProvider.value(value: _settings),
         ChangeNotifierProvider.value(value: _hunter),
+        ChangeNotifierProvider.value(value: _market),
       ],
       child: const BountyHunterApp(),
     );
