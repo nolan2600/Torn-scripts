@@ -1,0 +1,104 @@
+name: Build Bounty Hunter APK
+
+on:
+  push:
+    branches:
+      - main
+      - 'claude/**'
+    paths:
+      - 'bounty-hunter/**'
+      - '.github/workflows/build-bounty-hunter.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Flutter 3.22.x
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.3'
+          channel: 'stable'
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-bh-${{ runner.os }}-${{ hashFiles('bounty-hunter/android/**/*.gradle*') }}
+          restore-keys: gradle-bh-${{ runner.os }}-
+
+      - name: Flutter pub get
+        working-directory: bounty-hunter
+        run: flutter pub get
+
+      - name: Flutter analyze (non-blocking)
+        working-directory: bounty-hunter
+        run: flutter analyze --no-fatal-infos || true
+
+      - name: Build debug APK
+        working-directory: bounty-hunter
+        run: flutter build apk --debug --no-shrink
+
+      - name: Stage APK
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DATE=$(date +'%Y-%m-%d')
+          cp bounty-hunter/build/app/outputs/flutter-apk/app-debug.apk \
+             BountyHunter-${DATE}-${SHORT_SHA}.apk
+          echo "APK_NAME=BountyHunter-${DATE}-${SHORT_SHA}.apk" >> $GITHUB_ENV
+          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_ENV
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bounty-hunter-latest
+          name: "Bounty Hunter — Latest Build"
+          prerelease: true
+          body: |
+            ## 🎯 Bounty Hunter for Android
+
+            **Automated build** — sideload onto any Android device (Android 8+).
+
+            ### Features
+            - Live bounty board with FF filtering and BS bracket filter
+            - Hospital exit timers with per-target 🔔 alerts
+            - Marked targets tab — track specific players with live status
+            - Travel landing timers ✈️
+            - Faction war detection ⚔️
+            - Opens target profiles directly in **Torn PDA**
+            - Auto-refresh (30s – 5min, configurable)
+            - Scheduled local notifications (fires even when app is minimized)
+
+            ### Install
+            1. Transfer the APK to your Android device
+            2. **Settings → Apps → Special app access → Install unknown apps** → allow your file manager
+            3. Tap the APK to install
+            4. Open the app, go to **Settings**, enter your **Torn API key**
+            5. Optionally add an **FFScouter key** for FF and BS filtering
+
+            ---
+            **Commit:** `${{ github.sha }}`
+            **Built:** ${{ github.event.head_commit.timestamp }}
+          files: ${{ env.APK_NAME }}
