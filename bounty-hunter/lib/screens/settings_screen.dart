@@ -159,7 +159,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               _NumberField(
                 label: 'Min reward (\$)',
-                value: s.minPrice,
+                value: s.minPrice.toDouble(),
                 min: 0,
                 step: 100000,
                 onChanged: (v) => _updateSettings(s.copyWith(minPrice: v.round())),

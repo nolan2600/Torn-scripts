@@ -98,6 +98,8 @@ class NotificationService {
       ),
       payload: 'https://www.torn.com/profiles.php?XID=$targetId',
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
     );
   }
 
@@ -133,6 +135,8 @@ class NotificationService {
       ),
       payload: 'https://www.torn.com/profiles.php?XID=$targetId',
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
     );
   }
 

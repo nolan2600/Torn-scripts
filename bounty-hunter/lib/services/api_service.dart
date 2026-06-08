@@ -274,8 +274,8 @@ class TornApiService {
 class FFScouterService {
   static Future<({Map<int, FFData> map, String? error})> fetchStats(
       String key, List<int> userIds) async {
-    if (key.isEmpty) return (map: {}, error: 'no_key');
-    if (userIds.isEmpty) return (map: {}, error: null);
+    if (key.isEmpty) return (map: <int, FFData>{}, error: 'no_key');
+    if (userIds.isEmpty) return (map: <int, FFData>{}, error: null);
 
     final map = <int, FFData>{};
     String? error;
