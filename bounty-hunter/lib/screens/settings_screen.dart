@@ -369,7 +369,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 24),
           Center(
             child: Text(
-              'Bounty Hunter v1.0 for Torn\nlannav + DieselBlade',
+              'Torn Helper v1.0\n-NoLaN-',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.grey[700], fontSize: 11),
             ),

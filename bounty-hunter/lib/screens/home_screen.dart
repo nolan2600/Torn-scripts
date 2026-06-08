@@ -39,7 +39,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(width: 10),
             const Text(
-              'Bounty Hunter',
+              'Torn Helper',
               style: TextStyle(
                 color: Colors.white,
                 fontWeight: FontWeight.bold,
@@ -155,7 +155,7 @@ class _HomeScreenState extends State<HomeScreen> {
               // Footer
               Center(
                 child: Text(
-                  'Bounty Hunter v1.0 · lannav + DieselBlade',
+                  'Torn Helper v1.0 · -NoLaN-',
                   style: TextStyle(color: Colors.grey[700], fontSize: 11),
                 ),
               ),

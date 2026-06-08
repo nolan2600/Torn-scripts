@@ -71,7 +71,7 @@ class BountyHunterApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Bounty Hunter',
+      title: 'Torn Helper',
       debugShowCheckedModeBanner: false,
       theme: _buildTheme(),
       home: const HomeScreen(),

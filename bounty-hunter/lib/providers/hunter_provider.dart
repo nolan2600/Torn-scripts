@@ -226,9 +226,18 @@ class HunterProvider extends ChangeNotifier {
       refreshState = RefreshState.success;
       _scheduleHospitalAlerts();
     } catch (e) {
-      lastError = e is TornApiException
-          ? e.message
-          : e.toString().replaceFirst('Exception: ', '');
+      if (e is TornApiException) {
+        lastError = e.message;
+      } else {
+        final s = e.toString();
+        if (s.contains('SocketException') || s.contains('ClientException') ||
+            s.contains('SocketFailed') || s.contains('No address associated') ||
+            s.contains('Failed host lookup') || s.contains('errno = 7')) {
+          lastError = 'Network error — check your connection';
+        } else {
+          lastError = s.replaceFirst('Exception: ', '');
+        }
+      }
       refreshState = RefreshState.error;
     }
 

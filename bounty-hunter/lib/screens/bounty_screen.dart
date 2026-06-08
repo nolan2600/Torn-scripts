@@ -50,6 +50,7 @@ class _BountyScreenState extends State<BountyScreen>
                     color: Colors.white,
                     fontWeight: FontWeight.bold,
                     fontSize: 18)),
+            // title kept as "Bounty Hunter" — the feature name, not the app name
             bottom: TabBar(
               controller: _tabs,
               indicatorColor: const Color(0xFFEF5350),
@@ -103,14 +104,51 @@ class _BountyScreenState extends State<BountyScreen>
   }
 }
 
-class _HuntTab extends StatelessWidget {
+enum _SortBy { reward, time, ff }
+
+class _HuntTab extends StatefulWidget {
   final HunterProvider hunter;
   final SettingsProvider settings;
 
   const _HuntTab({required this.hunter, required this.settings});
 
   @override
+  State<_HuntTab> createState() => _HuntTabState();
+}
+
+class _HuntTabState extends State<_HuntTab> {
+  _SortBy _sort = _SortBy.reward;
+
+  List<BountyEntry> _sorted(List<BountyEntry> src) {
+    final list = List<BountyEntry>.from(src);
+    switch (_sort) {
+      case _SortBy.reward:
+        list.sort((a, b) => b.reward.compareTo(a.reward));
+      case _SortBy.time:
+        list.sort((a, b) {
+          final aH = a.statusState == 'Hospital';
+          final bH = b.statusState == 'Hospital';
+          if (aH && !bH) return -1;
+          if (!aH && bH) return 1;
+          if (aH && bH) return a.hospRemaining.compareTo(b.hospRemaining);
+          return b.reward.compareTo(a.reward);
+        });
+      case _SortBy.ff:
+        list.sort((a, b) {
+          if (a.ff == null && b.ff == null) return 0;
+          if (a.ff == null) return 1;
+          if (b.ff == null) return -1;
+          return a.ff!.compareTo(b.ff!);
+        });
+    }
+    return list;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final hunter = widget.hunter;
+    final settings = widget.settings;
+
     if (hunter.refreshState == RefreshState.error && hunter.bounties.isEmpty) {
       return _ErrorView(
           message: hunter.lastError ?? 'Unknown error',
@@ -133,28 +171,102 @@ class _HuntTab extends StatelessWidget {
       );
     }
 
+    final sorted = _sorted(hunter.bounties);
+
     return Column(
       children: [
-        // Error banner (non-blocking)
         if (hunter.lastError != null)
           _ErrorBanner(message: hunter.lastError!),
-        // Filter summary chips
         _FilterBar(settings: settings),
-        // List
+        _SortBar(current: _sort, onChanged: (s) => setState(() => _sort = s)),
         Expanded(
-          child: hunter.bounties.isEmpty
+          child: sorted.isEmpty
               ? const _EmptyBounties()
               : ListView.builder(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  itemCount: hunter.bounties.length,
+                  itemCount: sorted.length,
                   itemBuilder: (ctx, i) => _BountyCard(
-                        bounty: hunter.bounties[i],
+                        bounty: sorted[i],
                         hunter: hunter,
                       ),
                 ),
         ),
       ],
+    );
+  }
+}
+
+class _SortBar extends StatelessWidget {
+  final _SortBy current;
+  final void Function(_SortBy) onChanged;
+  const _SortBar({required this.current, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: const Color(0xFF161616),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: [
+          Text('Sort:',
+              style: TextStyle(color: Colors.grey[600], fontSize: 11)),
+          const SizedBox(width: 8),
+          _SortChip(
+            label: '💰 Reward',
+            active: current == _SortBy.reward,
+            onTap: () => onChanged(_SortBy.reward),
+          ),
+          const SizedBox(width: 6),
+          _SortChip(
+            label: '⏱ Time',
+            active: current == _SortBy.time,
+            onTap: () => onChanged(_SortBy.time),
+          ),
+          const SizedBox(width: 6),
+          _SortChip(
+            label: '⚔ FF',
+            active: current == _SortBy.ff,
+            onTap: () => onChanged(_SortBy.ff),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SortChip extends StatelessWidget {
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+  const _SortChip(
+      {required this.label, required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        decoration: BoxDecoration(
+          color: active ? const Color(0xFF3A1A1A) : const Color(0xFF222222),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color:
+                active ? const Color(0xFFEF5350) : const Color(0xFF333333),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight:
+                active ? FontWeight.w700 : FontWeight.normal,
+            color:
+                active ? const Color(0xFFEF5350) : Colors.grey[500],
+          ),
+        ),
+      ),
     );
   }
 }

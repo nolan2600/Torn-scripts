@@ -18,7 +18,7 @@
     </queries>
 
     <application
-        android:label="Bounty Hunter"
+        android:label="Torn Helper"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
