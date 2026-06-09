@@ -286,15 +286,23 @@ class TornApiService {
   }
 
   Future<LiveItemData?> fetchItemMarket(int itemId) async {
-    // v2 market endpoint doesn't exist yet — use v1 itemmarket selection
     try {
       final data = await _get(
           'https://api.torn.com/market/$itemId/?selections=itemmarket&key=$apiKey');
-      final raw = data['itemmarket'] as List<dynamic>? ?? [];
+      final rawData = data['itemmarket'];
       final listings = <MarketListing>[];
-      for (final e in raw) {
+
+      Iterable<dynamic> entries;
+      if (rawData is List) {
+        entries = rawData;
+      } else if (rawData is Map) {
+        entries = rawData.values;
+      } else {
+        entries = const [];
+      }
+
+      for (final e in entries) {
         final m = e as Map<String, dynamic>;
-        // v1 API uses 'cost', v2 uses 'price'
         final price = (m['cost'] as num?)?.toInt() ??
             (m['price'] as num?)?.toInt() ?? 0;
         final qty = (m['quantity'] as num?)?.toInt() ?? 1;
