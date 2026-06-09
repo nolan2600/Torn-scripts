@@ -63,21 +63,17 @@ jobs:
 
       - name: Stage APK
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          DATE=$(date +'%Y-%m-%d')
-          cp bounty-hunter/build/app/outputs/flutter-apk/app-debug.apk \
-             BountyHunter-${DATE}-${SHORT_SHA}.apk
-          echo "APK_NAME=BountyHunter-${DATE}-${SHORT_SHA}.apk" >> $GITHUB_ENV
-          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_ENV
+          cp bounty-hunter/build/app/outputs/flutter-apk/app-debug.apk TornHelper.apk
+          echo "SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-7)" >> $GITHUB_ENV
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: bounty-hunter-latest
-          name: "Bounty Hunter — Latest Build"
+          name: "Torn Helper — Latest Build"
           prerelease: true
           body: |
-            ## 🎯 Bounty Hunter for Android
+            ## 🎯 Torn Helper for Android
 
             **Automated build** — sideload onto any Android device (Android 8+).
 
@@ -90,6 +86,7 @@ jobs:
             - Opens target profiles directly in **Torn PDA**
             - Auto-refresh (30s – 5min, configurable)
             - Scheduled local notifications (fires even when app is minimized)
+            - **Market Watch** — watchlist with live prices, price alerts & flip calculator
 
             ### Install
             1. Transfer the APK to your Android device
@@ -101,4 +98,4 @@ jobs:
             ---
             **Commit:** `${{ github.sha }}`
             **Built:** ${{ github.event.head_commit.timestamp }}
-          files: ${{ env.APK_NAME }}
+          files: TornHelper.apk
