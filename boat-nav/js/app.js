@@ -59,13 +59,13 @@ const map = L.map('map', {
 });
 
 const baseLayers = {
-  ocean:     L.tileLayer(TILES.ocean.url,     { attribution: TILES.ocean.attr,     maxZoom: 17 }),
+  ocean:     L.tileLayer(TILES.ocean.url,     { attribution: TILES.ocean.attr,     maxZoom: 19, maxNativeZoom: 13 }),
   osm:       L.tileLayer(TILES.osm.url,       { attribution: TILES.osm.attr,       maxZoom: 19 }),
   satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 })
 };
 
 const overlayLayers = {
-  oceanRef: L.tileLayer(TILES.oceanRef.url, { attribution: TILES.oceanRef.attr, maxZoom: 17, opacity: 1.0 }),
+  oceanRef: L.tileLayer(TILES.oceanRef.url, { attribution: TILES.oceanRef.attr, maxZoom: 19, maxNativeZoom: 13, opacity: 1.0 }),
   seamark:  L.tileLayer(TILES.seamark.url,  { attribution: TILES.seamark.attr,  maxZoom: 18, opacity: 0.9 })
 };
 

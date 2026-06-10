@@ -1,5 +1,5 @@
 /* Service Worker — Lake Texoma Nav */
-const STATIC_CACHE = 'ltn-static-v2';
+const STATIC_CACHE = 'ltn-static-v3';
 const TILE_CACHE   = 'ltn-tiles-v1';
 
 const STATIC_ASSETS = [
