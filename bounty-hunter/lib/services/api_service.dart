@@ -301,18 +301,19 @@ class TornApiService {
         final decoded = jsonDecode(res.body);
 
         // Check for error object
-        if (decoded is Map<String, dynamic> &&
-            decoded.containsKey('error')) {
-          final err = decoded['error'] as Map<String, dynamic>;
-          final code = (err['code'] as num?)?.toInt();
-          throw TornApiException(
-              err['error'] as String? ?? 'API error', code: code);
+        if (decoded is Map && (decoded as Map).containsKey('error')) {
+          final err = decoded['error'];
+          if (err is Map) {
+            final code = (err['code'] as num?)?.toInt();
+            throw TornApiException(
+                err['error'] as String? ?? 'API error', code: code);
+          }
         }
 
         // v2 market returns top-level array; v1/wrapped uses a key
         final dynamic rawData = decoded is List
             ? decoded
-            : (decoded is Map ? decoded[path] : null);
+            : (decoded is Map ? (decoded as Map)[path] : null);
 
         _parseMarketListings(rawData, listings);
         fetchError = null;
@@ -334,22 +335,30 @@ class TornApiService {
     );
   }
 
-  static void _parseMarketListings(
-      dynamic rawData, List<MarketListing> out) {
-    Iterable<dynamic> entries;
+  static void _parseMarketListings(dynamic rawData, List<MarketListing> out) {
+    if (rawData == null) return;
     if (rawData is List) {
-      entries = rawData;
+      for (final e in rawData) {
+        if (e is Map) {
+          final price = (e['cost'] as num?)?.toInt() ??
+              (e['price'] as num?)?.toInt() ?? 0;
+          final qty = (e['quantity'] as num?)?.toInt() ?? 1;
+          if (price > 0) out.add(MarketListing(price: price, quantity: qty));
+        } else if (e is List) {
+          _parseMarketListings(e, out); // handle nested lists
+        }
+      }
     } else if (rawData is Map) {
-      entries = (rawData as Map).values;
-    } else {
-      return;
-    }
-    for (final e in entries) {
-      final m = e as Map<String, dynamic>;
-      final price = (m['cost'] as num?)?.toInt() ??
-          (m['price'] as num?)?.toInt() ?? 0;
-      final qty = (m['quantity'] as num?)?.toInt() ?? 1;
-      if (price > 0) out.add(MarketListing(price: price, quantity: qty));
+      for (final v in rawData.values) {
+        if (v is Map) {
+          final price = (v['cost'] as num?)?.toInt() ??
+              (v['price'] as num?)?.toInt() ?? 0;
+          final qty = (v['quantity'] as num?)?.toInt() ?? 1;
+          if (price > 0) out.add(MarketListing(price: price, quantity: qty));
+        } else if (v is List || v is Map) {
+          _parseMarketListings(v, out); // handle nested structures
+        }
+      }
     }
   }
 
