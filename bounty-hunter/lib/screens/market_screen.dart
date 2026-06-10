@@ -22,6 +22,20 @@ String _timeAgo(DateTime dt) {
   return '${diff.inDays}d ago';
 }
 
+double? _periodPct(List<PricePoint> history, int currentPrice, int lookbackSec) {
+  if (currentPrice <= 0 || history.length < 2) return null;
+  final cutoff = DateTime.now().millisecondsSinceEpoch ~/ 1000 - lookbackSec;
+  PricePoint? ref;
+  for (final p in history.reversed) {
+    if (p.timestamp <= cutoff) {
+      ref = p;
+      break;
+    }
+  }
+  if (ref == null || ref.price <= 0) return null;
+  return (currentPrice - ref.price) / ref.price * 100;
+}
+
 // ── Screen ─────────────────────────────────────────────────
 
 class MarketScreen extends StatefulWidget {
@@ -321,7 +335,7 @@ class _WatchlistView extends StatelessWidget {
   }
 }
 
-class _WatchedItemCard extends StatelessWidget {
+class _WatchedItemCard extends StatefulWidget {
   final WatchedItem item;
   final LiveItemData? live;
   final List<PricePoint> history;
@@ -337,11 +351,56 @@ class _WatchedItemCard extends StatelessWidget {
   });
 
   @override
+  State<_WatchedItemCard> createState() => _WatchedItemCardState();
+}
+
+class _WatchedItemCardState extends State<_WatchedItemCard> {
+  Color? _flashBg;
+
+  @override
+  void didUpdateWidget(_WatchedItemCard old) {
+    super.didUpdateWidget(old);
+    final newP = widget.live?.cheapestPrice ?? 0;
+    final oldP = old.live?.cheapestPrice ?? 0;
+    if (newP > 0 && oldP > 0 && newP != oldP) {
+      setState(() {
+        _flashBg = newP < oldP ? const Color(0xFF4CAF50) : const Color(0xFFEF5350);
+      });
+      Future.delayed(const Duration(milliseconds: 1200), () {
+        if (mounted) setState(() => _flashBg = null);
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final item = widget.item;
+    final live = widget.live;
+    final history = widget.history;
+    final isRefreshing = widget.isRefreshing;
+    final market = widget.market;
+
     final cheapest = live?.cheapestPrice ?? 0;
     final mv = item.marketValue;
-    final pctVsMv =
-        mv > 0 && cheapest > 0 ? ((cheapest - mv) / mv * 100) : null;
+    final pctVsMv = mv > 0 && cheapest > 0 ? ((cheapest - mv) / mv * 100) : null;
+
+    final threshold = item.alertThreshold;
+    final isTriggered = threshold != null &&
+        cheapest > 0 &&
+        (item.alertAbove ? cheapest >= threshold : cheapest <= threshold);
+
+    final pct1h = _periodPct(history, cheapest, 3600);
+    final pct24h = _periodPct(history, cheapest, 86400);
+    final cheapestQty =
+        live != null && live.listings.isNotEmpty ? live.listings.first.quantity : null;
+
+    final borderColor = isTriggered ? Colors.amber : const Color(0xFF4CAF50);
+    Color cardBg = const Color(0xFF1E1E1E);
+    if (isTriggered) {
+      cardBg = Color.alphaBlend(Colors.amber.withAlpha(18), cardBg);
+    } else if (_flashBg != null) {
+      cardBg = Color.alphaBlend(_flashBg!.withAlpha(28), cardBg);
+    }
 
     return Dismissible(
       key: Key('watched_${item.id}'),
@@ -364,18 +423,20 @@ class _WatchedItemCard extends StatelessWidget {
           ),
         );
       },
-      child: Container(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 400),
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E1E1E),
+          color: cardBg,
           borderRadius: BorderRadius.circular(12),
-          border: const Border(
-            left: BorderSide(color: Color(0xFF4CAF50), width: 3),
+          border: Border(
+            left: BorderSide(color: borderColor, width: 3),
           ),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Name row
             Row(
               children: [
                 Expanded(
@@ -400,17 +461,19 @@ class _WatchedItemCard extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.all(6),
                     decoration: BoxDecoration(
-                      color: item.alertThreshold != null
-                          ? const Color(0xFF4CAF50).withAlpha(30)
+                      color: threshold != null
+                          ? (isTriggered
+                              ? Colors.amber.withAlpha(40)
+                              : const Color(0xFF4CAF50).withAlpha(30))
                           : Colors.transparent,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Icon(
-                      item.alertThreshold != null
+                      threshold != null
                           ? Icons.notifications_active
                           : Icons.notifications_none,
-                      color: item.alertThreshold != null
-                          ? const Color(0xFF4CAF50)
+                      color: threshold != null
+                          ? (isTriggered ? Colors.amber : const Color(0xFF4CAF50))
                           : const Color(0xFF666666),
                       size: 20,
                     ),
@@ -419,54 +482,83 @@ class _WatchedItemCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
+            // Price row
             Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (isRefreshing && live == null)
-                  const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Color(0xFF4CAF50),
-                    ),
-                  )
-                else if (cheapest > 0) ...[
-                  Text(
-                    _fmt(cheapest),
-                    style: const TextStyle(
-                      color: Color(0xFF4CAF50),
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (isRefreshing && live == null)
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Color(0xFF4CAF50),
+                          ),
+                        )
+                      else if (cheapest > 0) ...[
+                        Row(
+                          children: [
+                            Text(
+                              _fmt(cheapest),
+                              style: const TextStyle(
+                                color: Color(0xFF4CAF50),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            if (pctVsMv != null) _PctBadge(pct: pctVsMv),
+                          ],
+                        ),
+                        const SizedBox(height: 2),
+                        _SubLine(
+                          cheapestQty: cheapestQty,
+                          pct1h: pct1h,
+                          pct24h: pct24h,
+                        ),
+                      ] else
+                        const Text('—',
+                            style: TextStyle(color: Color(0xFF666666), fontSize: 16)),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  if (pctVsMv != null) _PctBadge(pct: pctVsMv),
-                ] else
-                  const Text('—',
-                      style: TextStyle(color: Color(0xFF666666), fontSize: 16)),
-                const Spacer(),
-                if (history.length >= 2) _Sparkline(history: history),
+                ),
+                if (history.length >= 2)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: _Sparkline(history: history),
+                  ),
               ],
             ),
             if (live != null) ...[
               const SizedBox(height: 4),
               Text(
-                'Updated ${_timeAgo(live!.fetchedAt)}',
+                'Updated ${_timeAgo(live.fetchedAt)}',
                 style: const TextStyle(color: Color(0xFF444444), fontSize: 10),
               ),
             ],
-            if (item.alertThreshold != null)
+            if (threshold != null)
               Padding(
                 padding: const EdgeInsets.only(top: 5),
                 child: Row(
                   children: [
-                    const Icon(Icons.alarm, color: Color(0xFF4CAF50), size: 12),
+                    Icon(
+                      isTriggered ? Icons.alarm_on : Icons.alarm,
+                      color: isTriggered ? Colors.amber : const Color(0xFF4CAF50),
+                      size: 12,
+                    ),
                     const SizedBox(width: 4),
                     Text(
-                      'Alert ≤ ${_fmt(item.alertThreshold!)}',
-                      style: const TextStyle(
-                          color: Color(0xFF4CAF50), fontSize: 11),
+                      '${item.alertAbove ? 'Alert ≥' : 'Alert ≤'} ${_fmt(threshold)}'
+                      '${isTriggered ? ' — TRIGGERED' : ''}',
+                      style: TextStyle(
+                        color: isTriggered ? Colors.amber : const Color(0xFF4CAF50),
+                        fontSize: 11,
+                        fontWeight: isTriggered ? FontWeight.bold : FontWeight.normal,
+                      ),
                     ),
                   ],
                 ),
@@ -479,60 +571,188 @@ class _WatchedItemCard extends StatelessWidget {
 
   void _showAlertDialog(BuildContext context) {
     final ctrl = TextEditingController(
-      text: item.alertThreshold?.toString() ?? '',
+      text: widget.item.alertThreshold?.toString() ?? '',
     );
+    bool alertAbove = widget.item.alertAbove;
+
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF1E1E1E),
-        title: Text('Price alert — ${item.name}'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Notify when cheapest listing drops to or below:',
-              style: TextStyle(color: Color(0xFF888888), fontSize: 13),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: ctrl,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                hintText: 'Price in \$',
-                hintStyle: TextStyle(color: Color(0xFF666666)),
-                prefixText: '\$ ',
-                prefixStyle: TextStyle(color: Color(0xFF4CAF50)),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: Text('Price alert — ${widget.item.name}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Alert direction:',
+                style: TextStyle(color: Color(0xFF888888), fontSize: 12),
               ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => setDialogState(() => alertAbove = false),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        padding: const EdgeInsets.symmetric(vertical: 9),
+                        decoration: BoxDecoration(
+                          color: !alertAbove
+                              ? const Color(0xFF4CAF50).withAlpha(30)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: !alertAbove
+                                ? const Color(0xFF4CAF50)
+                                : const Color(0xFF444444),
+                          ),
+                        ),
+                        child: Text(
+                          '↓  Below',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: !alertAbove
+                                ? const Color(0xFF4CAF50)
+                                : const Color(0xFF888888),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => setDialogState(() => alertAbove = true),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        padding: const EdgeInsets.symmetric(vertical: 9),
+                        decoration: BoxDecoration(
+                          color: alertAbove
+                              ? const Color(0xFFEF5350).withAlpha(30)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: alertAbove
+                                ? const Color(0xFFEF5350)
+                                : const Color(0xFF444444),
+                          ),
+                        ),
+                        child: Text(
+                          '↑  Above',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: alertAbove
+                                ? const Color(0xFFEF5350)
+                                : const Color(0xFF888888),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'Price threshold:',
+                style: TextStyle(color: Color(0xFF888888), fontSize: 12),
+              ),
+              const SizedBox(height: 6),
+              TextField(
+                controller: ctrl,
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  hintText: 'Price in \$',
+                  hintStyle: TextStyle(color: Color(0xFF666666)),
+                  prefixText: '\$ ',
+                  prefixStyle: TextStyle(color: Color(0xFF4CAF50)),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            if (widget.item.alertThreshold != null)
+              TextButton(
+                onPressed: () {
+                  widget.market.setAlertThreshold(widget.item.id, null);
+                  Navigator.pop(context);
+                },
+                child:
+                    const Text('Clear', style: TextStyle(color: Color(0xFFEF5350))),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final v = int.tryParse(ctrl.text);
+                if (v != null && v > 0) {
+                  widget.market
+                      .setAlertThreshold(widget.item.id, v, alertAbove: alertAbove);
+                }
+                Navigator.pop(context);
+              },
+              child: const Text('Save'),
             ),
           ],
         ),
-        actions: [
-          if (item.alertThreshold != null)
-            TextButton(
-              onPressed: () {
-                market.setAlertThreshold(item.id, null);
-                Navigator.pop(context);
-              },
-              child: const Text('Clear', style: TextStyle(color: Color(0xFFEF5350))),
-            ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              final v = int.tryParse(ctrl.text);
-              if (v != null && v > 0) market.setAlertThreshold(item.id, v);
-              Navigator.pop(context);
-            },
-            child: const Text('Save'),
-          ),
-        ],
       ),
     );
+  }
+}
+
+class _SubLine extends StatelessWidget {
+  final int? cheapestQty;
+  final double? pct1h;
+  final double? pct24h;
+
+  const _SubLine({this.cheapestQty, this.pct1h, this.pct24h});
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = <Widget>[];
+
+    if (cheapestQty != null && cheapestQty! > 0) {
+      parts.add(Text(
+        'Qty $cheapestQty',
+        style: const TextStyle(
+          color: Color(0xFF4FC3F7),
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+        ),
+      ));
+    }
+
+    void addPct(double pct, String label) {
+      if (parts.isNotEmpty) {
+        parts.add(const Text(
+          '  ·  ',
+          style: TextStyle(color: Color(0xFF444444), fontSize: 10),
+        ));
+      }
+      final isDown = pct < 0;
+      parts.add(Text(
+        '$label: ${isDown ? '' : '+'}${pct.toStringAsFixed(1)}%',
+        style: TextStyle(
+          color: isDown ? const Color(0xFF4CAF50) : const Color(0xFFEF5350),
+          fontSize: 10,
+        ),
+      ));
+    }
+
+    if (pct1h != null) addPct(pct1h!, '1h');
+    if (pct24h != null) addPct(pct24h!, '24h');
+
+    if (parts.isEmpty) return const SizedBox.shrink();
+    return Row(children: parts);
   }
 }
 

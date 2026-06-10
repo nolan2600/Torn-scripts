@@ -36,15 +36,36 @@ class MarketProvider extends ChangeNotifier {
   bool flipLoading = false;
 
   bool _disposed = false;
+  Timer? _autoRefreshTimer;
+  final Set<int> _triggeredItems = {};
 
   void onSettingsChanged() {
     _api.apiKey = _settings.tornKey;
+    _startAutoRefresh();
   }
 
   @override
   void dispose() {
+    _stopAutoRefresh();
     _disposed = true;
     super.dispose();
+  }
+
+  // ── Auto-refresh timer ─────────────────────────────────────
+  void _startAutoRefresh() {
+    _stopAutoRefresh();
+    final intervalSec = _settings.settings.marketRefreshSec;
+    if (intervalSec <= 0) return;
+    _autoRefreshTimer = Timer.periodic(Duration(seconds: intervalSec), (_) {
+      if (!_disposed && _settings.hasKey && watchedItems.isNotEmpty) {
+        refreshWatchlist();
+      }
+    });
+  }
+
+  void _stopAutoRefresh() {
+    _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = null;
   }
 
   // ── Startup load ───────────────────────────────────────────
@@ -53,6 +74,7 @@ class MarketProvider extends ChangeNotifier {
     _loadWatchedItems();
     _loadPriceHistory();
     _loadItemsCache();
+    _startAutoRefresh();
     if (!_disposed) notifyListeners();
   }
 
@@ -133,7 +155,6 @@ class MarketProvider extends ChangeNotifier {
         .where((i) => i.name.toLowerCase().contains(q))
         .toList()
       ..sort((a, b) {
-        // Exact prefix matches first
         final aStart = a.name.toLowerCase().startsWith(q);
         final bStart = b.name.toLowerCase().startsWith(q);
         if (aStart && !bStart) return -1;
@@ -164,11 +185,12 @@ class MarketProvider extends ChangeNotifier {
   void removeFromWatchlist(int id) {
     watchedItems = watchedItems.where((w) => w.id != id).toList();
     liveData.remove(id);
+    _triggeredItems.remove(id);
     _saveWatchedItems();
     notifyListeners();
   }
 
-  void setAlertThreshold(int itemId, int? threshold) {
+  void setAlertThreshold(int itemId, int? threshold, {bool alertAbove = false}) {
     watchedItems = watchedItems.map((w) {
       if (w.id != itemId) return w;
       return WatchedItem(
@@ -177,8 +199,10 @@ class MarketProvider extends ChangeNotifier {
         type: w.type,
         marketValue: w.marketValue,
         alertThreshold: threshold,
+        alertAbove: alertAbove,
       );
     }).toList();
+    _triggeredItems.remove(itemId);
     _saveWatchedItems();
     notifyListeners();
   }
@@ -202,7 +226,7 @@ class MarketProvider extends ChangeNotifier {
       if (_disposed) break;
       LiveItemData? data;
       try {
-        data = await _api.fetchItemMarket(item.id);
+        data = await _api.fetchItemMarket(item.id, limitOne: true);
       } catch (e) {
         marketError = e.toString()
             .replaceFirst('TornApiException: ', '')
@@ -219,17 +243,27 @@ class MarketProvider extends ChangeNotifier {
       if (pts.length > 50) pts.removeRange(0, pts.length - 50);
       priceHistory[item.id] = pts;
 
-      // Price alert check
+      // Price alert — only notify on transition into triggered state
       final threshold = item.alertThreshold;
-      if (threshold != null &&
-          data.cheapestPrice > 0 &&
-          data.cheapestPrice <= threshold) {
-        NotificationService.instance.showPriceAlert(
-          itemId: item.id,
-          itemName: item.name,
-          price: data.cheapestPrice,
-          threshold: threshold,
-        );
+      if (threshold != null && data.cheapestPrice > 0) {
+        final triggered = item.alertAbove
+            ? data.cheapestPrice >= threshold
+            : data.cheapestPrice <= threshold;
+        final wasTriggered = _triggeredItems.contains(item.id);
+        if (triggered && !wasTriggered) {
+          _triggeredItems.add(item.id);
+          NotificationService.instance.showPriceAlert(
+            itemId: item.id,
+            itemName: item.name,
+            price: data.cheapestPrice,
+            threshold: threshold,
+            alertAbove: item.alertAbove,
+          );
+        } else if (!triggered) {
+          _triggeredItems.remove(item.id);
+        }
+      } else {
+        _triggeredItems.remove(item.id);
       }
 
       if (!_disposed) notifyListeners();

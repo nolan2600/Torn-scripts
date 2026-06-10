@@ -33,6 +33,7 @@ class WatchedItem {
   final String type;
   final int marketValue;
   final int? alertThreshold;
+  final bool alertAbove;
 
   const WatchedItem({
     required this.id,
@@ -40,6 +41,7 @@ class WatchedItem {
     required this.type,
     required this.marketValue,
     this.alertThreshold,
+    this.alertAbove = false,
   });
 
   factory WatchedItem.fromJson(Map<String, dynamic> j) => WatchedItem(
@@ -48,6 +50,7 @@ class WatchedItem {
         type: j['type'] as String? ?? '',
         marketValue: (j['market_value'] as num?)?.toInt() ?? 0,
         alertThreshold: (j['alert_threshold'] as num?)?.toInt(),
+        alertAbove: j['alert_above'] as bool? ?? false,
       );
 
   Map<String, dynamic> toJson() => {
@@ -56,6 +59,7 @@ class WatchedItem {
         'type': type,
         'market_value': marketValue,
         if (alertThreshold != null) 'alert_threshold': alertThreshold,
+        if (alertAbove) 'alert_above': alertAbove,
       };
 
   static List<WatchedItem> listFromJson(String raw) {

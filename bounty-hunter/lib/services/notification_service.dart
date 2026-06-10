@@ -149,11 +149,18 @@ class NotificationService {
     required String itemName,
     required int price,
     required int threshold,
+    bool alertAbove = false,
   }) async {
+    final title = alertAbove
+        ? '📈 $itemName price spike!'
+        : '💰 $itemName price drop!';
+    final body = alertAbove
+        ? 'Now ${_fmt(price)} — above your alert of ${_fmt(threshold)}'
+        : 'Now ${_fmt(price)} — below your alert of ${_fmt(threshold)}';
     await _plugin.show(
       500000 + itemId,
-      '💰 $itemName price drop!',
-      'Now ${_fmt(price)} — below your alert of ${_fmt(threshold)}',
+      title,
+      body,
       NotificationDetails(
         android: AndroidNotificationDetails(
           _marketChannelId,

@@ -21,6 +21,7 @@ class AppSettings {
   final bool hospAlerts;
   final bool hideWarTargets;
   final bool markedAlerts;
+  final int marketRefreshSec;
 
   const AppSettings({
     this.minPrice = 500000,
@@ -34,6 +35,7 @@ class AppSettings {
     this.hospAlerts = false,
     this.hideWarTargets = false,
     this.markedAlerts = false,
+    this.marketRefreshSec = 0,
   });
 
   static const AppSettings defaults = AppSettings();
@@ -50,6 +52,7 @@ class AppSettings {
     bool? hospAlerts,
     bool? hideWarTargets,
     bool? markedAlerts,
+    int? marketRefreshSec,
   }) =>
       AppSettings(
         minPrice: minPrice ?? this.minPrice,
@@ -63,6 +66,7 @@ class AppSettings {
         hospAlerts: hospAlerts ?? this.hospAlerts,
         hideWarTargets: hideWarTargets ?? this.hideWarTargets,
         markedAlerts: markedAlerts ?? this.markedAlerts,
+        marketRefreshSec: marketRefreshSec ?? this.marketRefreshSec,
       );
 
   Map<String, dynamic> toJson() => {
@@ -77,6 +81,7 @@ class AppSettings {
         'hospAlerts': hospAlerts,
         'hideWarTargets': hideWarTargets,
         'markedAlerts': markedAlerts,
+        'marketRefreshSec': marketRefreshSec,
       };
 
   String toJsonString() => jsonEncode(toJson());
@@ -96,6 +101,7 @@ class AppSettings {
         hospAlerts: j['hospAlerts'] as bool? ?? false,
         hideWarTargets: j['hideWarTargets'] as bool? ?? false,
         markedAlerts: j['markedAlerts'] as bool? ?? false,
+        marketRefreshSec: (j['marketRefreshSec'] as num?)?.toInt() ?? 0,
       );
 
   factory AppSettings.fromJsonString(String s) =>

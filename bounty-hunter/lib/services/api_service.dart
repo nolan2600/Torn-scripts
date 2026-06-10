@@ -285,15 +285,19 @@ class TornApiService {
     return result;
   }
 
-  Future<LiveItemData?> fetchItemMarket(int itemId) async {
+  Future<LiveItemData?> fetchItemMarket(int itemId, {bool limitOne = false}) async {
     final listings = <MarketListing>[];
     String? fetchError;
 
     for (final path in ['itemmarket', 'bazaar']) {
       try {
         await _rateLimit();
-        final uri = Uri.parse(
-            '$_tornBase/market/$itemId/$path?key=$apiKey');
+        final uri = Uri.parse('$_tornBase/market/$itemId/$path').replace(
+          queryParameters: {
+            'key': apiKey,
+            if (limitOne) 'limit': '1',
+          },
+        );
         final res = await http.get(uri).timeout(const Duration(seconds: 20));
         if (res.statusCode < 200 || res.statusCode >= 300) {
           throw TornApiException('HTTP ${res.statusCode}');

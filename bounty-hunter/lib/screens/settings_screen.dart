@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import '../models/app_settings.dart';
 import '../providers/settings_provider.dart';
 import '../providers/hunter_provider.dart';
+import '../providers/market_provider.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
 
@@ -278,7 +279,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _Card(
             children: [
               _DropdownField<int>(
-                label: 'Refresh interval',
+                label: 'Bounty board refresh interval',
                 value: s.refreshSec,
                 items: const [
                   (30, 'Every 30 seconds'),
@@ -295,6 +296,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const _Hint(
                   '60 seconds is safely under the Torn API rate limit.'),
+              const SizedBox(height: 14),
+              const Divider(color: Color(0xFF2A2A2A)),
+              const SizedBox(height: 14),
+              _DropdownField<int>(
+                label: 'Market Watch auto-refresh',
+                value: s.marketRefreshSec,
+                items: const [
+                  (0, 'Off (manual only)'),
+                  (60, 'Every 1 minute'),
+                  (120, 'Every 2 minutes'),
+                  (300, 'Every 5 minutes'),
+                  (600, 'Every 10 minutes'),
+                ],
+                onChanged: (v) {
+                  _updateSettings(s.copyWith(marketRefreshSec: v));
+                  context.read<MarketProvider>().onSettingsChanged();
+                },
+              ),
             ],
           ),
 
