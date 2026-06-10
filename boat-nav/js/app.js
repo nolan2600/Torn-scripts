@@ -11,6 +11,14 @@ const STORAGE_KEYS = { waypoints: 'ltn_waypoints', tracks: 'ltn_tracks' };
 
 // ── Tile URLs ──────────────────────────────────────────────
 const TILES = {
+  ocean: {
+    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',
+    attr: '© Esri, GEBCO, NOAA, NGA, BODC — depth contours'
+  },
+  oceanRef: {
+    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',
+    attr: '© Esri'
+  },
   osm: {
     url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attr: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
@@ -19,16 +27,8 @@ const TILES = {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attr: '© Esri, Maxar, Earthstar Geographics'
   },
-  topo: {
-    url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-    attr: '© <a href="https://opentopomap.org">OpenTopoMap</a> contributors'
-  },
   seamark: {
     url: 'https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',
-    attr: '© <a href="https://www.openseamap.org">OpenSeaMap</a>'
-  },
-  depth: {
-    url: 'https://tiles.openseamap.org/depth/{z}/{x}/{y}.png',
     attr: '© <a href="https://www.openseamap.org">OpenSeaMap</a>'
   }
 };
@@ -59,19 +59,19 @@ const map = L.map('map', {
 });
 
 const baseLayers = {
+  ocean:     L.tileLayer(TILES.ocean.url,     { attribution: TILES.ocean.attr,     maxZoom: 17 }),
   osm:       L.tileLayer(TILES.osm.url,       { attribution: TILES.osm.attr,       maxZoom: 19 }),
-  satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 }),
-  topo:      L.tileLayer(TILES.topo.url,      { attribution: TILES.topo.attr,       maxZoom: 17 })
+  satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 })
 };
 
 const overlayLayers = {
-  seamark: L.tileLayer(TILES.seamark.url, { attribution: TILES.seamark.attr, maxZoom: 18, opacity: 0.9 }),
-  depth:   L.tileLayer(TILES.depth.url,   { attribution: TILES.depth.attr,   maxZoom: 18, opacity: 0.75 })
+  oceanRef: L.tileLayer(TILES.oceanRef.url, { attribution: TILES.oceanRef.attr, maxZoom: 17, opacity: 1.0 }),
+  seamark:  L.tileLayer(TILES.seamark.url,  { attribution: TILES.seamark.attr,  maxZoom: 18, opacity: 0.9 })
 };
 
-baseLayers.osm.addTo(map);
+baseLayers.ocean.addTo(map);
+overlayLayers.oceanRef.addTo(map);
 overlayLayers.seamark.addTo(map);
-overlayLayers.depth.addTo(map);
 
 // ── Leaflet Groups ─────────────────────────────────────────
 const gpsLayer       = L.layerGroup().addTo(map);
@@ -475,14 +475,24 @@ function setupLayerControls() {
     radio.addEventListener('change', e => {
       Object.values(baseLayers).forEach(l => map.removeLayer(l));
       baseLayers[e.target.value].addTo(map);
+      // Ocean reference layer only makes sense on ocean base
+      if (e.target.value === 'ocean') {
+        overlayLayers.oceanRef.addTo(map);
+        document.getElementById('layer-oceanref').checked = true;
+        document.getElementById('layer-oceanref').closest('.layer-row').style.opacity = '1';
+      } else {
+        map.removeLayer(overlayLayers.oceanRef);
+        document.getElementById('layer-oceanref').checked = false;
+        document.getElementById('layer-oceanref').closest('.layer-row').style.opacity = '.4';
+      }
     });
   });
 
+  document.getElementById('layer-oceanref').addEventListener('change', e => {
+    e.target.checked ? overlayLayers.oceanRef.addTo(map) : map.removeLayer(overlayLayers.oceanRef);
+  });
   document.getElementById('layer-seamark').addEventListener('change', e => {
     e.target.checked ? overlayLayers.seamark.addTo(map) : map.removeLayer(overlayLayers.seamark);
-  });
-  document.getElementById('layer-depth').addEventListener('change', e => {
-    e.target.checked ? overlayLayers.depth.addTo(map) : map.removeLayer(overlayLayers.depth);
   });
   document.getElementById('layer-waypoints').addEventListener('change', e => {
     e.target.checked ? waypointLayer.addTo(map) : map.removeLayer(waypointLayer);
