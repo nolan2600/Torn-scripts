@@ -1,5 +1,5 @@
 /* Service Worker — Lake Texoma Nav */
-const STATIC_CACHE = 'ltn-static-v3';
+const STATIC_CACHE = 'ltn-static-v4';
 const TILE_CACHE   = 'ltn-tiles-v1';
 
 const STATIC_ASSETS = [
@@ -17,7 +17,7 @@ const TILE_HOSTS = [
   'tiles.openseamap.org',
   'server.arcgisonline.com',
   'services.arcgisonline.com',
-  'tile.opentopomap.org'
+  'seamlessrnc.nauticalcharts.noaa.gov'
 ];
 
 self.addEventListener('install', event => {
