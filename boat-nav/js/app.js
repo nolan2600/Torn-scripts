@@ -11,21 +11,18 @@ const STORAGE_KEYS = { waypoints: 'ltn_waypoints', tracks: 'ltn_tracks' };
 
 // ── Tile URLs ──────────────────────────────────────────────
 const TILES = {
-  noaa: {
-    url: 'https://seamlessrnc.nauticalcharts.noaa.gov/arcgis/rest/services/RNC/NOAA_RNC/ImageServer/tile/{z}/{y}/{x}',
-    attr: '© NOAA Office of Coast Survey — Nautical Charts'
-  },
   satellite: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attr: '© Esri, Maxar, Earthstar Geographics'
   },
+  topo: {
+    // USGS National Map — shows reservoir depth contours for Army Corps lakes
+    url: 'https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}',
+    attr: '© USGS National Map'
+  },
   osm: {
     url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attr: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-  },
-  ocean: {
-    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',
-    attr: '© Esri, GEBCO, NOAA — depth contours'
   },
   seamark: {
     url: 'https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',
@@ -59,17 +56,16 @@ const map = L.map('map', {
 });
 
 const baseLayers = {
-  noaa:      L.tileLayer(TILES.noaa.url,      { attribution: TILES.noaa.attr,      maxZoom: 19, maxNativeZoom: 16 }),
   satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 }),
+  topo:      L.tileLayer(TILES.topo.url,      { attribution: TILES.topo.attr,      maxZoom: 19, maxNativeZoom: 16 }),
   osm:       L.tileLayer(TILES.osm.url,       { attribution: TILES.osm.attr,       maxZoom: 19 })
 };
 
 const overlayLayers = {
-  ocean:   L.tileLayer(TILES.ocean.url,   { attribution: TILES.ocean.attr,   maxZoom: 19, maxNativeZoom: 10, opacity: 0.55 }),
   seamark: L.tileLayer(TILES.seamark.url, { attribution: TILES.seamark.attr, maxZoom: 18, opacity: 0.9 })
 };
 
-baseLayers.noaa.addTo(map);
+baseLayers.satellite.addTo(map);
 overlayLayers.seamark.addTo(map);
 
 // ── Leaflet Groups ─────────────────────────────────────────
@@ -476,10 +472,6 @@ function setupLayerControls() {
       baseLayers[e.target.value].addTo(map);
     });
   });
-
-  document.getElementById('layer-ocean').addEventListener('change', e => {
-    e.target.checked ? overlayLayers.ocean.addTo(map) : map.removeLayer(overlayLayers.ocean);
-  });
   document.getElementById('layer-seamark').addEventListener('change', e => {
     e.target.checked ? overlayLayers.seamark.addTo(map) : map.removeLayer(overlayLayers.seamark);
   });
@@ -626,8 +618,9 @@ function saveJSON(key, val) {
 }
 
 // ── Service Worker Registration ────────────────────────────
+// Unregister any old service workers so updates always come through immediately
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.unregister()));
 }
 
 // ── Boot ───────────────────────────────────────────────────
