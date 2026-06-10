@@ -291,13 +291,34 @@ class TornApiService {
 
     for (final path in ['itemmarket', 'bazaar']) {
       try {
-        final data = await _get(
+        await _rateLimit();
+        final uri = Uri.parse(
             '$_tornBase/market/$itemId/$path?key=$apiKey');
-        final rawData = data[path];
+        final res = await http.get(uri).timeout(const Duration(seconds: 20));
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          throw TornApiException('HTTP ${res.statusCode}');
+        }
+        final decoded = jsonDecode(res.body);
+
+        // Check for error object
+        if (decoded is Map<String, dynamic> &&
+            decoded.containsKey('error')) {
+          final err = decoded['error'] as Map<String, dynamic>;
+          final code = (err['code'] as num?)?.toInt();
+          throw TornApiException(
+              err['error'] as String? ?? 'API error', code: code);
+        }
+
+        // v2 market returns top-level array; v1/wrapped uses a key
+        final dynamic rawData = decoded is List
+            ? decoded
+            : (decoded is Map ? decoded[path] : null);
+
         _parseMarketListings(rawData, listings);
-        fetchError = null; // at least one succeeded
+        fetchError = null;
       } catch (e) {
-        fetchError ??= e.toString().replaceFirst('TornApiException: ', '');
+        fetchError ??=
+            e.toString().replaceFirst('TornApiException: ', '');
       }
     }
 
