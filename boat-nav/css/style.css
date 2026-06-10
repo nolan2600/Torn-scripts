@@ -1,0 +1,413 @@
+/* ── Reset & Base ─────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-dark:    #0a1628;
+  --bg-mid:     #0f2040;
+  --bg-panel:   #111e33;
+  --accent:     #1e8fff;
+  --accent-dim: #155aa0;
+  --text:       #d4e8ff;
+  --text-dim:   #6a90b8;
+  --danger:     #e63946;
+  --warn:       #f4a261;
+  --green:      #2dc653;
+  --toolbar-h:  68px;
+  --gps-bar-h:  40px;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--bg-dark);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ── GPS Status Bar ───────────────────────────── */
+#gps-bar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: var(--gps-bar-h);
+  background: var(--bg-dark);
+  border-bottom: 1px solid #1a3050;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  gap: 14px;
+  z-index: 1000;
+  user-select: none;
+}
+
+.gps-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.bar-label { color: var(--text-dim); font-size: 10px; letter-spacing: .05em; }
+.bar-unit  { color: var(--text-dim); font-size: 10px; }
+
+#gps-label { font-size: 11px; color: var(--text-dim); }
+
+.dot {
+  display: inline-block;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+}
+.dot-searching { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.dot-locked    { background: var(--green); }
+.dot-error     { background: var(--danger); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: .3; }
+}
+
+/* ── Map ──────────────────────────────────────── */
+#map {
+  position: fixed;
+  top: var(--gps-bar-h);
+  left: 0; right: 0;
+  bottom: var(--toolbar-h);
+  z-index: 1;
+}
+
+/* Leaflet attribution */
+.leaflet-control-attribution {
+  font-size: 9px !important;
+  background: rgba(10,22,40,.75) !important;
+  color: #6a90b8 !important;
+}
+.leaflet-control-attribution a { color: #3a8fd0 !important; }
+
+.leaflet-control-zoom a {
+  background: var(--bg-mid) !important;
+  color: var(--text) !important;
+  border-color: #1a3050 !important;
+}
+
+/* ── Toolbar ──────────────────────────────────── */
+#toolbar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: var(--toolbar-h);
+  background: var(--bg-dark);
+  border-top: 1px solid #1a3050;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  z-index: 1000;
+  padding: 0 4px;
+}
+
+.tool-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: 10px;
+  transition: background .15s, color .15s;
+  min-width: 56px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tool-btn svg {
+  width: 22px; height: 22px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tool-btn:active, .tool-btn.active {
+  color: var(--accent);
+  background: rgba(30,143,255,.1);
+}
+
+.tool-btn.recording {
+  color: var(--danger);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ── Panels ───────────────────────────────────── */
+.panel {
+  position: fixed;
+  bottom: var(--toolbar-h);
+  left: 0; right: 0;
+  max-height: 60vh;
+  background: var(--bg-panel);
+  border-top: 1px solid #1a3050;
+  border-radius: 14px 14px 0 0;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  transition: transform .25s ease;
+}
+
+.panel.hidden { display: none; }
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  font-size: 15px;
+  font-weight: 600;
+  border-bottom: 1px solid #1a3050;
+  flex-shrink: 0;
+}
+
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel-action-btn {
+  background: var(--accent-dim);
+  color: var(--text);
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.panel-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+}
+
+.panel-body {
+  overflow-y: auto;
+  padding: 12px 16px 16px;
+  flex: 1;
+}
+
+/* ── Layer Controls ───────────────────────────── */
+.layer-group { margin-bottom: 14px; }
+.layer-group-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  font-size: 14px;
+  cursor: pointer;
+  border-bottom: 1px solid #1a3050;
+}
+.layer-row:last-child { border-bottom: none; }
+.layer-row input { accent-color: var(--accent); width: 16px; height: 16px; }
+
+/* ── Waypoints List ───────────────────────────── */
+.wpt-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid #1a3050;
+}
+.wpt-item:last-child { border-bottom: none; }
+
+.wpt-icon { font-size: 18px; }
+.wpt-info { flex: 1; }
+.wpt-name { font-size: 14px; font-weight: 600; }
+.wpt-coords { font-size: 11px; color: var(--text-dim); }
+
+.wpt-actions { display: flex; gap: 6px; }
+.wpt-btn {
+  background: none;
+  border: 1px solid #1a3050;
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wpt-btn.go { color: var(--accent); border-color: var(--accent-dim); }
+.wpt-btn.del { color: var(--danger); border-color: #3a1020; }
+
+/* ── Track Controls ───────────────────────────── */
+.track-stats {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.stat-box {
+  flex: 1;
+  background: var(--bg-mid);
+  border-radius: 10px;
+  padding: 10px;
+  text-align: center;
+  border: 1px solid #1a3050;
+}
+.stat-box span { display: block; font-size: 22px; font-weight: 700; }
+.stat-box small { font-size: 11px; color: var(--text-dim); }
+
+.track-controls { display: flex; gap: 8px; }
+
+.track-btn {
+  flex: 1;
+  padding: 12px 0;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #fff;
+  transition: opacity .15s;
+}
+.track-btn:disabled { opacity: .35; cursor: not-allowed; }
+.track-btn.green  { background: var(--green); }
+.track-btn.yellow { background: var(--warn); }
+.track-btn.red    { background: var(--danger); }
+
+.saved-track-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid #1a3050;
+  font-size: 13px;
+}
+.saved-track-item:last-child { border-bottom: none; }
+
+/* ── Offline Panel ────────────────────────────── */
+.info-msg {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+
+.progress-bar {
+  background: var(--bg-mid);
+  border-radius: 6px;
+  height: 10px;
+  overflow: hidden;
+  margin-bottom: 6px;
+  border: 1px solid #1a3050;
+}
+#cache-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  width: 0%;
+  transition: width .2s;
+}
+#cache-progress-label { font-size: 12px; color: var(--text-dim); margin-bottom: 12px; }
+
+/* ── Waypoint Dialog ──────────────────────────── */
+.dialog {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+.dialog.hidden { display: none; }
+
+.dialog-box {
+  background: var(--bg-panel);
+  border: 1px solid #1a3050;
+  border-radius: 14px;
+  padding: 20px;
+  width: min(340px, 90vw);
+}
+
+.dialog-title { font-size: 16px; font-weight: 700; margin-bottom: 14px; }
+
+.dialog-box input[type="text"] {
+  width: 100%;
+  background: var(--bg-mid);
+  border: 1px solid #1a3050;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 15px;
+  padding: 10px 12px;
+  outline: none;
+}
+.dialog-box input:focus { border-color: var(--accent); }
+
+.dialog-coords { font-size: 11px; color: var(--text-dim); margin: 8px 0 14px; }
+
+.dialog-actions { display: flex; gap: 10px; }
+.dialog-btn {
+  flex: 1;
+  padding: 11px;
+  border: 1px solid #1a3050;
+  border-radius: 10px;
+  background: var(--bg-mid);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+}
+.dialog-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ── Toast ────────────────────────────────────── */
+#toast {
+  position: fixed;
+  bottom: calc(var(--toolbar-h) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(30,143,255,.9);
+  color: #fff;
+  padding: 8px 18px;
+  border-radius: 20px;
+  font-size: 13px;
+  z-index: 3000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .3s;
+  white-space: nowrap;
+}
+#toast.show { opacity: 1; }
+
+/* ── Custom Leaflet Markers ───────────────────── */
+.gps-marker-inner {
+  width: 16px; height: 16px;
+  background: var(--accent);
+  border: 3px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(30,143,255,.4);
+}
+
+.wpt-marker {
+  width: 28px; height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  filter: drop-shadow(0 1px 3px rgba(0,0,0,.8));
+}
+
+.empty-msg { font-size: 13px; color: var(--text-dim); text-align: center; padding: 20px 0; }

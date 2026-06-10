@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!-- Open in browser to generate PNG icons: right-click canvas > Save as PNG -->
+<html><body style="background:#0a1628;padding:20px">
+<canvas id="c192" width="192" height="192"></canvas>
+<canvas id="c512" width="512" height="512"></canvas>
+<script>
+function drawIcon(canvas) {
+  const s = canvas.width;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#0a1628';
+  ctx.fillRect(0,0,s,s);
+
+  // Outer ring
+  ctx.strokeStyle = '#1e8fff';
+  ctx.lineWidth = s * 0.06;
+  ctx.beginPath();
+  ctx.arc(s/2, s/2, s*0.38, 0, Math.PI*2);
+  ctx.stroke();
+
+  // Cross hairs
+  ctx.lineWidth = s * 0.03;
+  ctx.beginPath();
+  ctx.moveTo(s/2, s*0.08); ctx.lineTo(s/2, s*0.28);
+  ctx.moveTo(s/2, s*0.72); ctx.lineTo(s/2, s*0.92);
+  ctx.moveTo(s*0.08, s/2); ctx.lineTo(s*0.28, s/2);
+  ctx.moveTo(s*0.72, s/2); ctx.lineTo(s*0.92, s/2);
+  ctx.stroke();
+
+  // Center dot
+  ctx.fillStyle = '#1e8fff';
+  ctx.beginPath();
+  ctx.arc(s/2, s/2, s*0.09, 0, Math.PI*2);
+  ctx.fill();
+
+  // Heading tick (north)
+  ctx.strokeStyle = '#f4a261';
+  ctx.lineWidth = s * 0.045;
+  ctx.beginPath();
+  ctx.moveTo(s/2, s*0.28); ctx.lineTo(s/2, s*0.16);
+  ctx.stroke();
+}
+drawIcon(document.getElementById('c192'));
+drawIcon(document.getElementById('c512'));
+</script>
+</body></html>
