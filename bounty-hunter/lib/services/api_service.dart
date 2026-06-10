@@ -286,21 +286,21 @@ class TornApiService {
   }
 
   Future<LiveItemData?> fetchItemMarket(int itemId) async {
-    try {
-      final data = await _get(
-          'https://api.torn.com/market/$itemId/?selections=itemmarket&key=$apiKey');
-      final rawData = data['itemmarket'];
-      final listings = <MarketListing>[];
+    // Fetch both itemmarket and bazaar listings in one call
+    final data = await _get(
+        'https://api.torn.com/market/$itemId/?selections=itemmarket,bazaar&key=$apiKey');
+    final listings = <MarketListing>[];
 
+    for (final key in ['itemmarket', 'bazaar']) {
+      final rawData = data[key];
       Iterable<dynamic> entries;
       if (rawData is List) {
         entries = rawData;
       } else if (rawData is Map) {
-        entries = rawData.values;
+        entries = (rawData as Map).values;
       } else {
-        entries = const [];
+        continue;
       }
-
       for (final e in entries) {
         final m = e as Map<String, dynamic>;
         final price = (m['cost'] as num?)?.toInt() ??
@@ -310,15 +310,14 @@ class TornApiService {
           listings.add(MarketListing(price: price, quantity: qty));
         }
       }
-      listings.sort((a, b) => a.price.compareTo(b.price));
-      return LiveItemData(
-        cheapestPrice: listings.isNotEmpty ? listings.first.price : 0,
-        listings: listings,
-        fetchedAt: DateTime.now(),
-      );
-    } catch (_) {
-      return null;
     }
+
+    listings.sort((a, b) => a.price.compareTo(b.price));
+    return LiveItemData(
+      cheapestPrice: listings.isNotEmpty ? listings.first.price : 0,
+      listings: listings,
+      fetchedAt: DateTime.now(),
+    );
   }
 
   static String? _resolveCountry(String desc) {

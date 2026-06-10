@@ -169,6 +169,14 @@ class _WatchlistTabState extends State<_WatchlistTab> {
                   style: const TextStyle(color: Colors.orange, fontSize: 12),
                 ),
               ),
+            if (market.marketError != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Text(
+                  'Price fetch error: ${market.marketError}',
+                  style: const TextStyle(color: Colors.orange, fontSize: 12),
+                ),
+              ),
 
             Expanded(
               child: searching

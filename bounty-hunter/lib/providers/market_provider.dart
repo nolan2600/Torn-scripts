@@ -200,7 +200,14 @@ class MarketProvider extends ChangeNotifier {
 
     for (final item in List<WatchedItem>.from(watchedItems)) {
       if (_disposed) break;
-      final data = await _api.fetchItemMarket(item.id);
+      LiveItemData? data;
+      try {
+        data = await _api.fetchItemMarket(item.id);
+      } catch (e) {
+        marketError = e.toString().replaceFirst('Exception: ', '');
+        if (!_disposed) notifyListeners();
+        continue;
+      }
       if (data == null) continue;
       liveData[item.id] = data;
 
@@ -245,10 +252,15 @@ class MarketProvider extends ChangeNotifier {
     flipItem = item;
     flipLiveData = null;
     flipLoading = true;
+    marketError = null;
     if (!_disposed) notifyListeners();
 
     _api.apiKey = _settings.tornKey;
-    flipLiveData = await _api.fetchItemMarket(item.id);
+    try {
+      flipLiveData = await _api.fetchItemMarket(item.id);
+    } catch (e) {
+      marketError = e.toString().replaceFirst('Exception: ', '');
+    }
     flipLoading = false;
     if (!_disposed) notifyListeners();
   }
@@ -256,8 +268,13 @@ class MarketProvider extends ChangeNotifier {
   Future<void> refreshFlipPrice() async {
     if (flipItem == null || !_settings.hasKey || flipLoading) return;
     flipLoading = true;
+    marketError = null;
     if (!_disposed) notifyListeners();
-    flipLiveData = await _api.fetchItemMarket(flipItem!.id);
+    try {
+      flipLiveData = await _api.fetchItemMarket(flipItem!.id);
+    } catch (e) {
+      marketError = e.toString().replaceFirst('Exception: ', '');
+    }
     flipLoading = false;
     if (!_disposed) notifyListeners();
   }
