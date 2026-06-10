@@ -411,3 +411,21 @@ html, body {
 }
 
 .empty-msg { font-size: 13px; color: var(--text-dim); text-align: center; padding: 20px 0; }
+
+/* ── Depth Legend & Tooltip ───────────────────────────────── */
+.depth-legend {
+  font-size: 12px;
+  line-height: 2;
+  color: var(--text);
+  padding: 4px 0;
+}
+
+.depth-tip {
+  background: rgba(10,22,40,.85) !important;
+  border: 1px solid #1a3050 !important;
+  color: #d4e8ff !important;
+  font-size: 12px !important;
+  padding: 2px 7px !important;
+  border-radius: 4px !important;
+  box-shadow: none !important;
+}

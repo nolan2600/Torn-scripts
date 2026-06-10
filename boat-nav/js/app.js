@@ -68,6 +68,46 @@ const overlayLayers = {
 baseLayers.satellite.addTo(map);
 overlayLayers.seamark.addTo(map);
 
+// ── Depth Contour Layer (TWDB official survey data) ────────
+const depthLayer = L.layerGroup().addTo(map);
+let depthLoaded  = false;
+
+function depthColor(ft) {
+  if (ft <=  2) return '#ff2200';
+  if (ft <=  7) return '#ff7700';
+  if (ft <= 12) return '#ffbb00';
+  if (ft <= 17) return '#ffe000';
+  if (ft <= 27) return '#aadd00';
+  if (ft <= 37) return '#44ccff';
+  if (ft <= 47) return '#0099ee';
+  if (ft <= 57) return '#0066cc';
+  return '#003399';
+}
+
+function depthWeight(ft) { return ft <= 12 ? 2.5 : 1.5; }
+
+function loadDepthContours() {
+  if (depthLoaded) return;
+  depthLoaded = true;
+  showToast('Loading depth contours…');
+  fetch('js/texoma_depth.geojson')
+    .then(r => r.json())
+    .then(data => {
+      L.geoJSON(data, {
+        style: f => ({
+          color:   depthColor(f.properties.depth_ft),
+          weight:  depthWeight(f.properties.depth_ft),
+          opacity: 0.85
+        }),
+        onEachFeature: (f, layer) => {
+          layer.bindTooltip(`${f.properties.depth_ft} ft`, { sticky: true, className: 'depth-tip' });
+        }
+      }).addTo(depthLayer);
+      showToast('Depth contours loaded');
+    })
+    .catch(() => showToast('Could not load depth data'));
+}
+
 // ── Leaflet Groups ─────────────────────────────────────────
 const gpsLayer       = L.layerGroup().addTo(map);
 const waypointLayer  = L.layerGroup().addTo(map);
@@ -472,6 +512,14 @@ function setupLayerControls() {
       baseLayers[e.target.value].addTo(map);
     });
   });
+  document.getElementById('layer-depth').addEventListener('change', e => {
+    if (e.target.checked) {
+      loadDepthContours();
+      depthLayer.addTo(map);
+    } else {
+      map.removeLayer(depthLayer);
+    }
+  });
   document.getElementById('layer-seamark').addEventListener('change', e => {
     e.target.checked ? overlayLayers.seamark.addTo(map) : map.removeLayer(overlayLayers.seamark);
   });
@@ -630,3 +678,7 @@ renderWaypointsList();
 renderSavedTracks();
 updateCacheSize();
 initGPS();
+
+// Auto-load depth contours and check the toggle
+document.getElementById('layer-depth').checked = true;
+loadDepthContours();
