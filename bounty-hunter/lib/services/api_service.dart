@@ -286,30 +286,23 @@ class TornApiService {
   }
 
   Future<LiveItemData?> fetchItemMarket(int itemId) async {
-    // Fetch both itemmarket and bazaar listings in one call
-    final data = await _get(
-        'https://api.torn.com/market/$itemId/?selections=itemmarket,bazaar&key=$apiKey');
     final listings = <MarketListing>[];
+    String? fetchError;
 
-    for (final key in ['itemmarket', 'bazaar']) {
-      final rawData = data[key];
-      Iterable<dynamic> entries;
-      if (rawData is List) {
-        entries = rawData;
-      } else if (rawData is Map) {
-        entries = (rawData as Map).values;
-      } else {
-        continue;
+    for (final path in ['itemmarket', 'bazaar']) {
+      try {
+        final data = await _get(
+            '$_tornBase/market/$itemId/$path?key=$apiKey');
+        final rawData = data[path];
+        _parseMarketListings(rawData, listings);
+        fetchError = null; // at least one succeeded
+      } catch (e) {
+        fetchError ??= e.toString().replaceFirst('TornApiException: ', '');
       }
-      for (final e in entries) {
-        final m = e as Map<String, dynamic>;
-        final price = (m['cost'] as num?)?.toInt() ??
-            (m['price'] as num?)?.toInt() ?? 0;
-        final qty = (m['quantity'] as num?)?.toInt() ?? 1;
-        if (price > 0) {
-          listings.add(MarketListing(price: price, quantity: qty));
-        }
-      }
+    }
+
+    if (listings.isEmpty && fetchError != null) {
+      throw TornApiException(fetchError!);
     }
 
     listings.sort((a, b) => a.price.compareTo(b.price));
@@ -318,6 +311,25 @@ class TornApiService {
       listings: listings,
       fetchedAt: DateTime.now(),
     );
+  }
+
+  static void _parseMarketListings(
+      dynamic rawData, List<MarketListing> out) {
+    Iterable<dynamic> entries;
+    if (rawData is List) {
+      entries = rawData;
+    } else if (rawData is Map) {
+      entries = (rawData as Map).values;
+    } else {
+      return;
+    }
+    for (final e in entries) {
+      final m = e as Map<String, dynamic>;
+      final price = (m['cost'] as num?)?.toInt() ??
+          (m['price'] as num?)?.toInt() ?? 0;
+      final qty = (m['quantity'] as num?)?.toInt() ?? 1;
+      if (price > 0) out.add(MarketListing(price: price, quantity: qty));
+    }
   }
 
   static String? _resolveCountry(String desc) {

@@ -204,7 +204,9 @@ class MarketProvider extends ChangeNotifier {
       try {
         data = await _api.fetchItemMarket(item.id);
       } catch (e) {
-        marketError = e.toString().replaceFirst('Exception: ', '');
+        marketError = e.toString()
+            .replaceFirst('TornApiException: ', '')
+            .replaceFirst('Exception: ', '');
         if (!_disposed) notifyListeners();
         continue;
       }
@@ -259,7 +261,9 @@ class MarketProvider extends ChangeNotifier {
     try {
       flipLiveData = await _api.fetchItemMarket(item.id);
     } catch (e) {
-      marketError = e.toString().replaceFirst('Exception: ', '');
+      marketError = e.toString()
+          .replaceFirst('TornApiException: ', '')
+          .replaceFirst('Exception: ', '');
     }
     flipLoading = false;
     if (!_disposed) notifyListeners();
@@ -273,7 +277,9 @@ class MarketProvider extends ChangeNotifier {
     try {
       flipLiveData = await _api.fetchItemMarket(flipItem!.id);
     } catch (e) {
-      marketError = e.toString().replaceFirst('Exception: ', '');
+      marketError = e.toString()
+          .replaceFirst('TornApiException: ', '')
+          .replaceFirst('Exception: ', '');
     }
     flipLoading = false;
     if (!_disposed) notifyListeners();
