@@ -70,9 +70,8 @@ overlayLayers.seamark.addTo(map);
 
 // ── Depth Chart Layer (TWDB official survey — nautical chart style) ──
 const depthLayer    = L.layerGroup().addTo(map);
-const soundingLayer = L.layerGroup().addTo(map);
+const soundingLayer = L.layerGroup();   // NOT added to map at boot — zoom controls it
 let depthLoaded     = false;
-let soundingsLoaded = false;
 
 function contourStyle(ft) {
   // Index contours (every 10ft elevation interval) slightly heavier
@@ -114,15 +113,11 @@ function loadDepthContours() {
       }
     }).addTo(soundingLayer);
 
-    // Only show soundings when zoomed in enough
+    // Show soundings only at zoom 13+ so numbers stay readable
     function updateSoundingVisibility() {
-      if (map.getZoom() >= 12) {
-        if (!map.hasLayer(soundingLayer) && document.getElementById('layer-depth').checked) {
-          soundingLayer.addTo(map);
-        }
-      } else {
-        if (map.hasLayer(soundingLayer)) map.removeLayer(soundingLayer);
-      }
+      const show = map.getZoom() >= 13 && document.getElementById('layer-depth').checked;
+      if (show && !map.hasLayer(soundingLayer)) soundingLayer.addTo(map);
+      if (!show && map.hasLayer(soundingLayer)) map.removeLayer(soundingLayer);
     }
     map.on('zoomend', updateSoundingVisibility);
     updateSoundingVisibility();
@@ -539,7 +534,6 @@ function setupLayerControls() {
     if (e.target.checked) {
       loadDepthContours();
       depthLayer.addTo(map);
-      if (map.getZoom() >= 12) soundingLayer.addTo(map);
     } else {
       map.removeLayer(depthLayer);
       map.removeLayer(soundingLayer);
@@ -706,5 +700,4 @@ initGPS();
 
 // Auto-load depth chart and check the toggle
 document.getElementById('layer-depth').checked = true;
-soundingLayer.addTo(map);
 loadDepthContours();
