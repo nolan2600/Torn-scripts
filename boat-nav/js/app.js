@@ -11,21 +11,21 @@ const STORAGE_KEYS = { waypoints: 'ltn_waypoints', tracks: 'ltn_tracks' };
 
 // ── Tile URLs ──────────────────────────────────────────────
 const TILES = {
-  ocean: {
-    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',
-    attr: '© Esri, GEBCO, NOAA, NGA, BODC — depth contours'
+  noaa: {
+    url: 'https://seamlessrnc.nauticalcharts.noaa.gov/arcgis/rest/services/RNC/NOAA_RNC/ImageServer/tile/{z}/{y}/{x}',
+    attr: '© NOAA Office of Coast Survey — Nautical Charts'
   },
-  oceanRef: {
-    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',
-    attr: '© Esri'
+  satellite: {
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    attr: '© Esri, Maxar, Earthstar Geographics'
   },
   osm: {
     url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attr: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
   },
-  satellite: {
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    attr: '© Esri, Maxar, Earthstar Geographics'
+  ocean: {
+    url: 'https://services.arcgisonline.com/arcgis/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',
+    attr: '© Esri, GEBCO, NOAA — depth contours'
   },
   seamark: {
     url: 'https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',
@@ -59,18 +59,17 @@ const map = L.map('map', {
 });
 
 const baseLayers = {
-  ocean:     L.tileLayer(TILES.ocean.url,     { attribution: TILES.ocean.attr,     maxZoom: 19, maxNativeZoom: 13 }),
-  osm:       L.tileLayer(TILES.osm.url,       { attribution: TILES.osm.attr,       maxZoom: 19 }),
-  satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 })
+  noaa:      L.tileLayer(TILES.noaa.url,      { attribution: TILES.noaa.attr,      maxZoom: 19, maxNativeZoom: 16 }),
+  satellite: L.tileLayer(TILES.satellite.url, { attribution: TILES.satellite.attr, maxZoom: 19 }),
+  osm:       L.tileLayer(TILES.osm.url,       { attribution: TILES.osm.attr,       maxZoom: 19 })
 };
 
 const overlayLayers = {
-  oceanRef: L.tileLayer(TILES.oceanRef.url, { attribution: TILES.oceanRef.attr, maxZoom: 19, maxNativeZoom: 13, opacity: 1.0 }),
-  seamark:  L.tileLayer(TILES.seamark.url,  { attribution: TILES.seamark.attr,  maxZoom: 18, opacity: 0.9 })
+  ocean:   L.tileLayer(TILES.ocean.url,   { attribution: TILES.ocean.attr,   maxZoom: 19, maxNativeZoom: 10, opacity: 0.55 }),
+  seamark: L.tileLayer(TILES.seamark.url, { attribution: TILES.seamark.attr, maxZoom: 18, opacity: 0.9 })
 };
 
-baseLayers.ocean.addTo(map);
-overlayLayers.oceanRef.addTo(map);
+baseLayers.noaa.addTo(map);
 overlayLayers.seamark.addTo(map);
 
 // ── Leaflet Groups ─────────────────────────────────────────
@@ -475,21 +474,11 @@ function setupLayerControls() {
     radio.addEventListener('change', e => {
       Object.values(baseLayers).forEach(l => map.removeLayer(l));
       baseLayers[e.target.value].addTo(map);
-      // Ocean reference layer only makes sense on ocean base
-      if (e.target.value === 'ocean') {
-        overlayLayers.oceanRef.addTo(map);
-        document.getElementById('layer-oceanref').checked = true;
-        document.getElementById('layer-oceanref').closest('.layer-row').style.opacity = '1';
-      } else {
-        map.removeLayer(overlayLayers.oceanRef);
-        document.getElementById('layer-oceanref').checked = false;
-        document.getElementById('layer-oceanref').closest('.layer-row').style.opacity = '.4';
-      }
     });
   });
 
-  document.getElementById('layer-oceanref').addEventListener('change', e => {
-    e.target.checked ? overlayLayers.oceanRef.addTo(map) : map.removeLayer(overlayLayers.oceanRef);
+  document.getElementById('layer-ocean').addEventListener('change', e => {
+    e.target.checked ? overlayLayers.ocean.addTo(map) : map.removeLayer(overlayLayers.ocean);
   });
   document.getElementById('layer-seamark').addEventListener('change', e => {
     e.target.checked ? overlayLayers.seamark.addTo(map) : map.removeLayer(overlayLayers.seamark);
