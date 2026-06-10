@@ -68,44 +68,67 @@ const overlayLayers = {
 baseLayers.satellite.addTo(map);
 overlayLayers.seamark.addTo(map);
 
-// ── Depth Contour Layer (TWDB official survey data) ────────
-const depthLayer = L.layerGroup().addTo(map);
-let depthLoaded  = false;
+// ── Depth Chart Layer (TWDB official survey — nautical chart style) ──
+const depthLayer    = L.layerGroup().addTo(map);
+const soundingLayer = L.layerGroup().addTo(map);
+let depthLoaded     = false;
+let soundingsLoaded = false;
 
-function depthColor(ft) {
-  if (ft <=  2) return '#ff2200';
-  if (ft <=  7) return '#ff7700';
-  if (ft <= 12) return '#ffbb00';
-  if (ft <= 17) return '#ffe000';
-  if (ft <= 27) return '#aadd00';
-  if (ft <= 37) return '#44ccff';
-  if (ft <= 47) return '#0099ee';
-  if (ft <= 57) return '#0066cc';
-  return '#003399';
+function contourStyle(ft) {
+  // Index contours (every 10ft elevation interval) slightly heavier
+  const isIndex = (Math.round(617 - ft) % 10 === 0);
+  return {
+    color:   ft <= 7 ? '#8B0000' : '#2c3e6b',   // dark red for very shallow, navy for deeper
+    weight:  isIndex ? 1.5 : 0.8,
+    opacity: isIndex ? 0.9 : 0.7
+  };
 }
-
-function depthWeight(ft) { return ft <= 12 ? 2.5 : 1.5; }
 
 function loadDepthContours() {
   if (depthLoaded) return;
   depthLoaded = true;
-  showToast('Loading depth contours…');
-  fetch('js/texoma_depth.geojson')
-    .then(r => r.json())
-    .then(data => {
-      L.geoJSON(data, {
-        style: f => ({
-          color:   depthColor(f.properties.depth_ft),
-          weight:  depthWeight(f.properties.depth_ft),
-          opacity: 0.85
-        }),
-        onEachFeature: (f, layer) => {
-          layer.bindTooltip(`${f.properties.depth_ft} ft`, { sticky: true, className: 'depth-tip' });
+  showToast('Loading depth chart…');
+  Promise.all([
+    fetch('js/texoma_depth.geojson').then(r => r.json()),
+    fetch('js/texoma_soundings.geojson').then(r => r.json())
+  ]).then(([contourData, soundingData]) => {
+    // Contour lines
+    L.geoJSON(contourData, {
+      style: f => contourStyle(f.properties.depth_ft),
+      onEachFeature: (f, layer) => {
+        layer.bindTooltip(`${f.properties.depth_ft} ft`, { sticky: true, className: 'depth-tip' });
+      }
+    }).addTo(depthLayer);
+
+    // Depth soundings — shown at zoom 12+
+    L.geoJSON(soundingData, {
+      pointToLayer: (f, latlng) => {
+        return L.marker(latlng, {
+          icon: L.divIcon({
+            className: 'sounding-label',
+            html: `<span>${f.properties.depth_ft}</span>`,
+            iconSize:   null,
+            iconAnchor: [10, 6]
+          })
+        });
+      }
+    }).addTo(soundingLayer);
+
+    // Only show soundings when zoomed in enough
+    function updateSoundingVisibility() {
+      if (map.getZoom() >= 12) {
+        if (!map.hasLayer(soundingLayer) && document.getElementById('layer-depth').checked) {
+          soundingLayer.addTo(map);
         }
-      }).addTo(depthLayer);
-      showToast('Depth contours loaded');
-    })
-    .catch(() => showToast('Could not load depth data'));
+      } else {
+        if (map.hasLayer(soundingLayer)) map.removeLayer(soundingLayer);
+      }
+    }
+    map.on('zoomend', updateSoundingVisibility);
+    updateSoundingVisibility();
+
+    showToast('Depth chart loaded');
+  }).catch(() => showToast('Could not load depth data'));
 }
 
 // ── Leaflet Groups ─────────────────────────────────────────
@@ -516,8 +539,10 @@ function setupLayerControls() {
     if (e.target.checked) {
       loadDepthContours();
       depthLayer.addTo(map);
+      if (map.getZoom() >= 12) soundingLayer.addTo(map);
     } else {
       map.removeLayer(depthLayer);
+      map.removeLayer(soundingLayer);
     }
   });
   document.getElementById('layer-seamark').addEventListener('change', e => {
@@ -679,6 +704,7 @@ renderSavedTracks();
 updateCacheSize();
 initGPS();
 
-// Auto-load depth contours and check the toggle
+// Auto-load depth chart and check the toggle
 document.getElementById('layer-depth').checked = true;
+soundingLayer.addTo(map);
 loadDepthContours();
