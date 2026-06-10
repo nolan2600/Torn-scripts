@@ -430,6 +430,40 @@ html, body {
   box-shadow: none !important;
 }
 
+/* ── POI Markers (Marinas, Ramps, Fuel) ──────────────────── */
+.poi-marker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 15px;
+  border: 2.5px solid rgba(255,255,255,0.85);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.7);
+  cursor: pointer;
+}
+
+/* Leaflet popup tweaks */
+.leaflet-popup-content-wrapper {
+  background: var(--bg-panel) !important;
+  color: var(--text) !important;
+  border: 1px solid #1a3050 !important;
+  border-radius: 10px !important;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.6) !important;
+}
+.leaflet-popup-tip { background: var(--bg-panel) !important; }
+.leaflet-popup-content { font-size: 13px; line-height: 1.6; min-width: 180px; }
+.leaflet-popup-content b { font-size: 14px; }
+.leaflet-popup-content a {
+  color: var(--accent);
+  text-decoration: none;
+  display: inline-block;
+  margin-top: 4px;
+}
+.leaflet-popup-content a:active { opacity: .7; }
+.leaflet-popup-close-button { color: var(--text-dim) !important; }
+
+.poi-fuel-note { color: var(--warn); font-size: 11px; margin-top: 4px; display: block; }
+
 /* ── Nautical depth sounding labels ──────────────────────── */
 .sounding-label {
   background: none !important;

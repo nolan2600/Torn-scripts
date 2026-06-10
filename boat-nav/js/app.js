@@ -126,6 +126,93 @@ function loadDepthContours() {
   }).catch(() => showToast('Could not load depth data'));
 }
 
+// ── Points of Interest ─────────────────────────────────────
+const RAMP_CACHE_KEY = 'ltn_ramps_v1';
+const RAMP_CACHE_TTL = 14 * 24 * 60 * 60 * 1000; // 14 days
+
+const TEXOMA_MARINAS = [
+  { name: 'Walnut Creek Marina',         lat: 33.8477, lng: -96.7157, website: 'https://www.walnutcreekmarina.com',                            phone: '(903) 786-8200', fuel: true  },
+  { name: 'Highport Marina',             lat: 33.8912, lng: -96.6850, website: 'https://highportmarina.com',                                   phone: '(903) 786-9936', fuel: true  },
+  { name: 'Cedar Mills Marina',          lat: 33.7921, lng: -96.7901, website: 'https://cedarmills.com',                                       phone: '(903) 523-4223', fuel: true  },
+  { name: 'Grandpappy Point Marina',     lat: 33.8671, lng: -96.6729, website: 'https://grandpappypoint.com',                                  phone: '(903) 786-7821', fuel: true  },
+  { name: 'Lake Texoma State Park (OK)', lat: 34.0001, lng: -96.6392, website: 'https://www.travelok.com/state-parks/lake-texoma-state-park',  phone: '(580) 564-2566', fuel: true  },
+  { name: 'Eisenhower State Park',       lat: 33.8424, lng: -96.5375, website: 'https://tpwd.texas.gov/state-parks/eisenhower',                phone: '(903) 465-1956', fuel: false }
+];
+
+const poiLayer = L.layerGroup().addTo(map);
+
+function makePOIIcon(type) {
+  const cfg = {
+    marina: { emoji: '⚓', bg: '#ff6b2b', size: 30 },
+    ramp:   { emoji: '🚤', bg: '#2dc653', size: 28 },
+    fuel:   { emoji: '⛽', bg: '#f4c430', size: 28 }
+  }[type] || { emoji: '📍', bg: '#1e8fff', size: 28 };
+  return L.divIcon({
+    className: '',
+    html: `<div class="poi-marker" style="background:${cfg.bg};width:${cfg.size}px;height:${cfg.size}px">${cfg.emoji}</div>`,
+    iconSize: [cfg.size, cfg.size],
+    iconAnchor: [cfg.size / 2, cfg.size / 2]
+  });
+}
+
+function marinaPopup(m) {
+  let html = `<b>${escHtml(m.name)}</b>`;
+  if (m.website) html += `<br><a href="${escHtml(m.website)}" target="_blank" rel="noopener">🌐 Open Website ↗</a>`;
+  if (m.phone)   html += `<br><a href="tel:${escHtml(m.phone)}">${escHtml(m.phone)}</a>`;
+  if (m.fuel)    html += `<br><span class="poi-fuel-note">⛽ Fuel available · call for prices</span>`;
+  return html;
+}
+
+function rampPopup(name) {
+  return `<b>🚤 ${escHtml(name)}</b><br><small style="color:#8fa8c8">Public boat ramp</small>`;
+}
+
+function renderMarinaMarkers() {
+  TEXOMA_MARINAS.forEach(m => {
+    L.marker([m.lat, m.lng], { icon: makePOIIcon('marina'), zIndexOffset: 500 })
+      .bindPopup(marinaPopup(m), { maxWidth: 260 })
+      .addTo(poiLayer);
+  });
+}
+
+async function loadBoatRamps() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(RAMP_CACHE_KEY));
+    if (cached && Date.now() - cached.ts < RAMP_CACHE_TTL) {
+      renderRampMarkers(cached.elements);
+      return;
+    }
+  } catch {}
+
+  const query = '[out:json][timeout:20];(node[leisure=slipway](33.70,-97.20,34.25,-96.45);way[leisure=slipway](33.70,-97.20,34.25,-96.45););out center tags;';
+  try {
+    const res  = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: query });
+    const data = await res.json();
+    const elements = data.elements || [];
+    try { localStorage.setItem(RAMP_CACHE_KEY, JSON.stringify({ ts: Date.now(), elements })); } catch {}
+    renderRampMarkers(elements);
+  } catch {
+    // offline or API unavailable — silently skip ramps
+  }
+}
+
+function renderRampMarkers(elements) {
+  elements.forEach(el => {
+    const lat  = el.lat  ?? el.center?.lat;
+    const lng  = el.lon  ?? el.center?.lon;
+    const name = el.tags?.name || 'Boat Ramp';
+    if (!lat || !lng) return;
+    L.marker([lat, lng], { icon: makePOIIcon('ramp'), zIndexOffset: 400 })
+      .bindPopup(rampPopup(name), { maxWidth: 220 })
+      .addTo(poiLayer);
+  });
+}
+
+function initPOIs() {
+  renderMarinaMarkers();
+  loadBoatRamps();
+}
+
 // ── Leaflet Groups ─────────────────────────────────────────
 const gpsLayer       = L.layerGroup().addTo(map);
 const waypointLayer  = L.layerGroup().addTo(map);
@@ -542,6 +629,9 @@ function setupLayerControls() {
   document.getElementById('layer-seamark').addEventListener('change', e => {
     e.target.checked ? overlayLayers.seamark.addTo(map) : map.removeLayer(overlayLayers.seamark);
   });
+  document.getElementById('layer-poi').addEventListener('change', e => {
+    e.target.checked ? poiLayer.addTo(map) : map.removeLayer(poiLayer);
+  });
   document.getElementById('layer-waypoints').addEventListener('change', e => {
     e.target.checked ? waypointLayer.addTo(map) : map.removeLayer(waypointLayer);
   });
@@ -701,3 +791,4 @@ initGPS();
 // Auto-load depth chart and check the toggle
 document.getElementById('layer-depth').checked = true;
 loadDepthContours();
+initPOIs();
