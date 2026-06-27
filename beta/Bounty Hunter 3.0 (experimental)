@@ -1,0 +1,1096 @@
+// ==UserScript==
+// @name         Bounty Hunter 3.0
+// @namespace    https://github.com/nolan2600/torn-scripts/bounty-hunter-3
+// @version      3.0.0
+// @description  Full bounty board with six combinable dropdown filters, clan war badges + row tinting, and a live player tracking tab showing FF/BS/bounty/status data. Torn PDA compatible.
+// @author       nolan2600
+// @match        https://www.torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @connect      ffscouter.com
+// @license      GPL-3.0-or-later
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+(function () {
+    'use strict';
+
+    const PDA_API_KEY   = "###PDA-APIKEY###";
+    const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
+    const VERSION = "3.0.0";
+
+    const LS = {
+        apiKey:   "bh3_apiKey",
+        ffKey:    "bh3_ffKey",
+        settings: "bh3_settings",
+        filters:  "bh3_filters",
+        tracked:  "bh3_tracked",
+    };
+
+    // ── Filter option tables ───────────────────────────────────
+    const PRICE_OPTS = [
+        {v:"0",         l:"Any reward"},
+        {v:"50000",     l:"$50k+"},
+        {v:"250000",    l:"$250k+"},
+        {v:"500000",    l:"$500k+"},
+        {v:"1000000",   l:"$1M+"},
+        {v:"2500000",   l:"$2.5M+"},
+        {v:"5000000",   l:"$5M+"},
+        {v:"10000000",  l:"$10M+"},
+        {v:"25000000",  l:"$25M+"},
+    ];
+
+    const HOSP_OPTS = [
+        {v:"99999", l:"Any time remaining"},
+        {v:"120",   l:"Under 2 min"},
+        {v:"300",   l:"Under 5 min"},
+        {v:"600",   l:"Under 10 min"},
+        {v:"1800",  l:"Under 30 min"},
+        {v:"3600",  l:"Under 1 hr"},
+        {v:"7200",  l:"Under 2 hr"},
+    ];
+
+    const FF_OPTS = [
+        {v:"any", l:"Any FF",    min:0,   max:99},
+        {v:"lt15",l:"FF < 1.5", min:0,   max:1.499},
+        {v:"1520",l:"FF 1.5–2", min:1.5, max:2.0},
+        {v:"2025",l:"FF 2–2.5", min:2.0, max:2.5},
+        {v:"2530",l:"FF 2.5–3", min:2.5, max:3.0},
+        {v:"gt30",l:"FF 3.0+",  min:3.0, max:99},
+    ];
+
+    const BS_OPTS = [
+        {v:"any",l:"Any BS",      min:0,           max:Infinity},
+        {v:"bs1", l:"2k – 25k",   min:2_000,       max:25_000},
+        {v:"bs2", l:"20k – 250k", min:20_000,      max:250_000},
+        {v:"bs3", l:"200k – 2.5m",min:200_000,     max:2_500_000},
+        {v:"bs4", l:"2m – 25m",   min:2_000_000,   max:25_000_000},
+        {v:"bs5", l:"20m – 250m", min:20_000_000,  max:250_000_000},
+        {v:"bs6", l:"200m+",      min:200_000_000, max:Infinity},
+    ];
+
+    const WAR_OPTS = [
+        {v:"all", l:"All targets"},
+        {v:"hide",l:"Hide war targets"},
+        {v:"only",l:"War targets only"},
+    ];
+
+    const STATUS_OPTS = [
+        {v:"all",      l:"Any status"},
+        {v:"okay",     l:"Okay only"},
+        {v:"hospital", l:"Hospital only"},
+        {v:"traveling",l:"Traveling only"},
+    ];
+
+    const DEFAULT_SETTINGS = {
+        refreshSec: 60,
+        toastsEnabled: true,
+        includeUnknownFF: false,
+    };
+
+    const DEFAULT_FILTERS = {
+        minPrice:     "500000",
+        hospMax:      "99999",
+        ffRange:      "any",
+        bsBracket:    "any",
+        warMode:      "all",
+        statusFilter: "all",
+    };
+
+    // ── API + URL constants ────────────────────────────────────
+    const API_BASE          = "https://api.torn.com/v2";
+    const FF_BASE           = "https://ffscouter.com/api/v1";
+    const API_DELAY_MS      = 750;
+    const PROFILE_URL       = "https://www.torn.com/profiles.php?XID=";
+    const ATTACK_URL        = "https://www.torn.com/page.php?sid=attack&user2ID=";
+    const STATUS_CACHE_MS   = 20_000;
+    const STATUS_CONCURRENCY= 3;
+    const FACTION_CACHE_MS  = 5 * 60 * 1000;
+    const SPA_LS_APIKEY     = "spa_apiKey";
+
+    const IS_PDA      = typeof PDA_httpGet === "function";
+    const HAS_PDA_KEY = PDA_API_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_API_KEY);
+    const GM_XHR      = (typeof GM_xmlhttpRequest !== "undefined") ? GM_xmlhttpRequest : null;
+
+    // ── Utilities ──────────────────────────────────────────────
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    function escHtml(s) {
+        return String(s == null ? "" : s)
+            .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    function parseBS(human) {
+        if (!human) return null;
+        const m = String(human).match(/^\s*([\d.]+)\s*([kKmMbB]?)\s*$/);
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        if (!Number.isFinite(n)) return null;
+        const mult = {k:1e3,m:1e6,b:1e9}[(m[2]||"").toLowerCase()] || 1;
+        return n * mult;
+    }
+
+    function openTornUrl(url) {
+        const a = document.createElement("a"); a.href = url; a.target = "_blank";
+        a.rel = "noopener noreferrer"; document.body.appendChild(a); a.click(); a.remove();
+    }
+
+    function revivableEmoji(rev, state) {
+        if (state !== "Hospital") return "—";
+        if (rev === true) return "💚"; if (rev === false) return "❌"; return "⚠️";
+    }
+
+    const fmt = {
+        money(n) {
+            if (n == null) return "$0";
+            const a = Math.abs(n);
+            const s = a >= 1e9 ? (a/1e9).toFixed(2)+"B" : a >= 1e6 ? (a/1e6).toFixed(2)+"M" : a >= 1e3 ? (a/1e3).toFixed(1)+"K" : a.toLocaleString();
+            return (n < 0 ? "-$" : "$") + s;
+        },
+        moneyFull(n) { return (n < 0 ? "-" : "") + "$" + Math.abs(n).toLocaleString(); },
+        hospLabel(untilSec) {
+            const rem = Math.max(0, untilSec - Math.floor(Date.now()/1000));
+            if (rem <= 0) return "🏥 out";
+            const h = Math.floor(rem/3600), m = Math.floor((rem%3600)/60), s = rem%60;
+            if (h > 0) return `🏥 ${h}h ${m}m`;
+            return m === 0 ? `🏥 ${s}s` : `🏥 ${m}m ${s}s`;
+        },
+    };
+
+    function loadSettings() { try { return {...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(LS.settings)||"{}")}; } catch { return {...DEFAULT_SETTINGS}; } }
+    function saveSettings(s) { localStorage.setItem(LS.settings, JSON.stringify(s)); }
+    function loadFilters()  { try { return {...DEFAULT_FILTERS,  ...JSON.parse(localStorage.getItem(LS.filters)||"{}")}; }  catch { return {...DEFAULT_FILTERS}; } }
+    function saveFilters(f) { localStorage.setItem(LS.filters, JSON.stringify(f)); }
+
+    // ── HTTP layer ─────────────────────────────────────────────
+    function _gmGet(url) {
+        return new Promise((resolve, reject) => {
+            GM_XHR({
+                method:"GET", url,
+                onload:(r)   => resolve({status:r.status, text:r.responseText}),
+                onerror:()   => reject(new Error("network_error")),
+                ontimeout:() => reject(new Error("timeout")),
+            });
+        });
+    }
+
+    async function _httpGetOnceRaw(url) {
+        if (IS_PDA) {
+            const r = await PDA_httpGet(url);
+            if (r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
+            return JSON.parse(r.responseText);
+        }
+        if (GM_XHR) {
+            const r = await _gmGet(url);
+            if (r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
+            return JSON.parse(r.text);
+        }
+        const r = await fetch(url);
+        if (!r.ok) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
+        return r.json();
+    }
+
+    async function httpGetJson(url) {
+        try { return await _httpGetOnceRaw(url); }
+        catch(err) { if (err.status >= 400 && err.status < 500) throw err; await sleep(400); return _httpGetOnceRaw(url); }
+    }
+
+    function isRateLimit(err) { return err && (err.status === 429 || err.tornCode === 5); }
+
+    // ── Torn API ───────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key = key; this._last = 0; }
+        setKey(key) { this.key = key; }
+
+        async _rl() { const w = API_DELAY_MS - (Date.now() - this._last); this._last = Date.now() + Math.max(0, w); if (w > 0) await sleep(w); }
+
+        async _get(pathOrUrl, params = null) {
+            await this._rl();
+            const url = new URL(/^https?:\/\//.test(pathOrUrl) ? pathOrUrl : API_BASE + pathOrUrl);
+            if (params) for (const [k,v] of Object.entries(params)) url.searchParams.set(k, v);
+            if (!url.searchParams.has("key")) url.searchParams.set("key", this.key);
+            const data = await httpGetJson(url.toString());
+            if (data && data.error) { const e = new Error(data.error.error || "API error"); e.tornCode = data.error.code; throw e; }
+            return data;
+        }
+
+        async fetchAllBounties() {
+            const all = []; let url = `${API_BASE}/torn/bounties?limit=100&offset=0`, delay = 0, safety = 10;
+            while (url && safety-- > 0) {
+                const data = await this._get(url);
+                if (Array.isArray(data.bounties)) all.push(...data.bounties);
+                if (typeof data.bounties_delay === "number") delay = data.bounties_delay;
+                const next = data._metadata?.links?.next;
+                if (!next || !data.bounties || data.bounties.length === 0) break;
+                url = next;
+            }
+            return {bounties: all, delaySec: delay};
+        }
+
+        async fetchUserProfile(id) {
+            const d = await this._get(`/user/${id}/profile`);
+            return d?.profile || (d?.id ? d : null);
+        }
+
+        async validateKey() {
+            const d = await this._get("/user/profile");
+            return d?.profile || null;
+        }
+
+        async fetchWarFactions() {
+            const ids = new Set();
+            try {
+                const d = await this._get("https://api.torn.com/torn/?selections=rankedwars,territorywars");
+                for (const w of Object.values(d.rankedwars || {}))
+                    for (const fid of Object.keys(w.factions || {})) { const n = Number(fid); if (n > 0) ids.add(n); }
+                for (const w of Object.values(d.territorywars || {}))
+                    for (const k of ["assaulting_faction","defending_faction"]) { const n = Number(w[k]); if (n > 0) ids.add(n); }
+            } catch {}
+            return ids;
+        }
+    }
+
+    // ── FFScouter ──────────────────────────────────────────────
+    async function fetchFFStats(key, ids) {
+        const out = new Map();
+        if (!key || ids.length === 0) return out;
+        for (let i = 0; i < ids.length; i += 200) {
+            const chunk = ids.slice(i, i + 200);
+            try {
+                const data = await httpGetJson(`${FF_BASE}/get-stats?key=${encodeURIComponent(key)}&targets=${chunk.join(",")}`);
+                if (!Array.isArray(data)) continue;
+                for (const p of data) {
+                    if (p.fair_fight != null) out.set(Number(p.player_id), {ff: Number(p.fair_fight), bs: p.bs_estimate_human || null});
+                }
+            } catch {}
+        }
+        return out;
+    }
+
+    async function validateFFKey(key) {
+        if (!/^[A-Za-z0-9]{16}$/.test(key)) return {ok:false, msg:"Must be 16 alphanumeric characters."};
+        try {
+            const d = await httpGetJson(`${FF_BASE}/check-key?key=${encodeURIComponent(key)}`);
+            if (d?.code) return {ok:false, msg:d.error || "FFScouter error"};
+            if (!d?.is_registered) return {ok:false, msg:"Key not registered — sign up at ffscouter.com."};
+            return {ok:true, msg: d.is_premium ? "Valid (premium)." : "Valid."};
+        } catch(e) { return {ok:false, msg:e?.message || "Could not reach FFScouter."}; }
+    }
+
+    // ── KeyResolver ────────────────────────────────────────────
+    const KR = {
+        tornKey() { if (HAS_PDA_KEY) return PDA_API_KEY; return localStorage.getItem(LS.apiKey) || null; },
+        ffKey()   { return localStorage.getItem(LS.ffKey) || ""; },
+        saveTorn(k) { localStorage.setItem(LS.apiKey, k); },
+        saveFF(k)   { localStorage.setItem(LS.ffKey, k); },
+        clearTorn() { localStorage.removeItem(LS.apiKey); },
+        clearFF()   { localStorage.removeItem(LS.ffKey); },
+        isPDA()     { return HAS_PDA_KEY; },
+        hasSPA()    { const k = localStorage.getItem(SPA_LS_APIKEY); return !!k && /^[A-Za-z0-9]{16}$/.test(k); },
+        getSPA()    { return localStorage.getItem(SPA_LS_APIKEY); },
+    };
+
+    // ── TrackedStore ───────────────────────────────────────────
+    const TrackedStore = {
+        load() { try { return JSON.parse(localStorage.getItem(LS.tracked) || "[]"); } catch { return []; } },
+        save(list) { try { localStorage.setItem(LS.tracked, JSON.stringify(list)); } catch {} },
+        has(id) { return this.load().some(t => t.id === Number(id)); },
+        add(t) {
+            const list = this.load();
+            if (!list.some(x => x.id === Number(t.id))) {
+                list.push({id: Number(t.id), name: String(t.name || `Player ${t.id}`), level: Number(t.level) || 0, addedAt: Date.now()});
+                this.save(list);
+            }
+        },
+        remove(id) { this.save(this.load().filter(t => t.id !== Number(id))); },
+        updateMeta(id, patch) {
+            const list = this.load(), t = list.find(x => x.id === Number(id));
+            if (t) { Object.assign(t, patch); this.save(list); }
+        },
+    };
+
+    // ── Hunter ─────────────────────────────────────────────────
+    class Hunter {
+        constructor(api) {
+            this.api      = api;
+            this.settings = loadSettings();
+            this.filters  = loadFilters();
+            this.myUserId = null;
+            this._bounties      = [];   // enriched + deduped bounties from last fetch
+            this._ffMap         = new Map();  // bounty player id → {ff, bs}
+            this._warSet        = new Set();
+            this._warFetchedAt  = 0;
+            this._profileCache  = new Map();  // id → {data, at}
+            this._trackedStatuses = new Map(); // id → {state, until, revivable, inFactionWar, description}
+            this._trackedFF       = new Map(); // id → {ff, bs}
+            this._timer   = null; this._running = false; this._nextAt = 0;
+            this.lastError = null; this.lastCounts = null;
+            this.onUpdate         = null;
+            this.onToast          = null;
+            this.onTrackedUpdate  = null;
+        }
+
+        updateSettings(next) { this.settings = {...this.settings, ...next}; saveSettings(this.settings); }
+        updateFilters(next)  { this.filters  = {...this.filters,  ...next}; saveFilters(this.filters); }
+
+        start() { if (this._running) return; this._running = true; this._tick(); }
+        stop()  { if (this._timer) { clearTimeout(this._timer); this._timer = null; } this._running = false; }
+
+        async _tick() {
+            if (!this._running) return;
+            let waitSec = this.settings.refreshSec;
+            try {
+                const delay = await this.refresh();
+                waitSec = Math.max(this.settings.refreshSec, delay || 0);
+            } catch(err) {
+                this.lastError = err;
+                if (this.onUpdate) this.onUpdate();
+                waitSec = Math.max(this.settings.refreshSec, 30);
+            }
+            await this.refreshTracked().catch(() => {});
+            if (this.settings.refreshSec <= 0) return;
+            this._nextAt = Date.now() + waitSec * 1000;
+            this._timer  = setTimeout(() => this._tick(), waitSec * 1000);
+        }
+
+        async refresh() {
+            this.lastError = null;
+            if (this.onUpdate) this.onUpdate({loading: true});
+
+            try { const p = await this.api.validateKey(); if (p) this.myUserId = p.id || this.myUserId; } catch {}
+
+            const {bounties, delaySec} = await this.api.fetchAllBounties();
+
+            // Deduplicate by target_id, keep highest reward, sum bounty counts
+            const grouped = new Map();
+            for (const b of bounties) {
+                const id = String(b.target_id), qty = (b.quantity > 0 ? b.quantity : 1);
+                if (!grouped.has(id)) { grouped.set(id, {...b, bountyCount: qty}); }
+                else {
+                    const ex = grouped.get(id); ex.bountyCount += qty;
+                    if (b.reward > ex.reward) grouped.set(id, {...b, bountyCount: ex.bountyCount});
+                }
+            }
+            const deduped = [...grouped.values()].filter(b => !this.myUserId || b.target_id !== this.myUserId);
+
+            // Fetch FF/BS for all bounty targets
+            const ids = deduped.map(b => Number(b.target_id));
+            this._ffMap = await fetchFFStats(KR.ffKey(), ids);
+
+            // Fetch war factions (cached)
+            this._warSet = await this._getWarFactions();
+
+            // Fetch profiles (status, revivable, faction)
+            const profiles = await this._fetchProfiles(ids);
+
+            // Enrich each bounty with profile + ff data
+            const nowSec = Math.floor(Date.now() / 1000);
+            for (const b of deduped) {
+                const p  = profiles.get(Number(b.target_id));
+                const ff = this._ffMap.get(Number(b.target_id));
+                b.ff           = ff?.ff  ?? null;
+                b.bs           = ff?.bs  ?? null;
+                b.statusState  = p?.status?.state ?? null;
+                b.hospUntil    = p?.status?.until ?? 0;
+                b.revivable    = p?.revivable     ?? null;
+                b.inFactionWar = !!(p?.faction_id && this._warSet.has(Number(p.faction_id)));
+                if (p?.name)                    b.target_name  = p.name;
+                if (typeof p?.level === "number") b.target_level = p.level;
+            }
+
+            this._bounties  = deduped;
+            this.lastCounts = {total: bounties.length, deduped: deduped.length};
+
+            if (this.onUpdate) this.onUpdate({loading: false});
+            if (this.settings.toastsEnabled && this.onToast) this.onToast(this.applyFilters(this._bounties));
+            return delaySec;
+        }
+
+        async _getWarFactions() {
+            const now = Date.now();
+            if (this._warSet.size > 0 && (now - this._warFetchedAt) < FACTION_CACHE_MS) return this._warSet;
+            const ids = await this.api.fetchWarFactions();
+            this._warFetchedAt = now;
+            return ids;
+        }
+
+        async _fetchProfiles(ids) {
+            const out = new Map(), now = Date.now(), stale = [], unique = [...new Set(ids)];
+            for (const id of unique) {
+                const c = this._profileCache.get(id);
+                if (c && (now - c.at) < STATUS_CACHE_MS) { out.set(id, c.data); continue; }
+                stale.push(id);
+            }
+            let i = 0, rateErr = null;
+            await Promise.all(Array.from({length: STATUS_CONCURRENCY}, async () => {
+                while (i < stale.length && !rateErr) {
+                    const id = stale[i++];
+                    try {
+                        const p = await this.api.fetchUserProfile(id);
+                        if (p) {
+                            const data = {
+                                status:     p.status  ?? null,
+                                age:        p.age     ?? null,
+                                faction_id: p.faction?.id ?? p.faction?.faction_id ?? p.faction_id ?? null,
+                                revivable:  typeof p.revivable === "boolean" ? p.revivable : null,
+                                name:       p.name || p.player_name || null,
+                                level:      typeof p.level === "number" ? p.level : null,
+                            };
+                            out.set(id, data); this._profileCache.set(id, {data, at: Date.now()});
+                        }
+                    } catch(err) { if (isRateLimit(err)) { rateErr = err; return; } }
+                }
+            }));
+            if (rateErr) throw rateErr;
+            return out;
+        }
+
+        // Apply all current filter dropdowns to a list of enriched bounties
+        applyFilters(list) {
+            const f = this.filters, nowSec = Math.floor(Date.now() / 1000);
+            const minPrice = Number(f.minPrice) || 0;
+            const hospMax  = Number(f.hospMax) >= 99999 ? Infinity : Number(f.hospMax);
+            const ffOpt    = FF_OPTS.find(o => o.v === f.ffRange)    || FF_OPTS[0];
+            const bsOpt    = BS_OPTS.find(o => o.v === f.bsBracket)  || BS_OPTS[0];
+            const inclUnk  = !!this.settings.includeUnknownFF;
+
+            return list.filter(b => {
+                if (b.reward < minPrice) return false;
+
+                // Status filter
+                const state = b.statusState;
+                if (f.statusFilter === "okay"      && state !== "Okay")                                  return false;
+                if (f.statusFilter === "hospital"   && state !== "Hospital")                              return false;
+                if (f.statusFilter === "traveling"  && state !== "Traveling" && state !== "Abroad")       return false;
+
+                // Hospital time remaining (only applies to hospital targets)
+                if (state === "Hospital") {
+                    const rem = Math.max(0, (b.hospUntil || 0) - nowSec);
+                    if (rem > hospMax) return false;
+                }
+
+                // FF filter
+                if (b.ff === null) { if (!inclUnk) return false; }
+                else { if (b.ff < ffOpt.min || b.ff > ffOpt.max) return false; }
+
+                // BS bracket
+                if (bsOpt.v !== "any" && b.bs != null) {
+                    const bsNum = parseBS(b.bs);
+                    if (bsNum != null && (bsNum < bsOpt.min || bsNum > bsOpt.max)) return false;
+                }
+
+                // Clan war filter
+                if (f.warMode === "hide" && b.inFactionWar)  return false;
+                if (f.warMode === "only" && !b.inFactionWar) return false;
+
+                return true;
+            });
+        }
+
+        // Full refresh of all tracked players (runs after each main cycle)
+        async refreshTracked() {
+            const targets = TrackedStore.load();
+            if (targets.length === 0) {
+                this._trackedStatuses = new Map(); this._trackedFF = new Map();
+                if (this.onTrackedUpdate) this.onTrackedUpdate(); return;
+            }
+            const ids = targets.map(t => Number(t.id));
+            const profiles = await this._fetchProfiles(ids);
+            const warSet   = await this._getWarFactions();
+            const ffKey    = KR.ffKey();
+
+            // Fetch FF for tracked players not already covered by the bounty ffMap
+            const needFF = ids.filter(id => !this._ffMap.has(id));
+            if (needFF.length > 0 && ffKey) {
+                const extra = await fetchFFStats(ffKey, needFF);
+                for (const [k,v] of extra) this._trackedFF.set(k, v);
+            }
+            for (const [k,v] of this._ffMap) this._trackedFF.set(k, v);
+
+            const statuses = new Map();
+            for (const t of targets) {
+                const p = profiles.get(Number(t.id));
+                if (p?.name && p.name !== t.name) TrackedStore.updateMeta(t.id, {name: p.name});
+                if (p?.level && p.level !== t.level) TrackedStore.updateMeta(t.id, {level: p.level});
+                statuses.set(t.id, {
+                    state:        p?.status?.state       ?? null,
+                    until:        p?.status?.until        ?? 0,
+                    revivable:    p?.revivable            ?? null,
+                    inFactionWar: !!(p?.faction_id && warSet.has(Number(p.faction_id))),
+                    description:  p?.status?.description  ?? "",
+                });
+            }
+            this._trackedStatuses = statuses;
+            if (this.onTrackedUpdate) this.onTrackedUpdate();
+        }
+
+        // Immediately fetch a single player after the Track button is clicked
+        async refreshOneTracked(id) {
+            const profiles = await this._fetchProfiles([Number(id)]);
+            const warSet   = await this._getWarFactions();
+            const ffKey    = KR.ffKey();
+            if (ffKey) { const extra = await fetchFFStats(ffKey, [Number(id)]); for (const [k,v] of extra) this._trackedFF.set(k, v); }
+            const p = profiles.get(Number(id));
+            this._trackedStatuses.set(id, {
+                state:        p?.status?.state      ?? null,
+                until:        p?.status?.until       ?? 0,
+                revivable:    p?.revivable           ?? null,
+                inFactionWar: !!(p?.faction_id && warSet.has(Number(p?.faction_id))),
+                description:  p?.status?.description ?? "",
+            });
+            if (this.onTrackedUpdate) this.onTrackedUpdate();
+        }
+
+        // Look up whether a player currently has a bounty on the board
+        getBounty(id) { return this._bounties.find(b => b.target_id === Number(id)) || null; }
+
+        secondsUntilRefresh() { return Math.max(0, Math.round((this._nextAt - Date.now()) / 1000)); }
+    }
+
+    // ── CSS ────────────────────────────────────────────────────
+    function injectCSS() {
+        if (document.getElementById("bh3-style")) return;
+        const s = document.createElement("style"); s.id = "bh3-style";
+        s.textContent = `
+#bh3-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.72)}
+#bh3-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#181818;border:1px solid #333;border-radius:10px;overflow:hidden;resize:both;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#ddd;font-size:14px;width:900px;max-width:100vw;max-height:90vh;min-width:340px;min-height:300px;flex-direction:column}
+#bh3-panel.bh3-open{display:flex}#bh3-overlay.bh3-open{display:block}#bh3-panel *{box-sizing:border-box;color:inherit}
+#bh3-panel ::-webkit-scrollbar{width:6px;height:6px}#bh3-panel ::-webkit-scrollbar-track{background:#181818}#bh3-panel ::-webkit-scrollbar-thumb{background:#3a3a3a;border-radius:3px}#bh3-panel ::-webkit-scrollbar-thumb:hover{background:#555}
+
+/* ── Header ── */
+#bh3-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#1f1f1f;border-bottom:1px solid #2e2e2e;flex-shrink:0}
+#bh3-header h2{margin:0;font-size:17px;color:#fff}
+#bh3-close{background:none;border:none;color:#777;font-size:22px;cursor:pointer;padding:2px 8px;line-height:1}#bh3-close:hover{color:#fff}
+
+/* ── Tabs ── */
+#bh3-tabs{display:flex;background:#1a1a1a;border-bottom:1px solid #2e2e2e;overflow-x:auto;flex-shrink:0}
+.bh3-tab{padding:10px 20px;cursor:pointer;color:#777!important;border-bottom:2px solid transparent;white-space:nowrap;font-size:14px;transition:color .15s,border-color .15s}
+.bh3-tab:hover{color:#bbb!important;background:#202020}.bh3-tab.active{color:#e53935!important;border-bottom-color:#e53935}
+
+/* ── Filter bar ── */
+#bh3-filter-bar{display:flex;gap:8px;flex-wrap:wrap;padding:10px 14px;background:#1c1c1c;border-bottom:1px solid #262626;flex-shrink:0;align-items:flex-end}
+.bh3-fg{display:flex;flex-direction:column;gap:3px;min-width:130px}
+.bh3-fg label{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
+.bh3-sel{background:#242424;border:1px solid #383838;color:#ddd;padding:5px 24px 5px 8px;border-radius:4px;font-size:12px;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath fill='%23666' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 7px center;width:100%}
+.bh3-sel:focus{outline:none;border-color:#e53935}
+
+/* ── Status bar ── */
+#bh3-sbar{display:flex;gap:12px;align-items:center;padding:8px 14px;color:#666;font-size:12px;flex-wrap:wrap;border-bottom:1px solid #202020;flex-shrink:0}
+#bh3-sbar .bh3-err{color:#e53935}
+#bh3-rbtn{padding:4px 10px;background:#252525;border:1px solid #383838;color:#bbb;border-radius:4px;cursor:pointer;font-size:12px}
+#bh3-rbtn:hover{background:#2e2e2e}#bh3-rbtn:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── Table shared ── */
+.bh3-twrap{overflow-x:auto;flex:1}
+table.bh3-t{width:100%;border-collapse:collapse}
+.bh3-t th,.bh3-t td{padding:7px 12px;text-align:left;border-bottom:1px solid #242424;font-size:13px;white-space:nowrap;vertical-align:middle}
+.bh3-t th{color:#555!important;font-weight:600;text-transform:uppercase;font-size:10px;position:sticky;top:0;background:#181818;border-bottom:2px solid #2e2e2e;user-select:none}
+.bh3-t th.sortable{cursor:pointer}.bh3-t th.sortable:hover{color:#999!important}
+.bh3-t th.sort-asc::after{content:" ▲";color:#e53935;font-size:9px}.bh3-t th.sort-desc::after{content:" ▼";color:#e53935;font-size:9px}.bh3-t th.sortable:not(.sort-asc):not(.sort-desc)::after{content:" ⇅";color:#3a3a3a;font-size:9px}
+.bh3-t tbody tr:hover td{background:#1e1e1e}
+.bh3-t td.num{text-align:right;font-variant-numeric:tabular-nums}
+
+/* ── War row tinting ── */
+.bh3-row-war td{background:rgba(229,57,53,.06)!important}.bh3-row-war:hover td{background:rgba(229,57,53,.12)!important}
+
+/* ── Badges & chips ── */
+.bh3-link{color:#4fc3f7!important;text-decoration:none}.bh3-link:hover{text-decoration:underline}
+.bh3-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.bh3-ok{background:#1b3124;color:#4caf50}
+.bh3-hosp{background:#352413;color:#ffb74d}
+.bh3-travel{background:#122840;color:#4fc3f7}
+.bh3-jail{background:#252525;color:#777}
+.bh3-war-badge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;font-weight:700;background:#2a1212;color:#e57373;border:1px solid #4a1e1e;margin-left:5px;vertical-align:middle}
+.bh3-count{display:inline-block;padding:1px 6px;margin-left:5px;background:#2e1e40;color:#ce93d8;border-radius:8px;font-size:10px;font-weight:700;vertical-align:middle}
+.bh3-atk{display:inline-block;padding:3px 10px;background:#e53935;color:#fff!important;border-radius:4px;text-decoration:none;font-weight:600;font-size:12px;border:none;cursor:pointer}.bh3-atk:hover{background:#c62828}
+.bh3-rev{font-size:14px;text-align:center!important}
+.bh3-empty{text-align:center;color:#555;padding:40px 12px;font-size:14px}
+
+/* ── Tracking tab ── */
+#bh3-tbar{display:flex;gap:10px;align-items:center;padding:8px 14px;color:#666;font-size:12px;border-bottom:1px solid #202020;flex-shrink:0}
+.bh3-trm{background:none;border:1px solid #2e2e2e;border-radius:4px;color:#555;cursor:pointer;font-size:11px;padding:2px 7px}
+.bh3-trm:hover{background:#2a1212;border-color:#e53935;color:#e57373}
+
+/* ── Settings ── */
+#bh3-swrap{padding:14px 16px;overflow-y:auto;flex:1}
+.bh3-sec{margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid #222}.bh3-sec:last-child{border-bottom:none}
+.bh3-sec h3{margin:0 0 10px;font-size:14px;color:#eee}
+.bh3-g2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.bh3-fld{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
+.bh3-fld label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.bh3-inp{background:#202020;border:1px solid #383838;color:#ddd;padding:6px 10px;border-radius:4px;font-size:13px;width:100%}.bh3-inp:focus{outline:none;border-color:#e53935}
+.bh3-inp-m{-webkit-text-security:disc;text-security:disc;letter-spacing:2px}
+.bh3-chk{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:#bbb;font-size:13px;margin:3px 0}.bh3-chk input{accent-color:#e53935}
+.bh3-hint{color:#555;font-size:11px;margin:3px 0;line-height:1.4}
+.bh3-rowa{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.bh3-ss{font-size:12px;margin-top:5px;min-height:1em}.bh3-ok2{color:#4caf50}.bh3-err2{color:#e53935}.bh3-inf{color:#888}
+.bh3-btn{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600}
+.bh3-btn-p{background:#4fc3f7;color:#111!important}.bh3-btn-p:hover{background:#29b6f6}
+.bh3-btn-d{background:#e53935;color:#fff!important}.bh3-btn-d:hover{background:#c62828}
+.bh3-btn-m{background:#252525;border:1px solid #383838;color:#ccc!important}.bh3-btn-m:hover{background:#2e2e2e}
+.bh3-btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── Profile track button ── */
+.bh3-tb{position:fixed;bottom:80px;right:16px;z-index:999997;padding:10px 18px;background:#122840;border:2px solid #4fc3f7;border-radius:24px;color:#4fc3f7;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.6);transition:all .15s}
+.bh3-tb:hover{background:#1a3a52;border-color:#81d4fa}
+.bh3-tb-on{background:#122e1c!important;border-color:#4caf50!important;color:#4caf50!important}
+
+/* ── Toasts ── */
+#bh3-toasts{position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column-reverse;gap:8px;z-index:2147483646;pointer-events:none;max-width:calc(100vw - 32px)}
+.bh3-toast{pointer-events:auto;width:300px;max-width:100%;background:#1c1c1c;border:1px solid #3a3a3a;border-left:4px solid #e53935;border-radius:8px;padding:10px 12px;font-family:inherit;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.5);animation:bh3-ti .2s ease-out;position:relative}
+@keyframes bh3-ti{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:none}}
+.bh3-tc{position:absolute;top:4px;right:6px;background:none;border:none;color:#555;font-size:18px;cursor:pointer;padding:0 4px;line-height:1}.bh3-tc:hover{color:#fff}
+.bh3-th{display:flex;justify-content:space-between;align-items:baseline;margin:0 18px 4px 0}
+.bh3-tn{color:#fff;font-weight:600}.bh3-tr{color:#4caf50;font-weight:700}
+.bh3-tm{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px}
+.bh3-chip{background:#222;border:1px solid #333;padding:1px 7px;border-radius:10px;font-size:11px;color:#999}
+.bh3-ta{width:100%;padding:5px 10px;background:#e53935;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-size:12px}.bh3-ta:hover{background:#c62828}
+
+/* ── Auth ── */
+#bh3-auth{padding:24px;line-height:1.5}#bh3-auth h3{margin:0 0 10px;color:#fff}
+
+@media(max-width:768px){#bh3-panel{width:100vw!important;max-width:100vw;min-width:0;border-radius:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}.bh3-g2{grid-template-columns:1fr}.bh3-fg{min-width:calc(50% - 4px)}.bh3-t td,.bh3-t th{padding:5px 6px;font-size:12px}#bh3-toasts{left:8px;right:8px;bottom:8px}.bh3-toast{width:auto}}
+`;
+        document.head.appendChild(s);
+    }
+
+    // ── Toaster ────────────────────────────────────────────────
+    class Toaster {
+        constructor() { this._con = null; this._cards = []; }
+        _ensure() {
+            if (this._con && document.body.contains(this._con)) return;
+            const c = document.createElement("div"); c.id = "bh3-toasts"; document.body.appendChild(c); this._con = c;
+        }
+        showNew(matches, prevIds) {
+            const newOnes = prevIds ? matches.filter(b => !prevIds.has(`${b.target_id}|${b.reward}`)) : matches;
+            if (!newOnes.length) return;
+            this._ensure();
+            for (const b of newOnes.slice(0, 3)) this._show(b);
+        }
+        _show(b) {
+            const stale = this._cards.find(c => c.id === Number(b.target_id)); if (stale) this._rm(stale);
+            const el = document.createElement("div"); el.className = "bh3-toast";
+            const isH = b.statusState === "Hospital";
+            const wb  = b.inFactionWar ? `<span class="bh3-chip">⚔️ War</span>` : "";
+            el.innerHTML = `<button class="bh3-tc">&times;</button><div class="bh3-th"><span class="bh3-tn">${escHtml(b.target_name)} <span style="color:#555;font-size:11px">L${b.target_level}</span></span><span class="bh3-tr">${escHtml(fmt.money(b.reward))}</span></div><div class="bh3-tm">${b.ff!=null?`<span class="bh3-chip">FF ${b.ff.toFixed(2)}</span>`:""}<span class="bh3-chip ${isH?"bh3-hosp":"bh3-ok"}">${isH?fmt.hospLabel(b.hospUntil):"Okay"}</span>${wb}</div><button class="bh3-ta">Attack</button>`;
+            const card = {id: Number(b.target_id), el, timer: null, rem: 12000, at: 0};
+            el.querySelector(".bh3-tc").addEventListener("click", e => { e.stopPropagation(); this._rm(card); });
+            el.querySelector(".bh3-ta").addEventListener("click", () => { openTornUrl(ATTACK_URL + b.target_id); this._rm(card); });
+            el.addEventListener("pointerenter", () => this._pause(card));
+            el.addEventListener("pointerleave", () => this._resume(card));
+            this._resume(card); this._con.appendChild(el); this._cards.push(card);
+        }
+        _pause(c)  { if (!c.timer) return; clearTimeout(c.timer); c.timer = null; c.rem = Math.max(0, c.rem - (Date.now() - c.at)); }
+        _resume(c) { c.at = Date.now(); if (c.timer) clearTimeout(c.timer); c.timer = setTimeout(() => this._rm(c), c.rem); }
+        _rm(c)     { if (c.timer) clearTimeout(c.timer); c.el?.parentNode?.removeChild(c.el); this._cards = this._cards.filter(x => x !== c); }
+        clearAll() { for (const c of [...this._cards]) this._rm(c); }
+    }
+
+    // ── UI ─────────────────────────────────────────────────────
+    class UI {
+        constructor(hunter, toaster) {
+            this.hunter   = hunter; this.toaster = toaster;
+            this.activeTab = "hunt";
+            this._panel = null; this._overlay = null; this._authed = false;
+            this._sortCol = "reward"; this._sortDir = "desc";
+            this._refreshing = false;
+            this._prevMatchIds = new Set();
+            this._cdTimer = null;
+        }
+
+        inject() {
+            injectCSS();
+            const overlay = document.createElement("div"); overlay.id = "bh3-overlay"; document.body.appendChild(overlay);
+            const panel   = document.createElement("div"); panel.id   = "bh3-panel";
+            panel.innerHTML = `<div id="bh3-header"><h2>Bounty Hunter <span style="color:#555;font-size:11px;margin-left:6px">v${VERSION}</span></h2><button id="bh3-close">&times;</button></div><div id="bh3-tabs"><div class="bh3-tab active" data-tab="hunt">Hunt</div><div class="bh3-tab" data-tab="tracking">Tracking 🎯</div><div class="bh3-tab" data-tab="settings">Settings</div></div><div id="bh3-content" style="display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden"></div>`;
+            document.body.appendChild(panel); this._panel = panel; this._overlay = overlay;
+
+            overlay.addEventListener("click", () => this.toggle(false));
+            panel.querySelector("#bh3-close").addEventListener("click", () => this.toggle(false));
+            panel.querySelector("#bh3-tabs").addEventListener("click", e => {
+                const t = e.target.closest(".bh3-tab"); if (!t) return;
+                this.activeTab = t.dataset.tab; this._syncTabs(); this._renderActive();
+            });
+
+            this.hunter.onUpdate = () => { if (this._isOpen()) this._renderActive(); };
+            this.hunter.onToast  = (matches) => {
+                this.toaster.showNew(matches, this._prevMatchIds);
+                this._prevMatchIds = new Set(matches.map(b => `${b.target_id}|${b.reward}`));
+            };
+            this.hunter.onTrackedUpdate = () => { if (this._isOpen() && this.activeTab === "tracking") this._renderTracking(); };
+
+            this._cdTimer = setInterval(() => {
+                if (!this._isOpen()) return;
+                const cdEl = document.getElementById("bh3-cd"); if (cdEl) cdEl.textContent = this.hunter.secondsUntilRefresh() + "s";
+                document.querySelectorAll("[data-hu]").forEach(el => { const u = parseInt(el.dataset.hu, 10); if (Number.isFinite(u)) el.textContent = fmt.hospLabel(u); });
+            }, 1000);
+        }
+
+        _isOpen() { return !!this._panel?.classList.contains("bh3-open"); }
+        toggle(open) {
+            const isOpen = open != null ? open : !this._isOpen();
+            this._panel.classList.toggle("bh3-open", isOpen);
+            this._overlay.classList.toggle("bh3-open", isOpen);
+            if (isOpen) this._renderActive();
+        }
+        _syncTabs() { for (const t of this._panel.querySelectorAll(".bh3-tab")) t.classList.toggle("active", t.dataset.tab === this.activeTab); }
+        _renderActive() { if (!this._authed) { this._renderAuth(); return; } if (this.activeTab === "hunt") this._renderHunt(); else if (this.activeTab === "tracking") this._renderTracking(); else this._renderSettings(); }
+        setAuthed(v) { this._authed = v; if (this._isOpen()) this._renderActive(); }
+
+        // ── Auth ───────────────────────────────────────────────
+        _renderAuth() {
+            const con = this._panel.querySelector("#bh3-content");
+            const spaOk = !IS_PDA && KR.hasSPA();
+            con.innerHTML = `<div id="bh3-auth"><h3>Set your Torn API key</h3><p style="color:#888;font-size:13px">Bounty Hunter 3.0 requires a <b>Public</b> access Torn API key. Stored locally and only sent to <code>api.torn.com</code>.</p><div class="bh3-fld" style="margin-top:14px"><label>Torn API key (16 chars)</label><input id="bh3-ak" class="bh3-inp bh3-inp-m" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true"></div><div class="bh3-rowa"><button id="bh3-asave" class="bh3-btn bh3-btn-p">Save &amp; start</button>${spaOk?`<button id="bh3-aspa" class="bh3-btn bh3-btn-m">Use SPA key</button>`:""}</div><p id="bh3-aerr" class="bh3-ss bh3-err2" style="min-height:1em"></p><hr style="border:none;border-top:1px solid #242424;margin:16px 0"><h3 style="margin:0 0 8px">FFScouter key <span style="color:#555;font-size:12px;font-weight:400">(optional)</span></h3><p style="color:#666;font-size:12px">Required for the FF and BS bracket filters.</p><div class="bh3-fld"><label>FFScouter key (16 chars)</label><input id="bh3-affk" class="bh3-inp bh3-inp-m" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" value="${escHtml(KR.ffKey())}"></div></div>`;
+            const ki = con.querySelector("#bh3-ak"), err = con.querySelector("#bh3-aerr");
+            const doSave = async () => {
+                err.textContent = ""; const k = ki.value.trim();
+                if (!/^[A-Za-z0-9]{16}$/.test(k)) { err.textContent = "Needs to be 16 alphanumeric characters."; return; }
+                await this._adoptKey(k, con.querySelector("#bh3-affk").value.trim());
+            };
+            con.querySelector("#bh3-asave").addEventListener("click", doSave);
+            ki.addEventListener("keydown", e => { if (e.key === "Enter") doSave(); });
+            const spaBtn = con.querySelector("#bh3-aspa");
+            if (spaBtn) spaBtn.addEventListener("click", async () => { const k = KR.getSPA(); if (!k) return; await this._adoptKey(k, con.querySelector("#bh3-affk").value.trim()); });
+        }
+        async _adoptKey(tornKey, ffKey) {
+            const err = this._panel.querySelector("#bh3-aerr");
+            if (err) err.textContent = "Validating…";
+            this.hunter.api.setKey(tornKey);
+            try { await this.hunter.api.validateKey(); } catch(e) { if (err) err.textContent = "Key rejected: " + (e.message || "invalid"); return; }
+            KR.saveTorn(tornKey);
+            if (ffKey && /^[A-Za-z0-9]{16}$/.test(ffKey)) KR.saveFF(ffKey);
+            this.setAuthed(true); this.hunter.start();
+        }
+
+        // ── Hunt tab ───────────────────────────────────────────
+        _renderHunt() {
+            const con = this._panel.querySelector("#bh3-content");
+            const f   = this.hunter.filters;
+            const matches = this.hunter.applyFilters(this.hunter._bounties);
+            const sorted  = this._sortList(matches);
+            const cnt     = this.hunter.lastCounts;
+            const errLine = this.hunter.lastError ? `<span class="bh3-err">${escHtml(this.hunter.lastError.message||"error")}</span>` : "";
+            const noFF    = !KR.ffKey() && !this.hunter.settings.includeUnknownFF ? `<span class="bh3-err">No FFScouter key — all targets excluded. Set one in Settings.</span>` : "";
+
+            con.innerHTML = `
+${this._filterBarHTML(f)}
+<div id="bh3-sbar">
+  <button id="bh3-rbtn"${this._refreshing?" disabled":""}>Refresh now</button>
+  <span>Next: <span id="bh3-cd">${this.hunter.secondsUntilRefresh()}</span>s</span>
+  <span>${sorted.length} match${sorted.length===1?"":"es"}${cnt?` of ${cnt.deduped} bounties`:""}</span>
+  ${errLine}${noFF}
+</div>
+<div class="bh3-twrap">
+${sorted.length === 0
+    ? `<div class="bh3-empty">No bounties match your current filters.<br><span style="color:#444">Adjust the dropdowns above, or wait for the next auto-refresh.</span></div>`
+    : `<table class="bh3-t"><thead><tr>
+        <th class="sortable" data-col="target">Target</th>
+        <th class="sortable num" data-col="reward">Reward</th>
+        <th class="sortable num" data-col="ff">FF</th>
+        <th class="sortable num" data-col="bs">BS Est.</th>
+        <th class="sortable" data-col="status">Status</th>
+        <th class="bh3-rev">Rev.</th>
+        <th></th>
+      </tr></thead>
+      <tbody>${sorted.map(b => this._rowHTML(b)).join("")}</tbody>
+    </table>`
+}
+</div>`;
+
+            this._bindFilters(con, f);
+
+            const rb = con.querySelector("#bh3-rbtn");
+            rb.addEventListener("click", async () => {
+                if (this._refreshing) return; this._refreshing = true; rb.disabled = true;
+                try { await this.hunter.refresh(); } catch {}
+                this._refreshing = false;
+            });
+
+            con.querySelectorAll("th.sortable").forEach(th => th.addEventListener("click", () => {
+                const col = th.dataset.col;
+                if (this._sortCol === col) this._sortDir = this._sortDir === "asc" ? "desc" : "asc";
+                else { this._sortCol = col; this._sortDir = col === "target" ? "asc" : "desc"; }
+                this._renderHunt();
+            }));
+            con.querySelectorAll("th[data-col]").forEach(th => {
+                th.classList.remove("sort-asc","sort-desc");
+                if (th.dataset.col === this._sortCol) th.classList.add(this._sortDir === "asc" ? "sort-asc" : "sort-desc");
+            });
+            con.querySelectorAll(".bh3-atk").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openTornUrl(ATTACK_URL + el.dataset.id); }));
+        }
+
+        _filterBarHTML(f) {
+            const opt = (arr, cur) => arr.map(o => `<option value="${escHtml(o.v)}"${o.v===cur?" selected":""}>${escHtml(o.l)}</option>`).join("");
+            return `<div id="bh3-filter-bar">
+<div class="bh3-fg"><label>Reward</label><select class="bh3-sel" id="bh3-fp">${opt(PRICE_OPTS, f.minPrice)}</select></div>
+<div class="bh3-fg"><label>Hospital time</label><select class="bh3-sel" id="bh3-fh">${opt(HOSP_OPTS, f.hospMax)}</select></div>
+<div class="bh3-fg"><label>Fair Fight</label><select class="bh3-sel" id="bh3-ff">${opt(FF_OPTS, f.ffRange)}</select></div>
+<div class="bh3-fg"><label>Battle Stats</label><select class="bh3-sel" id="bh3-fb">${opt(BS_OPTS, f.bsBracket)}</select></div>
+<div class="bh3-fg"><label>Clan War</label><select class="bh3-sel" id="bh3-fw">${opt(WAR_OPTS, f.warMode)}</select></div>
+<div class="bh3-fg"><label>Status</label><select class="bh3-sel" id="bh3-fs">${opt(STATUS_OPTS, f.statusFilter)}</select></div>
+</div>`;
+        }
+
+        _bindFilters(con) {
+            const refresh = () => {
+                this.hunter.updateFilters({
+                    minPrice:     con.querySelector("#bh3-fp").value,
+                    hospMax:      con.querySelector("#bh3-fh").value,
+                    ffRange:      con.querySelector("#bh3-ff").value,
+                    bsBracket:    con.querySelector("#bh3-fb").value,
+                    warMode:      con.querySelector("#bh3-fw").value,
+                    statusFilter: con.querySelector("#bh3-fs").value,
+                });
+                this._renderHunt();
+            };
+            ["bh3-fp","bh3-fh","bh3-ff","bh3-fb","bh3-fw","bh3-fs"]
+                .forEach(id => con.querySelector("#"+id)?.addEventListener("change", refresh));
+        }
+
+        _rowHTML(b) {
+            const isH    = b.statusState === "Hospital";
+            const warRow = b.inFactionWar ? " bh3-row-war" : "";
+            const warBadge = b.inFactionWar ? `<span class="bh3-war-badge" title="Faction is in an active war — outside attackers blocked">⚔️ War</span>` : "";
+            const countBadge = b.bountyCount > 1 ? `<span class="bh3-count">×${b.bountyCount}</span>` : "";
+            const statusCell = isH
+                ? `<span class="bh3-badge bh3-hosp" data-hu="${b.hospUntil}">${fmt.hospLabel(b.hospUntil)}</span>`
+                : `<span class="bh3-badge bh3-ok">Okay</span>`;
+            const ffCell  = b.ff != null ? b.ff.toFixed(2) : "—";
+            const bsCell  = b.bs ? escHtml(b.bs) : "—";
+            const revCell = revivableEmoji(b.revivable, b.statusState);
+            return `<tr class="${warRow}"><td><a class="bh3-link" href="${PROFILE_URL}${b.target_id}" target="_blank" rel="noopener">${escHtml(b.target_name)}</a><span style="color:#444;font-size:11px"> L${b.target_level}</span>${countBadge}${warBadge}</td><td class="num">${escHtml(fmt.moneyFull(b.reward))}</td><td class="num">${ffCell}</td><td class="num">${bsCell}</td><td>${statusCell}</td><td class="bh3-rev" title="${revCell==="💚"?"Revivable":revCell==="❌"?"Not revivable":"—"}">${revCell}</td><td><button class="bh3-atk" data-id="${b.target_id}">Attack</button></td></tr>`;
+        }
+
+        _sortList(list) {
+            const col = this._sortCol, dir = this._sortDir === "asc" ? 1 : -1;
+            const key = m => {
+                switch (col) {
+                    case "target": return String(m.target_name || "").toLowerCase();
+                    case "reward": return m.reward || 0;
+                    case "ff":     return m.ff == null ? Infinity : m.ff;
+                    case "bs":     return parseBS(m.bs) == null ? Infinity : parseBS(m.bs);
+                    case "status": return (m.statusState === "Okay" ? 0 : 1) * 1e6 + Math.max(0, (m.hospUntil||0) - Math.floor(Date.now()/1000));
+                    default:       return m.reward || 0;
+                }
+            };
+            return [...list].sort((a,b) => {
+                const ka = key(a), kb = key(b);
+                if (ka === Infinity && kb !== Infinity) return 1;
+                if (kb === Infinity && ka !== Infinity) return -1;
+                return ka < kb ? -dir : ka > kb ? dir : 0;
+            });
+        }
+
+        // ── Tracking tab ───────────────────────────────────────
+        _renderTracking() {
+            const con      = this._panel.querySelector("#bh3-content");
+            const targets  = TrackedStore.load();
+            const statuses = this.hunter._trackedStatuses;
+            const ffMap    = this.hunter._trackedFF;
+
+            const tbar = `<div id="bh3-tbar"><button id="bh3-trf" class="bh3-btn bh3-btn-m">Refresh now</button><span>${targets.length} tracked player${targets.length===1?"":"s"}</span></div>`;
+
+            if (targets.length === 0) {
+                con.innerHTML = tbar + `<div class="bh3-empty">No tracked players yet.<br><span style="color:#444">Open any player's profile and tap <b>🎯 Track</b> to add them here.</span></div>`;
+                con.querySelector("#bh3-trf").addEventListener("click", async () => { await this.hunter.refreshTracked().catch(() => {}); });
+                return;
+            }
+
+            const rows = targets.map(t => {
+                const s   = statuses?.get(t.id);
+                const ff  = ffMap?.get(t.id);
+                const bnt = this.hunter.getBounty(t.id);
+                const state = s?.state ?? null;
+
+                let stCell = `<span class="bh3-badge bh3-jail">Loading…</span>`;
+                if (s) {
+                    if      (state === "Okay")                           stCell = `<span class="bh3-badge bh3-ok">Okay ✓</span>`;
+                    else if (state === "Hospital")                       stCell = `<span class="bh3-badge bh3-hosp" data-hu="${s.until}">${fmt.hospLabel(s.until)}</span>`;
+                    else if (state === "Traveling" || state === "Abroad") stCell = `<span class="bh3-badge bh3-travel">✈️ ${escHtml(s.description||"Abroad")}</span>`;
+                    else if (state === "Jail")                           stCell = `<span class="bh3-badge bh3-jail">Jailed</span>`;
+                    else                                                  stCell = `<span class="bh3-badge bh3-jail">${escHtml(state||"—")}</span>`;
+                }
+                const warBadge = s?.inFactionWar ? `<span class="bh3-war-badge" title="Faction at war">⚔️ War</span>` : "";
+                const revCell  = state === "Hospital" ? revivableEmoji(s?.revivable, "Hospital") : "—";
+                const ffCell   = ff ? ff.ff.toFixed(2) : "—";
+                const bsCell   = ff?.bs ? escHtml(ff.bs) : "—";
+                const bntCell  = bnt ? `<span style="color:#4caf50;font-weight:700">${fmt.moneyFull(bnt.reward)}</span>` : `<span style="color:#444">None</span>`;
+                const rowCls   = s?.inFactionWar ? " bh3-row-war" : "";
+
+                return `<tr class="${rowCls}"><td><a class="bh3-link" href="${PROFILE_URL}${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a><span style="color:#444;font-size:11px"> L${t.level}</span>${warBadge}</td><td>${stCell}</td><td class="bh3-rev">${revCell}</td><td class="num">${ffCell}</td><td class="num">${bsCell}</td><td>${bntCell}</td><td><button class="bh3-atk" data-id="${t.id}">Attack</button></td><td><button class="bh3-trm" data-id="${t.id}" data-name="${escHtml(t.name)}">✕</button></td></tr>`;
+            }).join("");
+
+            con.innerHTML = tbar + `<div class="bh3-twrap"><table class="bh3-t"><thead><tr><th>Player</th><th>Status</th><th class="bh3-rev" title="Revivable">Rev.</th><th class="num">FF</th><th class="num">BS Est.</th><th>Bounty</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+
+            con.querySelector("#bh3-trf").addEventListener("click", async () => { await this.hunter.refreshTracked().catch(() => {}); });
+            con.querySelectorAll(".bh3-atk").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openTornUrl(ATTACK_URL + el.dataset.id); }));
+            con.querySelectorAll(".bh3-trm").forEach(btn => btn.addEventListener("click", () => {
+                const id = Number(btn.dataset.id), name = btn.dataset.name;
+                if (!confirm(`Remove ${name} from tracked players?`)) return;
+                TrackedStore.remove(id); this._renderTracking();
+            }));
+        }
+
+        // ── Settings tab ───────────────────────────────────────
+        _renderSettings() {
+            const con = this._panel.querySelector("#bh3-content");
+            const s   = this.hunter.settings;
+            const tk  = KR.tornKey() || "";
+            const pdaNote = KR.isPDA() ? `<p class="bh3-hint">Your Torn key is injected by Torn PDA and cannot be edited here.</p>` : "";
+
+            con.innerHTML = `<div id="bh3-swrap">
+<div class="bh3-sec"><h3>⚙️ Bounty Board</h3><div class="bh3-g2">
+<div class="bh3-fld"><label>Auto-refresh interval</label><select id="bh3-sr" class="bh3-inp"><option value="30"${s.refreshSec===30?" selected":""}>30 seconds</option><option value="60"${s.refreshSec===60?" selected":""}>60 seconds</option><option value="120"${s.refreshSec===120?" selected":""}>2 minutes</option><option value="300"${s.refreshSec===300?" selected":""}>5 minutes</option><option value="0"${s.refreshSec===0?" selected":""}>Off (manual only)</option></select><p class="bh3-hint">60s is well under the Torn API rate limit.</p></div>
+<div class="bh3-fld"><label>Options</label><label class="bh3-chk"><input type="checkbox" id="bh3-st"${s.toastsEnabled?" checked":""}> Show toast for new matching bounties</label><label class="bh3-chk"><input type="checkbox" id="bh3-su"${s.includeUnknownFF?" checked":""}> Show targets with unknown FF (no FFScouter data)</label></div>
+</div></div>
+<div class="bh3-sec"><h3>🎯 Player Tracking</h3><p class="bh3-hint">Track players from their profile pages. The Tracking tab shows their live status, hospital/travel timers, FF/BS estimates, current bounty, and clan war badge.</p><p class="bh3-hint">Clicking <b>🎯 Track</b> on a profile immediately fetches that player's data and opens the Tracking tab.</p></div>
+<div class="bh3-sec"><h3>🔑 Torn API Key</h3>${pdaNote}<div class="bh3-fld"><input id="bh3-stk" class="bh3-inp bh3-inp-m" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" value="${escHtml(tk)}"${KR.isPDA()?" disabled":""}></div>${!KR.isPDA()?`<div class="bh3-rowa"><button id="bh3-stks" class="bh3-btn bh3-btn-p">Save key</button><button id="bh3-stkc" class="bh3-btn bh3-btn-d">Clear &amp; log out</button></div><div id="bh3-stks2" class="bh3-ss"></div>`:""}</div>
+<div class="bh3-sec"><h3>📊 FFScouter Key</h3><p class="bh3-hint">Required for Fair Fight and Battle Stats bracket filters. One bulk call per refresh cycle — no extra rate-limit cost per target.</p><div class="bh3-fld"><input id="bh3-sfk" class="bh3-inp bh3-inp-m" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" value="${escHtml(KR.ffKey())}"></div><div class="bh3-rowa"><button id="bh3-sfks" class="bh3-btn bh3-btn-p">Save key</button><button id="bh3-sfkc" class="bh3-btn bh3-btn-m">Clear</button></div><div id="bh3-sfks2" class="bh3-ss"></div></div>
+<div class="bh3-sec"><h3>Environment</h3><p class="bh3-hint">Version ${VERSION} · Platform: ${IS_PDA?"Torn PDA":"Desktop/Browser"}</p><button id="bh3-sreset" class="bh3-btn bh3-btn-m">Reset all settings to defaults</button></div>
+</div>`;
+
+            const $ = id => con.querySelector("#" + id);
+            const ss = (id, cls, msg) => { const el = $(id); if (el) { el.className = "bh3-ss bh3-" + cls; el.textContent = msg; } };
+
+            ["bh3-sr","bh3-st","bh3-su"].forEach(id => $(id)?.addEventListener("change", () => {
+                this.hunter.updateSettings({
+                    refreshSec:       parseInt($("bh3-sr").value, 10),
+                    toastsEnabled:    $("bh3-st").checked,
+                    includeUnknownFF: $("bh3-su").checked,
+                });
+                if (this.hunter.settings.refreshSec > 0) { this.hunter.stop(); this.hunter.start(); }
+                else this.hunter.stop();
+            }));
+
+            if (!KR.isPDA()) {
+                $("bh3-stks")?.addEventListener("click", async () => {
+                    const k = $("bh3-stk").value.trim();
+                    if (!/^[A-Za-z0-9]{16}$/.test(k)) { ss("bh3-stks2","err2","Must be 16 alphanumeric characters."); return; }
+                    ss("bh3-stks2","inf","Validating…"); this.hunter.api.setKey(k);
+                    try { await this.hunter.api.validateKey(); } catch(e) { ss("bh3-stks2","err2","Rejected: "+(e.message||"invalid")); return; }
+                    KR.saveTorn(k); ss("bh3-stks2","ok2","Saved ✓");
+                    await this.hunter.refresh().catch(() => {});
+                });
+                $("bh3-stkc")?.addEventListener("click", () => {
+                    if (!confirm("Clear API key and return to the auth screen?")) return;
+                    KR.clearTorn(); this.hunter.stop(); this.toaster.clearAll(); this.setAuthed(false);
+                });
+            }
+
+            $("bh3-sfks")?.addEventListener("click", async () => {
+                const k = $("bh3-sfk").value.trim();
+                if (!k) { KR.clearFF(); ss("bh3-sfks2","inf","Cleared."); return; }
+                ss("bh3-sfks2","inf","Validating with FFScouter…");
+                const r = await validateFFKey(k);
+                if (!r.ok) { ss("bh3-sfks2","err2",r.msg); return; }
+                KR.saveFF(k); ss("bh3-sfks2","ok2",r.msg + " Refreshing…");
+                await this.hunter.refresh().catch(() => {}); ss("bh3-sfks2","ok2",r.msg + " Saved ✓");
+            });
+            $("bh3-sfkc")?.addEventListener("click", () => { KR.clearFF(); $("bh3-sfk").value = ""; ss("bh3-sfks2","inf","Cleared."); });
+            $("bh3-sreset")?.addEventListener("click", () => {
+                if (!confirm("Reset all settings to defaults?")) return;
+                this.hunter.updateSettings({...DEFAULT_SETTINGS}); this._renderSettings();
+            });
+        }
+    }
+
+    // ── Profile Track Button ───────────────────────────────────
+    function setupProfileInjector(hunter, ui) {
+        let lastUrl = "", lastXid = "";
+        const tryInject = () => {
+            const url = location.href;
+            if (!url.includes("profiles.php")) { const b = document.getElementById("bh3-tb"); if (b) b.remove(); lastXid = ""; return; }
+            const xid = new URLSearchParams(location.search).get("XID") || "";
+            if (!xid) { const b = document.getElementById("bh3-tb"); if (b) b.remove(); lastXid = ""; return; }
+            if (document.getElementById("bh3-tb") && lastXid === xid) return;
+            const prev = document.getElementById("bh3-tb"); if (prev) prev.remove();
+            lastXid = xid;
+            const id = Number(xid); if (!id) return;
+            let name = `Player ${id}`, level = 0;
+            for (const sel of ["[class*='playerName']","[class*='player-name']","[class*='name___']",".profile-header h4","h4.bold"]) {
+                const el = document.querySelector(sel);
+                if (el && el.textContent.trim() && el.textContent.trim().length < 40) { name = el.textContent.trim(); break; }
+            }
+            const isTracked = TrackedStore.has(id);
+            const btn = document.createElement("button");
+            btn.id = "bh3-tb"; btn.className = "bh3-tb" + (isTracked ? " bh3-tb-on" : "");
+            btn.textContent = isTracked ? "✓ Tracked" : "🎯 Track";
+            btn.addEventListener("click", async () => {
+                if (TrackedStore.has(id)) {
+                    TrackedStore.remove(id);
+                    btn.textContent = "🎯 Track";
+                    btn.classList.remove("bh3-tb-on");
+                } else {
+                    TrackedStore.add({id, name, level});
+                    btn.textContent = "⏳ Fetching…";
+                    btn.disabled = true;
+                    try { await hunter.refreshOneTracked(id); } catch {}
+                    btn.textContent = "✓ Tracked";
+                    btn.classList.add("bh3-tb-on");
+                    btn.disabled = false;
+                    // Open tracking tab
+                    ui.activeTab = "tracking";
+                    if (!ui._isOpen()) ui.toggle(true);
+                    else { ui._syncTabs(); ui._renderActive(); }
+                }
+            });
+            document.body.appendChild(btn);
+        };
+        setInterval(() => { if (location.href !== lastUrl) { lastUrl = location.href; setTimeout(tryInject, 500); setTimeout(tryInject, 1500); } }, 400);
+        tryInject(); setTimeout(tryInject, 800); setTimeout(tryInject, 2000);
+    }
+
+    // ── Eugene Footer Menu (shared across scripts) ─────────────
+    (function setupEugFooterMenu() {
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        if (W.__eugFooterMenuLoaded) return; W.__eugFooterMenuLoaded = true; W.__eugeneScripts = W.__eugeneScripts || [];
+        const ROW_ID = "eug-footer-row";
+        function injectFMCSS(){if(document.getElementById("eug-footer-style"))return;const s=document.createElement("style");s.id="eug-footer-style";s.textContent=`[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`;document.head.appendChild(s);}
+        function injectEntryCSS(e){if(!e.color)return;const id=`eug-color-${e.id}`,dark=e.colorDark||"#222",hover=e.hoverColor||e.color,css=`[data-eug-id="${e.id}"]{background:linear-gradient(to bottom,${e.color},${dark})!important}[data-eug-id="${e.id}"]:hover{background:linear-gradient(to bottom,${hover},${e.color})!important}`;const ex=document.getElementById(id);if(ex){ex.textContent=css;return;}const el=document.createElement("style");el.id=id;el.textContent=css;document.head.appendChild(el);}
+        const findRefBtn=()=>document.getElementById("notes_panel_button")||document.getElementById("people_panel_button"),getRow=()=>document.getElementById(ROW_ID),closeRow=()=>{const r=getRow();if(r)r.classList.remove("eug-open");};
+        const openRow=(btn)=>{const row=getRow();if(!row)return;const rect=btn.getBoundingClientRect();row.classList.add("eug-open");const rr=row.getBoundingClientRect();const left=Math.max(4,Math.min(rect.left+rect.width/2-rr.width/2,window.innerWidth-rr.width-4));row.style.left=left+"px";row.style.bottom=(window.innerHeight-rect.top+6)+"px";};
+        function makeScriptBtn(entry,refBtn,role){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title=entry.name;btn.setAttribute("data-eug",role);btn.setAttribute("data-eug-id",entry.id);btn.innerHTML=(entry.iconSVG||"").replace(/<svg\b([^>]*)>/,(m,a)=>/\sclass\s*=/.test(a)?m:`<svg${a} class="${ic}">`);btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();closeRow();try{entry.onClick();}catch{}});injectEntryCSS(entry);return btn;}
+        function makeMenuBtn(refBtn){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title="My userscripts";btn.setAttribute("data-eug","menu");btn.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`;btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();const row=getRow();if(row&&row.classList.contains("eug-open"))closeRow();else openRow(btn);});return btn;}
+        const LEGACY=["tat-footer-btn","spa-footer-btn"];
+        function render(){const refBtn=findRefBtn();if(!refBtn)return false;injectFMCSS();const parent=refBtn.parentNode;parent.querySelectorAll("[data-eug]").forEach(el=>el.remove());LEGACY.forEach(id=>{const el=document.getElementById(id);if(el)el.remove();});const oldRow=getRow();if(oldRow)oldRow.remove();const scripts=W.__eugeneScripts||[];if(scripts.length===0)return true;if(scripts.length===1){parent.insertBefore(makeScriptBtn(scripts[0],refBtn,"solo"),refBtn);}else{const mb=makeMenuBtn(refBtn);parent.insertBefore(mb,refBtn);const row=document.createElement("div");row.id=ROW_ID;row.setAttribute("data-eug-row","");for(const sc of scripts)row.appendChild(makeScriptBtn(sc,refBtn,"item"));document.body.appendChild(row);}return true;}
+        function mount(){render();let pending=false;const obs=new MutationObserver(()=>{if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;const r=findRefBtn();if(r&&!r.parentNode.querySelector("[data-eug]"))render();});});obs.observe(document.body,{childList:true,subtree:true});}
+        W.addEventListener("eugene-scripts-updated",render);
+        document.addEventListener("click",(e)=>{const row=getRow();if(!row||!row.classList.contains("eug-open"))return;const mb=document.querySelector('[data-eug="menu"]');if(mb&&mb.contains(e.target))return;if(row.contains(e.target))return;closeRow();});
+        document.addEventListener("keydown",(e)=>{if(e.key==="Escape")closeRow();});
+        W.addEventListener("scroll",closeRow,{passive:true}); W.addEventListener("resize",closeRow);
+        W.registerEugeneScript=function(entry){const list=W.__eugeneScripts,i=list.findIndex(s=>s.id===entry.id);if(i>=0)list[i]=entry;else list.push(entry);W.dispatchEvent(new CustomEvent("eugene-scripts-updated"));};
+        W.mountEugeneFooterMenu=mount;
+    })();
+
+    // ── Main ───────────────────────────────────────────────────
+    const BH3_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><defs><linearGradient id="bh3g" x1="0.5" x2="0.5" y2="1"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#bh3g)"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8Z"/><path d="M12 6a6 6 0 1 0 6 6 6 6 0 0 0-6-6Zm0 10a4 4 0 1 1 4-4 4 4 0 0 1-4 4Z"/><circle cx="12" cy="12" r="1.5"/><path d="M11 0h2v5h-2zM11 19h2v5h-2zM0 11h5v2H0zM19 11h5v2h-5z"/></g></svg>`;
+
+    function main() {
+        const initialKey = KR.tornKey();
+        const api     = new TornAPI(initialKey || "");
+        const hunter  = new Hunter(api);
+        const toaster = new Toaster();
+        const ui      = new UI(hunter, toaster);
+
+        window.__bh3UI = ui;
+        ui.inject();
+        ui.setAuthed(!!initialKey);
+        setupProfileInjector(hunter, ui);
+
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        W.registerEugeneScript({
+            id:"bh3", name:"Bounty Hunter 3.0",
+            color:"#8b1a1a", colorDark:"#4a0e0e", hoverColor:"#b02020",
+            iconSVG: BH3_ICON,
+            onClick: () => ui.toggle(true),
+        });
+        W.mountEugeneFooterMenu();
+
+        if (initialKey) hunter.start();
+    }
+
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+    else main();
+})();
