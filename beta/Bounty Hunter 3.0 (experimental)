@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bounty Hunter 3.0
 // @namespace    https://github.com/nolan2600/torn-scripts/bounty-hunter-3
-// @version      3.0.0
+// @version      3.0.1
 // @description  Full bounty board with six combinable dropdown filters, clan war badges + row tinting, and a live player tracking tab showing FF/BS/bounty/status data. Torn PDA compatible.
 // @author       nolan2600
 // @match        https://www.torn.com/*
@@ -18,7 +18,7 @@
 
     const PDA_API_KEY   = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION = "3.0.0";
+    const VERSION = "3.0.1";
 
     const LS = {
         apiKey:   "bh3_apiKey",
@@ -722,7 +722,7 @@ table.bh3-t{width:100%;border-collapse:collapse}
 
             this._cdTimer = setInterval(() => {
                 if (!this._isOpen()) return;
-                const cdEl = document.getElementById("bh3-cd"); if (cdEl) cdEl.textContent = this.hunter.secondsUntilRefresh() + "s";
+                const cdEl = document.getElementById("bh3-cd"); if (cdEl) cdEl.textContent = this.hunter.secondsUntilRefresh();
                 document.querySelectorAll("[data-hu]").forEach(el => { const u = parseInt(el.dataset.hu, 10); if (Number.isFinite(u)) el.textContent = fmt.hospLabel(u); });
             }, 1000);
         }
