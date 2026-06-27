@@ -18,7 +18,7 @@
 
     const PDA_API_KEY   = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION = "3.0.1";
+    const VERSION = "3.1.0";
 
     const LS = {
         apiKey:   "bh3_apiKey",
@@ -86,7 +86,7 @@
     const DEFAULT_SETTINGS = {
         refreshSec: 60,
         toastsEnabled: true,
-        includeUnknownFF: false,
+        includeUnknownFF: true,
     };
 
     const DEFAULT_FILTERS = {
@@ -317,7 +317,8 @@
             this.settings = loadSettings();
             this.filters  = loadFilters();
             this.myUserId = null;
-            this._bounties      = [];   // enriched + deduped bounties from last fetch
+            this._allBounties   = [];   // all deduped bounties (for getBounty lookup on tracking tab)
+            this._bounties      = [];   // pre-filtered + profile-enriched candidates (for hunt table)
             this._ffMap         = new Map();  // bounty player id → {ff, bs}
             this._warSet        = new Set();
             this._warFetchedAt  = 0;
@@ -325,7 +326,7 @@
             this._trackedStatuses = new Map(); // id → {state, until, revivable, inFactionWar, description}
             this._trackedFF       = new Map(); // id → {ff, bs}
             this._timer   = null; this._running = false; this._nextAt = 0;
-            this.lastError = null; this.lastCounts = null;
+            this.lastError = null; this.lastCounts = null; this._loadingMsg = null;
             this.onUpdate         = null;
             this.onToast          = null;
             this.onTrackedUpdate  = null;
@@ -333,6 +334,26 @@
 
         updateSettings(next) { this.settings = {...this.settings, ...next}; saveSettings(this.settings); }
         updateFilters(next)  { this.filters  = {...this.filters,  ...next}; saveFilters(this.filters); }
+
+        // Pre-filter by price/FF/BS using only data available before profile fetches.
+        // Conservative: only exclude when we KNOW a bounty fails (never exclude on missing data).
+        _preFilter(bounties) {
+            const f = this.filters;
+            const minPrice = Number(f.minPrice) || 0;
+            const ffOpt = FF_OPTS.find(o => o.v === f.ffRange)   || FF_OPTS[0];
+            const bsOpt = BS_OPTS.find(o => o.v === f.bsBracket) || BS_OPTS[0];
+            return bounties.filter(b => {
+                if (b.reward < minPrice) return false;
+                if (ffOpt.v !== "any" && b.ff !== null) {
+                    if (b.ff < ffOpt.min || b.ff > ffOpt.max) return false;
+                }
+                if (bsOpt.v !== "any" && b.bs !== null) {
+                    const bsNum = parseBS(b.bs);
+                    if (bsNum !== null && (bsNum < bsOpt.min || bsNum > bsOpt.max)) return false;
+                }
+                return true;
+            });
+        }
 
         start() { if (this._running) return; this._running = true; this._tick(); }
         stop()  { if (this._timer) { clearTimeout(this._timer); this._timer = null; } this._running = false; }
@@ -355,7 +376,8 @@
         }
 
         async refresh() {
-            this.lastError = null;
+            this.lastError  = null;
+            this._loadingMsg = "Fetching bounties…";
             if (this.onUpdate) this.onUpdate({loading: true});
 
             try { const p = await this.api.validateKey(); if (p) this.myUserId = p.id || this.myUserId; } catch {}
@@ -374,33 +396,50 @@
             }
             const deduped = [...grouped.values()].filter(b => !this.myUserId || b.target_id !== this.myUserId);
 
-            // Fetch FF/BS for all bounty targets
-            const ids = deduped.map(b => Number(b.target_id));
-            this._ffMap = await fetchFFStats(KR.ffKey(), ids);
+            // ── Phase 1: Bulk FF/BS fetch (1 API call regardless of bounty count) ──
+            this._loadingMsg = `Fetching FF data for ${deduped.length} targets…`;
+            if (this.onUpdate) this.onUpdate({loading: true});
 
-            // Fetch war factions (cached)
+            const allIds = deduped.map(b => Number(b.target_id));
+            this._ffMap  = await fetchFFStats(KR.ffKey(), allIds);
+
+            // Stamp FF/BS onto every bounty entry so pre-filter can use it
+            for (const b of deduped) {
+                const ff = this._ffMap.get(Number(b.target_id));
+                b.ff = ff?.ff ?? null;
+                b.bs = ff?.bs ?? null;
+                b.statusState = null; b.hospUntil = 0;
+                b.revivable = null; b.inFactionWar = false;
+            }
+
+            // Pre-filter by price/FF/BS — no profile data needed for these
+            const candidates = this._preFilter(deduped);
+
+            // Fetch war factions (cached, 1 call per 5 min)
             this._warSet = await this._getWarFactions();
 
-            // Fetch profiles (status, revivable, faction)
-            const profiles = await this._fetchProfiles(ids);
+            // ── Phase 2: Profile fetch for candidates only ──
+            this._loadingMsg = `Fetching ${candidates.length} profile${candidates.length===1?"":"s"} (filtered from ${deduped.length})…`;
+            if (this.onUpdate) this.onUpdate({loading: true});
 
-            // Enrich each bounty with profile + ff data
-            const nowSec = Math.floor(Date.now() / 1000);
-            for (const b of deduped) {
-                const p  = profiles.get(Number(b.target_id));
-                const ff = this._ffMap.get(Number(b.target_id));
-                b.ff           = ff?.ff  ?? null;
-                b.bs           = ff?.bs  ?? null;
-                b.statusState  = p?.status?.state ?? null;
-                b.hospUntil    = p?.status?.until ?? 0;
-                b.revivable    = p?.revivable     ?? null;
+            const candidateIds = candidates.map(b => Number(b.target_id));
+            const profiles = await this._fetchProfiles(candidateIds);
+
+            // Enrich candidates with profile data (status, war, revivable, name, level)
+            for (const b of candidates) {
+                const p = profiles.get(Number(b.target_id));
+                b.statusState  = p?.status?.state  ?? null;
+                b.hospUntil    = p?.status?.until   ?? 0;
+                b.revivable    = p?.revivable        ?? null;
                 b.inFactionWar = !!(p?.faction_id && this._warSet.has(Number(p.faction_id)));
-                if (p?.name)                    b.target_name  = p.name;
+                if (p?.name)                     b.target_name  = p.name;
                 if (typeof p?.level === "number") b.target_level = p.level;
             }
 
-            this._bounties  = deduped;
-            this.lastCounts = {total: bounties.length, deduped: deduped.length};
+            this._allBounties = deduped;     // full set — used by getBounty() for tracking tab
+            this._bounties    = candidates;  // profile-enriched candidates — used by hunt table
+            this.lastCounts   = {total: bounties.length, deduped: deduped.length, candidates: candidates.length};
+            this._loadingMsg  = null;
 
             if (this.onUpdate) this.onUpdate({loading: false});
             if (this.settings.toastsEnabled && this.onToast) this.onToast(this.applyFilters(this._bounties));
@@ -542,8 +581,9 @@
             if (this.onTrackedUpdate) this.onTrackedUpdate();
         }
 
-        // Look up whether a player currently has a bounty on the board
-        getBounty(id) { return this._bounties.find(b => b.target_id === Number(id)) || null; }
+        // Look up whether a player currently has a bounty on the board.
+        // Uses _allBounties so tracked players below the current price filter still show their bounty.
+        getBounty(id) { return this._allBounties.find(b => b.target_id === Number(id)) || null; }
 
         secondsUntilRefresh() { return Math.max(0, Math.round((this._nextAt - Date.now()) / 1000)); }
     }
@@ -771,20 +811,34 @@ table.bh3-t{width:100%;border-collapse:collapse}
             const matches = this.hunter.applyFilters(this.hunter._bounties);
             const sorted  = this._sortList(matches);
             const cnt     = this.hunter.lastCounts;
+            const lmsg    = this.hunter._loadingMsg;
             const errLine = this.hunter.lastError ? `<span class="bh3-err">${escHtml(this.hunter.lastError.message||"error")}</span>` : "";
-            const noFF    = !KR.ffKey() && !this.hunter.settings.includeUnknownFF ? `<span class="bh3-err">No FFScouter key — all targets excluded. Set one in Settings.</span>` : "";
+            const noFF    = !KR.ffKey() && !this.hunter.settings.includeUnknownFF ? `<span class="bh3-err">No FFScouter key — unknown-FF targets excluded. Enable in Settings or add FFScouter key.</span>` : "";
+            const countLine = lmsg
+                ? `<span style="color:#777">${escHtml(lmsg)}</span>`
+                : cnt
+                    ? `<span>${sorted.length} shown · ${cnt.candidates} candidates · ${cnt.deduped} unique · ${cnt.total} raw</span>`
+                    : `<span>${sorted.length} match${sorted.length===1?"":"es"}</span>`;
 
             con.innerHTML = `
 ${this._filterBarHTML(f)}
 <div id="bh3-sbar">
   <button id="bh3-rbtn"${this._refreshing?" disabled":""}>Refresh now</button>
   <span>Next: <span id="bh3-cd">${this.hunter.secondsUntilRefresh()}</span>s</span>
-  <span>${sorted.length} match${sorted.length===1?"":"es"}${cnt?` of ${cnt.deduped} bounties`:""}</span>
+  ${countLine}
   ${errLine}${noFF}
 </div>
 <div class="bh3-twrap">
 ${sorted.length === 0
-    ? `<div class="bh3-empty">No bounties match your current filters.<br><span style="color:#444">Adjust the dropdowns above, or wait for the next auto-refresh.</span></div>`
+    ? (() => {
+        const c = this.hunter.lastCounts;
+        const hint = c
+            ? (c.deduped === 0 ? "No bounties found on the board right now."
+                : c.candidates === 0 ? `All ${c.deduped} targets were removed by the Reward, FF, or BS filters above.`
+                : `${c.candidates} candidate${c.candidates===1?"":"s"} fetched — status/hospital/war filters removed the rest.`)
+            : "Adjust the dropdowns above, or wait for the next auto-refresh.";
+        return `<div class="bh3-empty">No bounties match your current filters.<br><span style="color:#444">${escHtml(hint)}</span></div>`;
+    })()
     : `<table class="bh3-t"><thead><tr>
         <th class="sortable" data-col="target">Target</th>
         <th class="sortable num" data-col="reward">Reward</th>
