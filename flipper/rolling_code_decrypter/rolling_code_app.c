@@ -3,6 +3,9 @@
 #include "hcs_protocol.h"
 #include "signal_decoder.h"
 #include "known_keys.h"
+#include "gm_protocol.h"
+#include "fob_state.h"
+#include "fob_tx.h"
 
 #include <furi.h>
 #include <gui/gui.h>
@@ -12,7 +15,7 @@
 #include <input/input.h>
 #include <storage/storage.h>
 #include <flipper_format/flipper_format.h>
-#include <furi_hal_mem.h>
+#include <furi_hal_subghz.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -289,6 +292,68 @@ static void draw_list(Canvas* canvas, const char* const* items,
 /* Main draw dispatch                                                   */
 /* ------------------------------------------------------------------ */
 
+static void draw_fob_main(Canvas* canvas, RollingCodeApp* app) {
+    draw_header(canvas, "My Fob  315MHz");
+    canvas_set_font(canvas, FontSecondary);
+
+    if(!app->fob.valid) {
+        canvas_draw_str(canvas, 2, 25, "No fob programmed.");
+        canvas_draw_str(canvas, 2, 35, "Use 'Program BCM'");
+        canvas_draw_str(canvas, 2, 45, "to set up first.");
+        return;
+    }
+
+    char serial_str[24];
+    snprintf(serial_str, sizeof(serial_str), "ID: %07lX  Cnt:%lu",
+             (unsigned long)app->fob.serial,
+             (unsigned long)app->fob.counter[FobButtonLock]);
+    canvas_draw_str(canvas, 2, 22, serial_str);
+    canvas_draw_str(canvas, 2, 34, app->tx_status[0] ? app->tx_status : "Ready");
+
+    /* Button legend */
+    canvas_draw_str(canvas, 2,  48, "Up=Lock");
+    canvas_draw_str(canvas, 2,  58, "Dn=Unlock");
+    canvas_draw_str(canvas, 66, 48, "L=Trunk");
+    canvas_draw_str(canvas, 66, 58, "R=Panic");
+}
+
+static void draw_fob_program(Canvas* canvas, RollingCodeApp* app) {
+    draw_header(canvas, "Program BCM");
+    canvas_set_font(canvas, FontSecondary);
+
+    /* Multi-line step text */
+    const char* step_text = PROGRAM_STEPS[app->program_step];
+    uint8_t row = 0;
+    char line[32];
+    const char* p = step_text;
+    while(*p && row < 4) {
+        uint8_t col = 0;
+        while(*p && *p != '\n' && col < sizeof(line) - 1)
+            line[col++] = *p++;
+        line[col] = '\0';
+        if(*p == '\n') p++;
+        canvas_draw_str(canvas, 2, 22 + row * 10, line);
+        row++;
+    }
+
+    if(app->program_step == PROGRAM_STEP_COUNT - 1) {
+        /* Final step — show OK prompt */
+        canvas_draw_str(canvas, 2, 58, "OK=Send  Back=Cancel");
+    } else {
+        canvas_draw_str(canvas, 2, 58, "OK=Next  Back=Cancel");
+    }
+}
+
+static void draw_fob_capture(Canvas* canvas, RollingCodeApp* app) {
+    (void)app;
+    draw_header(canvas, "Capture Fob");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 22, "Press button on OEM");
+    canvas_draw_str(canvas, 2, 32, "fob near Flipper.");
+    canvas_draw_str(canvas, 2, 42, "Listening 315MHz...");
+    canvas_draw_str(canvas, 2, 56, "Back=Cancel");
+}
+
 static void app_draw_cb(Canvas* canvas, void* ctx) {
     RollingCodeApp* app = ctx;
     canvas_clear(canvas);
@@ -300,6 +365,18 @@ static void app_draw_cb(Canvas* canvas, void* ctx) {
         draw_list(canvas, MENU_ITEMS, MENU_ITEM_COUNT, app->menu_cursor, 20);
         break;
 
+    case AppStateFobMain:
+        draw_fob_main(canvas, app);
+        break;
+
+    case AppStateFobProgram:
+        draw_fob_program(canvas, app);
+        break;
+
+    case AppStateFobCapture:
+        draw_fob_capture(canvas, app);
+        break;
+
     case AppStateFileList:
         draw_header(canvas, "Select .sub File");
         if(app->file_count == 0) {
@@ -307,13 +384,11 @@ static void app_draw_cb(Canvas* canvas, void* ctx) {
             canvas_draw_str(canvas, 2, 28, "No files in");
             canvas_draw_str(canvas, 2, 38, SUBGHZ_DIR);
         } else {
-            /* Show basenames only */
             const char* ptrs[RC_MAX_FILES];
             for(uint8_t i = 0; i < app->file_count; i++) {
                 const char* slash = strrchr(app->files[i], '/');
                 ptrs[i] = slash ? slash + 1 : app->files[i];
             }
-            /* Visible window: up to 4 items */
             uint8_t start = app->file_cursor > 3 ? app->file_cursor - 3 : 0;
             uint8_t shown = app->file_count - start;
             if(shown > 4) shown = 4;
@@ -331,7 +406,6 @@ static void app_draw_cb(Canvas* canvas, void* ctx) {
     case AppStateResult:
         draw_header(canvas, app->decrypted ? "Decrypted" : "Frame Info");
         draw_scrollable_text(canvas, app->result_text, app->result_scroll);
-        /* Scroll hint */
         canvas_set_font(canvas, FontSecondary);
         if(app->result_scroll > 0)
             canvas_draw_str(canvas, 120, 20, "^");
@@ -347,12 +421,12 @@ static void app_draw_cb(Canvas* canvas, void* ctx) {
 
     case AppStateAbout:
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 2, 12, "Rolling Code Decrypter");
+        canvas_draw_str(canvas, 2, 12, "Rolling Code Tool v1.1");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str(canvas, 2, 24, "v1.0 — KeeLoq / HCS301");
-        canvas_draw_str(canvas, 2, 34, "Place .sub files in:");
-        canvas_draw_str(canvas, 2, 44, SUBGHZ_DIR);
-        canvas_draw_str(canvas, 2, 56, "Press Back to exit");
+        canvas_draw_str(canvas, 2, 24, "KeeLoq + GM OUC/KOBT");
+        canvas_draw_str(canvas, 2, 34, "315 MHz Unleashed TX");
+        canvas_draw_str(canvas, 2, 44, "Sub files: SD:/subghz/");
+        canvas_draw_str(canvas, 2, 54, "Back=exit");
         break;
     }
 }
@@ -368,6 +442,20 @@ static void app_input_cb(InputEvent* event, void* ctx) {
     furi_message_queue_put(queue, event, FuriWaitForever);
 }
 
+static void app_fob_tx(RollingCodeApp* app, FobButton button) {
+    FobTxResult result;
+    fob_tx_press(&app->fob, button, &result);
+    if(result.success) {
+        snprintf(app->tx_status, sizeof(app->tx_status),
+                 "Sent x%lu  Cnt:%lu",
+                 (unsigned long)result.frames_sent,
+                 (unsigned long)app->fob.counter[button]);
+    } else {
+        snprintf(app->tx_status, sizeof(app->tx_status),
+                 "ERR: %s", result.error_msg);
+    }
+}
+
 static bool app_handle_input(RollingCodeApp* app, InputEvent* ev) {
     if(ev->type != InputTypeShort && ev->type != InputTypeRepeat) return true;
 
@@ -379,24 +467,82 @@ static bool app_handle_input(RollingCodeApp* app, InputEvent* ev) {
     case AppStateMenu:
         if(key == InputKeyUp   && app->menu_cursor > 0) app->menu_cursor--;
         if(key == InputKeyDown && app->menu_cursor < MENU_ITEM_COUNT - 1) app->menu_cursor++;
-        if(key == InputKeyBack) return false; /* exit app */
+        if(key == InputKeyBack) return false;
         if(key == InputKeyOk) {
             switch(app->menu_cursor) {
-            case 0: /* Decode .sub file */
+            case 0: /* My Fob TX */
+                app->state = AppStateFobMain;
+                break;
+            case 1: /* Program BCM */
+                app->program_step = 0;
+                app->state = AppStateFobProgram;
+                break;
+            case 2: /* Capture fob signal */
+                app->state = AppStateFobCapture;
+                break;
+            case 3: /* Decode .sub file */
                 app_scan_files(app);
                 app->file_cursor = 0;
                 app->state = AppStateFileList;
                 break;
-            case 1: /* Try known keys */
+            case 4: /* Try known keys */
                 app->result_scroll = 0;
                 app_try_known_keys(app);
                 app->state = AppStateKeyList;
                 break;
-            case 2: /* About */
+            case 5: /* About */
                 app->state = AppStateAbout;
                 break;
             }
         }
+        break;
+
+    /* ---- My Fob transmit screen ---- */
+    case AppStateFobMain:
+        if(key == InputKeyBack)  { app->state = AppStateMenu; break; }
+        if(key == InputKeyUp)    app_fob_tx(app, FobButtonLock);
+        if(key == InputKeyDown)  app_fob_tx(app, FobButtonUnlock);
+        if(key == InputKeyLeft)  app_fob_tx(app, FobButtonTrunk);
+        if(key == InputKeyRight) app_fob_tx(app, FobButtonPanic);
+        break;
+
+    /* ---- BCM programming wizard ---- */
+    case AppStateFobProgram:
+        if(key == InputKeyBack) { app->state = AppStateMenu; break; }
+        if(key == InputKeyOk) {
+            if(app->program_step < PROGRAM_STEP_COUNT - 1) {
+                app->program_step++;
+            } else {
+                /* Final step: transmit programming frame to BCM */
+                if(!app->fob.valid)
+                    fob_state_init_gm(&app->fob, 0x1234567u);
+                bool ok = fob_tx_program_bcm(&app->fob);
+                if(ok) {
+                    app->fob.valid = true;
+                    fob_state_save(&app->fob);
+                    snprintf(app->tx_status, sizeof(app->tx_status),
+                             "BCM programmed OK!");
+                } else {
+                    snprintf(app->tx_status, sizeof(app->tx_status),
+                             "TX failed — retry");
+                }
+                app->state = AppStateFobMain;
+            }
+        }
+        break;
+
+    /* ---- Capture fob signal ---- */
+    case AppStateFobCapture:
+        if(key == InputKeyBack) { app->state = AppStateMenu; break; }
+        snprintf(app->result_text, RC_RESULT_LEN,
+            "Use Flipper built-in\n"
+            "Sub-GHz > Read RAW\n"
+            "at 315 MHz, capture\n"
+            "3 button presses.\n"
+            "Then use Decode .sub\n"
+            "to analyse the file.");
+        app->result_scroll = 0;
+        app->state = AppStateResult;
         break;
 
     /* ---- File list ---- */
@@ -409,7 +555,6 @@ static bool app_handle_input(RollingCodeApp* app, InputEvent* ev) {
             bool ok = app_load_sub_file(app, app->files[app->file_cursor]);
             app->result_scroll = 0;
             if(!ok) {
-                /* status_msg already set by loader */
                 snprintf(app->result_text, RC_RESULT_LEN,
                          "Error: %s", app->status_msg);
             }
@@ -423,7 +568,6 @@ static bool app_handle_input(RollingCodeApp* app, InputEvent* ev) {
         if(key == InputKeyBack)  { app->state = AppStateMenu; break; }
         if(key == InputKeyUp   && app->result_scroll > 0) app->result_scroll--;
         if(key == InputKeyDown && app->result_scroll < 20) app->result_scroll++;
-        /* OK on result triggers key-try if not yet done */
         if(key == InputKeyOk && app->state == AppStateResult && !app->decrypted) {
             app->result_scroll = 0;
             app_try_known_keys(app);
@@ -453,6 +597,14 @@ int32_t rolling_code_app(void* p) {
     furi_assert(app);
     memset(app, 0, sizeof(*app));
     app->state = AppStateMenu;
+
+    /* Restore saved fob state (counter must survive reboots) */
+    if(fob_state_load(&app->fob)) {
+        snprintf(app->tx_status, sizeof(app->tx_status),
+                 "Fob loaded ID:%07lX", (unsigned long)app->fob.serial);
+    } else {
+        snprintf(app->tx_status, sizeof(app->tx_status), "No fob — use Program BCM");
+    }
 
     FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
 
