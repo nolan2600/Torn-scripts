@@ -1,0 +1,12 @@
+# Compiled binaries
+flipper/rolling_code_decrypter/keeloq_test
+
+# Flipper build artifacts
+*.fap
+dist/
+.sconsign.dblite
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
