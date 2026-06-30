@@ -1,0 +1,943 @@
+// ==UserScript==
+// @name         Bounty Hunter 4
+// @namespace    https://github.com/nolan2600/torn-scripts/bounty-hunter-4
+// @version      4.0.0
+// @description  Tactical live bounty board — 30-minute attack window, FF/BS/war filters, marked-target tracking, hospital + travel alerts. Desktop + Torn PDA.
+// @author       nolan2600
+// @match        https://www.torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @connect      ffscouter.com
+// @license      GPL-3.0-or-later
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+
+(function () {
+    "use strict";
+
+    const PDA_API_KEY   = "###PDA-APIKEY###";
+    const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
+    const VERSION = "4.0.0";
+    const LS = { apiKey:"bh4_apiKey", ffKey:"bh4_ffscouterKey", settings:"bh4_settings", shared:"bh4_shared", debug:"bh4_debug", marked:"bh4_marked" };
+    const SHARED_FRESH_RATIO = 0.8;
+    const SPA_LS_APIKEY = "spa_apiKey";
+
+    const BS_RANGES = [
+        { id:"bs-2k",   label:"2k – 25k",    min:2_000,       max:25_000 },
+        { id:"bs-20k",  label:"20k – 250k",  min:20_000,      max:250_000 },
+        { id:"bs-200k", label:"200k – 2.5m", min:200_000,     max:2_500_000 },
+        { id:"bs-2m",   label:"2m – 25m",    min:2_000_000,   max:25_000_000 },
+        { id:"bs-20m",  label:"20m – 250m",  min:20_000_000,  max:250_000_000 },
+        { id:"bs-200m", label:"200m+",        min:200_000_000, max:Infinity },
+    ];
+
+    const DEFAULT_SETTINGS = {
+        minPrice:500_000, minFF:1.0, maxFF:3.0, hospitalMaxMin:30, statusFilter:"all",
+        refreshSec:60, toastsEnabled:true, includeUnknownFF:false,
+        revivableOnly:false, bsRanges:[], hospAlerts:false, hideWarTargets:false, markedAlerts:false,
+    };
+
+    const NPP_DAYS = 14;
+    function isAttackableByAge(targetAge, myAge) {
+        if (targetAge == null) return true;
+        const meUnderNPP = (myAge != null) && (myAge < NPP_DAYS);
+        if (meUnderNPP) return targetAge >= 1;
+        return targetAge >= NPP_DAYS;
+    }
+
+    const HOSPITAL_ADJ_TO_COUNTRY = {
+        "Mexican":"Mexico","Caymanian":"Cayman Islands","Canadian":"Canada","Hawaiian":"Hawaii",
+        "British":"United Kingdom","Argentinian":"Argentina","Argentine":"Argentina","Swiss":"Switzerland",
+        "Japanese":"Japan","Chinese":"China","Emirati":"United Arab Emirates","South African":"South Africa",
+    };
+    function getPlayerCountry(status) {
+        if (!status || typeof status !== "object") return null;
+        const state = status.state, desc = status.description || "";
+        if (state === "Okay" || state === "Jail" || state === "Federal") return "Torn";
+        if (state === "Abroad") { const m = /^In\s+(.+)$/.exec(desc); return m ? m[1].trim() : null; }
+        if (state === "Hospital") {
+            if (/^In hospital\b/i.test(desc)) return "Torn";
+            const m = /^In an?\s+(.+?)\s+hospital\b/i.exec(desc);
+            if (m) return HOSPITAL_ADJ_TO_COUNTRY[m[1].trim()] || null;
+            return null;
+        }
+        return null;
+    }
+
+    const API_BASE="https://api.torn.com/v2", FF_BASE="https://ffscouter.com/api/v1";
+    const API_DELAY_MS=750, ATTACK_URL="https://www.torn.com/page.php?sid=attack&user2ID=", PROFILE_URL="https://www.torn.com/profiles.php?XID=";
+    const TOAST_TIMEOUT_MS=15_000, TOAST_MAX_DESKTOP=3, TOAST_MAX_MOBILE=1, MOBILE_MEDIA="(max-width: 768px)";
+    const STATUS_CACHE_MS=20_000, STATUS_CONCURRENCY=3;
+    const FACTION_CACHE_MS=5*60*1000; // 5-minute faction war status cache
+
+    // Flight durations in minutes per destination + plane type (from Torn game data)
+    const FLIGHT_MINS={
+        "Mexico":            {light_aircraft:18, airliner:26, airliner_business:8,  private_jet:13},
+        "Cayman Islands":    {light_aircraft:25, airliner:35, airliner_business:11, private_jet:18},
+        "Canada":            {light_aircraft:29, airliner:41, airliner_business:12, private_jet:20},
+        "Hawaii":            {light_aircraft:94, airliner:134,airliner_business:40, private_jet:67},
+        "United Kingdom":    {light_aircraft:111,airliner:159,airliner_business:48, private_jet:80},
+        "Argentina":         {light_aircraft:117,airliner:167,airliner_business:50, private_jet:83},
+        "Switzerland":       {light_aircraft:123,airliner:175,airliner_business:53, private_jet:88},
+        "Japan":             {light_aircraft:158,airliner:225,airliner_business:68, private_jet:113},
+        "China":             {light_aircraft:169,airliner:242,airliner_business:72, private_jet:121},
+        "United Arab Emirates":{light_aircraft:190,airliner:271,airliner_business:81,private_jet:135},
+        "South Africa":      {light_aircraft:208,airliner:297,airliner_business:89, private_jet:149},
+    };
+    // Resolve description text to a canonical country name
+    function resolveCountryFromDesc(desc){
+        const d=(desc||"").toLowerCase();
+        for(const name of Object.keys(FLIGHT_MINS)){if(d.includes(name.toLowerCase()))return name;}
+        if(/mex/.test(d))return"Mexico";
+        if(/cayman/.test(d))return"Cayman Islands";
+        if(/can/.test(d))return"Canada";
+        if(/hawaii/.test(d))return"Hawaii";
+        if(/united kingdom|london|uk/.test(d))return"United Kingdom";
+        if(/argentin/.test(d))return"Argentina";
+        if(/swiss/.test(d))return"Switzerland";
+        if(/japan/.test(d))return"Japan";
+        if(/china/.test(d))return"China";
+        if(/emirates|dubai|uae/.test(d))return"United Arab Emirates";
+        if(/south africa/.test(d))return"South Africa";
+        return null;
+    }
+    // Compute landing timestamp from first observation of travel
+    function computeLandingTs(desc,plane){
+        const country=resolveCountryFromDesc(desc);
+        if(!country)return 0;
+        const durations=FLIGHT_MINS[country];
+        if(!durations)return 0;
+        const mins=durations[plane]||durations.airliner||0;
+        if(!mins)return 0;
+        return Math.floor(Date.now()/1000)+mins*60;
+    }
+
+    function toastMaxVisible() { try { return window.matchMedia(MOBILE_MEDIA).matches ? TOAST_MAX_MOBILE : TOAST_MAX_DESKTOP; } catch { return TOAST_MAX_DESKTOP; } }
+    const IS_PDA      = typeof PDA_httpGet === "function";
+    const HAS_PDA_KEY = PDA_API_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_API_KEY);
+    const GM_XHR      = (typeof GM_xmlhttpRequest !== "undefined") ? GM_xmlhttpRequest : null;
+
+    // ── Debug log ──────────────────────────────────────────────
+    const debugLog = [], MAX_DEBUG_LOG = 150, debugBus = document.createElement("div");
+    function isDebugOn() { try { return localStorage.getItem(LS.debug) === "1"; } catch { return false; } }
+    function redactUrl(url) {
+        try { const u=new URL(url),p=new URLSearchParams(u.search); for(const k of["key","apikey"]) if(p.has(k)) p.set(k,"***"); const q=p.toString(); return `${u.host}${u.pathname}${q?"?"+q:""}`; } catch { return url; }
+    }
+    function logDebug(label,level="info",ms=null) {
+        if(!isDebugOn()) return;
+        debugLog.push({ts:new Date().toISOString().slice(11,19),label,level,ms:(typeof ms==="number")?Math.round(ms):null});
+        if(debugLog.length>MAX_DEBUG_LOG) debugLog.shift();
+        debugBus.dispatchEvent(new CustomEvent("entry"));
+    }
+
+    // ── Utilities ──────────────────────────────────────────────
+    const fmt = {
+        money(n) { if(n==null)return"$0"; const a=Math.abs(n),s=a>=1e9?(a/1e9).toFixed(2)+"B":a>=1e6?(a/1e6).toFixed(2)+"M":a>=1e3?(a/1e3).toFixed(1)+"K":a.toLocaleString(); return(n<0?"-$":"$")+s; },
+        moneyFull(n) { return(n<0?"-":"")+"\$"+Math.abs(n).toLocaleString(); },
+        hospLabel(untilSec) { const rem=Math.max(0,untilSec-Math.floor(Date.now()/1000)); if(rem<=0)return"OUT"; const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),s=rem%60; if(h>0)return`${h}h ${m}m`; return m===0?`${s}s`:`${m}m ${s}s`; },
+        travelLabel(description,landingTs) { const dir=travelDirLabel(description||""); if(!landingTs)return dir; const rem=Math.max(0,landingTs-Math.floor(Date.now()/1000)); if(!rem)return dir; const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),s=rem%60; if(h>0)return`${dir} ${h}h ${m}m`; return `${dir} ${m}m ${String(s).padStart(2,"0")}s`; },
+    };
+    const sleep = (ms) => new Promise((r) => setTimeout(r,ms));
+    function parseBS(human) {
+        if(!human) return null;
+        const m=String(human).match(/^\s*([\d.]+)\s*([kKmMbB]?)\s*$/); if(!m) return null;
+        const n=parseFloat(m[1]); if(!Number.isFinite(n)) return null;
+        const s=(m[2]||"").toLowerCase(), mult=s==="k"?1e3:s==="m"?1e6:s==="b"?1e9:1; return n*mult;
+    }
+    function escHtml(s) { return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+    const _TRAVEL_MAP={"Mexico":"MEX","Cayman Islands":"CAY","Canada":"CAN","Hawaii":"HAW","United Kingdom":"UK","Argentina":"ARG","Switzerland":"SWI","Japan":"JPN","China":"CHI","United Arab Emirates":"UAE","South Africa":"SA"};
+    function travelDestShort(desc){
+        if(!desc)return"ABROAD";
+        for(const[full,short]of Object.entries(_TRAVEL_MAP)){if(desc.includes(full))return short;}
+        const m=/(?:to |from |In )([A-Z][a-zA-Z]+)/.exec(desc);
+        return(m&&!/torn/i.test(m[1]))?m[1].substring(0,3).toUpperCase():"ABROAD";
+    }
+    function travelDirLabel(desc){
+        if(!desc)return"ABROAD";
+        const country=travelDestShort(desc);
+        if(/returning to torn/i.test(desc))return`IN ← ${country}`;
+        if(/traveling to/i.test(desc)&&!/torn/i.test(desc))return`OUT → ${country}`;
+        if(/^in /i.test(desc.trim()))return`${country}`;
+        return`${country}`;
+    }
+    function revivableEmoji(revivable,statusState) { if(statusState!=="Hospital")return"—"; if(revivable===true)return"REV"; if(revivable===false)return"NO"; return"?"; }
+    function loadSettings() { try { const raw=localStorage.getItem(LS.settings); return{...DEFAULT_SETTINGS,...(raw?JSON.parse(raw):{})}; } catch { return{...DEFAULT_SETTINGS}; } }
+    function saveSettings(s) { localStorage.setItem(LS.settings,JSON.stringify(s)); }
+    function openTornUrl(url) { const a=document.createElement("a"); a.href=url; a.target="_blank"; a.rel="noopener noreferrer"; document.body.appendChild(a); a.click(); a.remove(); }
+
+    // ── HTTP ───────────────────────────────────────────────────
+    function _gmGet(url) {
+        return new Promise((resolve,reject) => { GM_XHR({method:"GET",url,onload:(r)=>resolve({status:r.status,text:r.responseText}),onerror:()=>reject(new Error("network_error")),ontimeout:()=>reject(new Error("timeout"))}); });
+    }
+    async function _httpGetOnceRaw(url) {
+        if(IS_PDA) { const res=await PDA_httpGet(url); if(res.status<200||res.status>=300){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;} return JSON.parse(res.responseText); }
+        if(GM_XHR) { const res=await _gmGet(url); if(res.status<200||res.status>=300){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;} return JSON.parse(res.text); }
+        const res=await fetch(url); if(!res.ok){const e=new Error(`HTTP ${res.status}`);e.status=res.status;throw e;} return res.json();
+    }
+    async function _httpGetOnce(url) {
+        const t0=performance.now(),rd=redactUrl(url);
+        try { const data=await _httpGetOnceRaw(url),ms=performance.now()-t0,tc=data&&data.error&&data.error.code; if(tc===5)logDebug(`GET ${rd} → rate limit`,"err",ms); else if(tc)logDebug(`GET ${rd} → code ${tc}`,"warn",ms); else logDebug(`GET ${rd} → 200`,"ok",ms); return data; }
+        catch(err) { logDebug(`GET ${rd} → ${err.status||"ERR"}`,(err.status===429)?"err":"warn",performance.now()-t0); throw err; }
+    }
+    async function httpGetJson(url) {
+        try { return await _httpGetOnce(url); }
+        catch(err) { if(err.status>=400&&err.status<500) throw err; logDebug("retry","warn"); await sleep(400); return _httpGetOnce(url); }
+    }
+    function isRateLimitError(err) { if(!err)return false; if(err.status===429)return true; if(err.tornCode===5)return true; return false; }
+
+    // ── Torn API ───────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key=key; this._lastReq=0; }
+        setKey(key) { this.key=key; }
+        async _rateLimit() { const w=API_DELAY_MS-(Date.now()-this._lastReq); this._lastReq=Date.now()+Math.max(0,w); if(w>0)await sleep(w); }
+        async _get(pathOrUrl,params=null) {
+            await this._rateLimit();
+            const url=new URL(/^https?:\/\//.test(pathOrUrl)?pathOrUrl:API_BASE+pathOrUrl);
+            if(params)for(const[k,v]of Object.entries(params))url.searchParams.set(k,v);
+            if(!url.searchParams.has("key"))url.searchParams.set("key",this.key);
+            const data=await httpGetJson(url.toString());
+            if(data&&data.error){const e=new Error(data.error.error||"Torn API error");e.tornCode=data.error.code;throw e;}
+            return data;
+        }
+        async fetchAllBounties() {
+            const all=[]; let url=`${API_BASE}/torn/bounties?limit=100&offset=0`,delay=0,safety=10;
+            while(url&&safety-->0) {
+                const data=await this._get(url);
+                if(Array.isArray(data.bounties))all.push(...data.bounties);
+                if(typeof data.bounties_delay==="number")delay=data.bounties_delay;
+                const next=data._metadata&&data._metadata.links&&data._metadata.links.next;
+                if(!next||!data.bounties||data.bounties.length===0)break; url=next;
+            }
+            return{bounties:all,delaySec:delay};
+        }
+        async fetchUserProfile(id) { const data=await this._get(`/user/${id}/profile`); if(!data)return null; return data.profile||(data.id?data:null); }
+        async validateKey() { const data=await this._get("/user/profile"); return(data&&data.profile)||null; }
+    }
+
+    // ── FFScouter ──────────────────────────────────────────────
+    async function validateFFScouterKey(key) {
+        if(!/^[A-Za-z0-9]{16}$/.test(key))return{ok:false,message:"Must be 16 alphanumeric characters."};
+        try { const data=await httpGetJson(`${FF_BASE}/check-key?key=${encodeURIComponent(key)}`); if(data&&data.code)return{ok:false,message:data.error||`FFScouter code ${data.code}`}; if(!data||!data.is_registered)return{ok:false,message:"Key is not registered — sign up at ffscouter.com first."}; return{ok:true,message:data.is_premium?"Valid — premium.":"Valid."}; }
+        catch(e){return{ok:false,message:e&&e.message?e.message:"Could not reach FFScouter."};}
+    }
+    async function fetchFFScouterStats(key,userIds) {
+        const result={map:new Map(),error:null,nullCount:0,totalReturned:0,networkFail:false};
+        if(!key){result.error="no_key";return result;}
+        if(userIds.length===0)return result;
+        for(let i=0;i<userIds.length;i+=200) {
+            const chunk=userIds.slice(i,i+200),url=`${FF_BASE}/get-stats?key=${encodeURIComponent(key)}&targets=${chunk.join(",")}`;
+            try {
+                const data=await httpGetJson(url);
+                if(!Array.isArray(data)){result.error=(data&&data.error)?data.error:"unexpected_response";continue;}
+                result.totalReturned+=data.length;
+                for(const p of data){if(p.fair_fight==null){result.nullCount++;continue;}result.map.set(Number(p.player_id),{ff:Number(p.fair_fight),bs:p.bs_estimate_human||null});}
+            } catch(e) {
+                if(isRateLimitError(e))throw e;
+                if(!result.error){result.error=e.message||"network_error";if(String(e.message).match(/fetch|network|Failed/i))result.networkFail=true;}
+            }
+        }
+        return result;
+    }
+
+    // ── Key Resolver ───────────────────────────────────────────
+    const KeyResolver = {
+        resolveTornKey(){if(HAS_PDA_KEY)return PDA_API_KEY;return localStorage.getItem(LS.apiKey)||null;},
+        hasSPAKey(){const k=localStorage.getItem(SPA_LS_APIKEY);return!!k&&/^[A-Za-z0-9]{16}$/.test(k);},
+        getSPAKey(){return localStorage.getItem(SPA_LS_APIKEY);},
+        saveTornKey(k){localStorage.setItem(LS.apiKey,k);}, clearTornKey(){localStorage.removeItem(LS.apiKey);},
+        getFFKey(){return localStorage.getItem(LS.ffKey)||"";},
+        saveFFKey(k){localStorage.setItem(LS.ffKey,k);}, clearFFKey(){localStorage.removeItem(LS.ffKey);},
+        isPDAKey(){return HAS_PDA_KEY;},
+    };
+
+    // ── Marked Target Store ────────────────────────────────────
+    const MarkedTargetStore={
+        load(){try{const r=localStorage.getItem(LS.marked);return r?JSON.parse(r):[];}catch{return[];}},
+        save(list){try{localStorage.setItem(LS.marked,JSON.stringify(list));}catch{}},
+        has(id){return this.load().some((t)=>t.id===Number(id));},
+        add(t){const list=this.load();if(!list.some((x)=>x.id===Number(t.id))){list.push({id:Number(t.id),name:String(t.name||`Player ${t.id}`),level:Number(t.level)||0});this.save(list);}},
+        remove(id){this.save(this.load().filter((t)=>t.id!==Number(id)));},
+        updateInfo(id,name,level){const list=this.load();const t=list.find((x)=>x.id===Number(id));if(t&&name){t.name=name;if(level)t.level=level;this.save(list);}},
+    };
+
+    // ── Hunter ─────────────────────────────────────────────────
+    class Hunter {
+        constructor(api) {
+            this.api=api; this.settings=loadSettings();
+            this.myUserId=null; this.myUserLevel=null; this.myUserAge=null; this.myCountry=null;
+            this.lastMatches=[]; this.lastMatchIds=new Set(); this.lastCounts=null;
+            this._statusCache=new Map(); this._travelCache=new Map(); this._warCache=null; this._timer=null; this._running=false; this._nextAt=0;
+            this.lastError=null; this.onUpdate=null; this.onToast=null; this.onHospAlert=null; this.onBountyClaimed=null; this.onMarkedUpdate=null; this.onMarkedAlert=null; this.lastMarkedStatuses=new Map();
+        }
+        updateSettings(next) { this.settings={...this.settings,...next}; saveSettings(this.settings); this.lastMatchIds=new Set(); this._warCache=null; try{localStorage.removeItem(LS.shared);}catch{} }
+        _readShared() { try{const raw=localStorage.getItem(LS.shared);if(!raw)return null;const s=JSON.parse(raw);if(!s||typeof s.writtenAt!=="number")return null;return s;}catch{return null;} }
+        _writeShared() { try{localStorage.setItem(LS.shared,JSON.stringify({writtenAt:Date.now(),refreshSec:this.settings.refreshSec,matches:this.lastMatches,lastCounts:this.lastCounts,myUserId:this.myUserId,myUserLevel:this.myUserLevel,myUserAge:this.myUserAge,myCountry:this.myCountry,lastError:this.lastError?(this.lastError.message||"error"):null}));}catch{} }
+        _adoptSharedIdentity(s) { if(s.myUserId!=null&&this.myUserId==null)this.myUserId=s.myUserId; if(s.myUserLevel!=null&&this.myUserLevel==null)this.myUserLevel=s.myUserLevel; if(s.myUserAge!=null&&this.myUserAge==null)this.myUserAge=s.myUserAge; if(s.myCountry!=null)this.myCountry=s.myCountry; }
+        _applyMatches(matches) {
+            const key=(m)=>`${m.target_id}|${m.reward}`,currentIds=new Set(matches.map(key)),newOnes=matches.filter((m)=>!this.lastMatchIds.has(key(m)));
+            if(this.settings.toastsEnabled&&this.onToast&&newOnes.length>0)this.onToast(newOnes);
+            this.lastMatches=matches; this.lastMatchIds=currentIds;
+            if(this.onHospAlert)this.onHospAlert(matches);
+        }
+        adoptSharedPayload(s) { if(!s)return; this._adoptSharedIdentity(s); if(Array.isArray(s.matches)){this.lastCounts=s.lastCounts||null;this._applyMatches(s.matches);} if(this.onUpdate)this.onUpdate(); }
+        stop() { if(this._timer){clearTimeout(this._timer);this._timer=null;} this._running=false; }
+        start() { if(this._running)return; this._running=true; this._tick(); }
+        async _tick() {
+            if(!this._running)return;
+            let waitSec=this.settings.refreshSec;
+            try {
+                const shared=this._readShared(),fresh=shared&&(Date.now()-shared.writtenAt)<(this.settings.refreshSec*1000*SHARED_FRESH_RATIO);
+                if(fresh){logDebug(`free-ride: ${shared.matches?shared.matches.length:0} matches`,"info");this._adoptSharedIdentity(shared);this.lastCounts=shared.lastCounts||null;this.lastError=null;this._applyMatches(shared.matches||[]);if(this.onUpdate)this.onUpdate();}
+                else{const delaySec=await this.refresh();waitSec=Math.max(this.settings.refreshSec,delaySec||0);}
+            } catch(err) { this.lastError=err; logDebug(`refresh ${isRateLimitError(err)?"aborted — rate limit":"failed: "+(err.message||"error")}`,"err"); if(this.onUpdate)this.onUpdate(); waitSec=Math.max(this.settings.refreshSec,30); }
+            await this.refreshMarked().catch(()=>{});
+            if(this.settings.refreshSec<=0)return;
+            this._nextAt=Date.now()+waitSec*1000; this._timer=setTimeout(()=>this._tick(),waitSec*1000);
+        }
+        async refresh() {
+            this.lastError=null; const t0=performance.now(); logDebug("refresh: start","info"); if(this.onUpdate)this.onUpdate({loading:true});
+            try { const profile=await this.api.validateKey(); if(profile){this.myUserId=profile.id||this.myUserId;this.myUserLevel=(typeof profile.level==="number")?profile.level:this.myUserLevel;this.myUserAge=(typeof profile.age==="number")?profile.age:this.myUserAge;this.myCountry=getPlayerCountry(profile.status)||this.myCountry;} } catch{}
+            const{bounties,delaySec}=await this.api.fetchAllBounties(); logDebug(`fetched ${bounties.length} bounties`,"ok");
+            // Deduplicate by target — keep highest-reward bounty per person, sum counts.
+            const grouped=new Map();
+            for(const b of bounties){
+                const id=String(b.target_id),qty=(typeof b.quantity==="number"&&b.quantity>0)?b.quantity:1;
+                if(!grouped.has(id)){grouped.set(id,{...b,bountyCount:qty});}
+                else{const ex=grouped.get(id);const newCount=ex.bountyCount+qty;if(b.reward>ex.reward){grouped.set(id,{...b,bountyCount:newCount});}else{ex.bountyCount=newCount;}}
+            }
+            const deduped=[...grouped.values()];
+            // Detect bounties claimed since last refresh: hospital matches that vanished from the board.
+            if(this.lastMatches.length>0){
+                const boardIds=new Set(deduped.map((b)=>String(b.target_id)));
+                const claimed=this.lastMatches.filter((m)=>m.statusState==="Hospital"&&!boardIds.has(String(m.target_id)));
+                if(claimed.length>0&&this.onBountyClaimed)this.onBountyClaimed(claimed);
+            }
+            const counts={total:bounties.length,afterBasic:0,withFF:0,ffNull:0,ffError:null,ffNetworkFail:false,afterFF:0,afterBS:0,statusBreakdown:{},notRevivable:0,tooNew:0,differentCountry:0,matches:0,inWar:0,outsideWindow:0};
+            const byBasic=deduped.filter((b)=>b.reward>=this.settings.minPrice&&(this.myUserId==null||b.target_id!==this.myUserId));
+            counts.afterBasic=byBasic.length;
+            const ffKey=KeyResolver.getFFKey(),ids=[...new Set(byBasic.map((b)=>Number(b.target_id)))];
+            logDebug(`FFScouter: requesting ${ids.length} IDs`,"info");
+            const ff=await fetchFFScouterStats(ffKey,ids);
+            counts.withFF=ff.map.size; counts.ffNull=ff.nullCount; counts.ffError=ff.error; counts.ffNetworkFail=ff.networkFail;
+            logDebug(`FFScouter: ${ff.map.size} with FF${ff.error?", error: "+ff.error:""}`,ff.error?"warn":"ok");
+            const includeUnknown=!!this.settings.includeUnknownFF||ff.networkFail;
+            const byFF=byBasic.map((b)=>{const e=ff.map.get(Number(b.target_id));if(e)return{...b,ff:e.ff,bs:e.bs};return includeUnknown?{...b,ff:null,bs:null}:null;}).filter((b)=>{if(b==null)return false;if(b.ff==null)return true;return b.ff>=this.settings.minFF&&b.ff<=this.settings.maxFF;});
+            counts.afterFF=byFF.length;
+            const selectedRanges=this.settings.bsRanges||[];
+            const byBS=selectedRanges.length===0?byFF:byFF.filter((b)=>{if(b.bs==null)return true;const bsNum=parseBS(b.bs);if(bsNum==null)return true;return selectedRanges.some((rid)=>{const range=BS_RANGES.find((r)=>r.id===rid);return range&&bsNum>=range.min&&bsNum<=range.max;});});
+            counts.afterBS=byBS.length;
+            const nowSec=Math.floor(Date.now()/1000),hospWindowSec=this.settings.hospitalMaxMin*60,statusFilter=this.settings.statusFilter||"all";
+            logDebug(`profiles: need ${byBS.length}`,"info");
+            const profiles=await this._fetchProfiles(byBS.map((b)=>Number(b.target_id)));
+            // Faction war check — fetch global ranked war list once (1 API call, cached 5 min)
+            const factionWarSet=await this._fetchGlobalWarFactions();
+            if(factionWarSet.size>0)logDebug(`ranked wars: ${factionWarSet.size} factions at war`,"warn");
+            const matches=[];
+            for(const b of byBS) {
+                try {
+                    const p=profiles.get(Number(b.target_id));
+                    if(!p||!p.status||typeof p.status!=="object"){counts.statusBreakdown["unknown"]=(counts.statusBreakdown["unknown"]||0)+1;continue;}
+                    if(!isAttackableByAge(p.age,this.myUserAge)){counts.tooNew++;continue;}
+                    const state=p.status.state; counts.statusBreakdown[state||"unknown"]=(counts.statusBreakdown[state||"unknown"]||0)+1;
+                    const until=p.status.until||0,remaining=Math.max(0,until-nowSec);
+                    const targetCountry=getPlayerCountry(p.status);
+                    if(this.myCountry&&targetCountry&&targetCountry!==this.myCountry){counts.differentCountry++;continue;}
+                    const inFactionWar=!!(p.faction_id&&factionWarSet.has(Number(p.faction_id)));
+                    if(this.settings.hideWarTargets&&inFactionWar){counts.inWar++;continue;}
+                    if(state==="Okay"){
+                        if(statusFilter==="hospital"){counts.outsideWindow++;continue;}
+                        matches.push({...b,statusState:"Okay",hospUntil:0,revivable:null,inFactionWar});
+                    }
+                    else if(state==="Hospital"){
+                        if(remaining>hospWindowSec){counts.outsideWindow++;continue;}
+                        if(statusFilter==="okay"){counts.outsideWindow++;continue;}
+                        if(this.settings.revivableOnly&&p.revivable!==true){counts.notRevivable++;continue;}
+                        matches.push({...b,statusState:"Hospital",hospUntil:until,revivable:p.revivable??null,inFactionWar});
+                    }
+                } catch(rowErr){logDebug(`match loop error for ${b.target_id}: ${rowErr.message}`,"warn");}
+            }
+            matches.sort((a,b)=>b.reward-a.reward); counts.matches=matches.length;
+            this.lastCounts=counts; this._applyMatches(matches); this._writeShared();
+            logDebug(`refresh: done — ${matches.length} matches`,"ok",performance.now()-t0);
+            if(this.onUpdate)this.onUpdate({loading:false}); return delaySec;
+        }
+        async _fetchProfiles(ids) {
+            const out=new Map(),now=Date.now(),stale=[],unique=[...new Set(ids)];
+            for(const id of unique){const c=this._statusCache.get(id);if(c){const d=c.data,hospLocked=d&&d.status&&d.status.state==="Hospital"&&d.status.until&&(d.status.until*1000)>now;if(hospLocked||(now-c.fetchedAt<STATUS_CACHE_MS)){out.set(id,d);continue;}}stale.push(id);}
+            let i=0,rateLimitErr=null;
+            const workers=Array.from({length:STATUS_CONCURRENCY},async()=>{
+                while(i<stale.length&&!rateLimitErr){
+                    const id=stale[i++];
+                    try {
+                        const profile=await this.api.fetchUserProfile(id);
+                        if(profile&&typeof profile==="object"){
+                            const data={status:profile.status??null,age:typeof profile.age==="number"?profile.age:null,faction_id:profile.faction?.id??profile.faction?.faction_id??profile.faction_id??null,revivable:typeof profile.revivable==="boolean"?profile.revivable:null,name:profile.name||profile.player_name||null,level:typeof profile.level==="number"?profile.level:null,plane:profile.status?.plane_image_type||null};
+                            if(data.status!==null&&typeof data.status!=="object")data.status=null;
+                            out.set(id,data); this._statusCache.set(id,{data,fetchedAt:Date.now()});
+                        }
+                    } catch(err){if(isRateLimitError(err)){rateLimitErr=err;return;}}
+                }
+            });
+            await Promise.all(workers); if(rateLimitErr)throw rateLimitErr; return out;
+        }
+        async _fetchGlobalWarFactions(){
+            // One API call gets ALL active ranked + territory wars; cache for 5 minutes.
+            const now=Date.now();
+            if(this._warCache&&(now-this._warCache.fetchedAt)<FACTION_CACHE_MS)return this._warCache.ids;
+            const ids=new Set();
+            try{
+                const data=await this.api._get("https://api.torn.com/torn/?selections=rankedwars,territorywars");
+                for(const war of Object.values(data.rankedwars||{})){
+                    for(const fid of Object.keys(war.factions||{})){
+                        const n=Number(fid); if(!isNaN(n)&&n>0)ids.add(n);
+                    }
+                }
+                for(const war of Object.values(data.territorywars||{})){
+                    for(const key of ["assaulting_faction","defending_faction"]){
+                        const fid=war[key]; if(fid){const n=Number(fid);if(!isNaN(n)&&n>0)ids.add(n);}
+                    }
+                }
+            }catch(e){
+                logDebug(`global war fetch failed: ${e.message}`,"warn");
+                return this._warCache?this._warCache.ids:ids;
+            }
+            this._warCache={ids,fetchedAt:now};
+            return ids;
+        }
+        async refreshMarked(){
+            const targets=MarkedTargetStore.load();
+            if(targets.length===0){this.lastMarkedStatuses=new Map();if(this.onMarkedUpdate)this.onMarkedUpdate();return;}
+            const profiles=await this._fetchProfiles(targets.map((t)=>Number(t.id)));
+            const warSet=await this._fetchGlobalWarFactions();
+            const nowSec=Math.floor(Date.now()/1000);
+            let storeChanged=false;
+            const updatedTargets=targets.map((t)=>{const p=profiles.get(Number(t.id));if(p&&p.name&&(p.name!==t.name||(p.level&&p.level!==t.level))){storeChanged=true;return{...t,name:p.name,level:p.level||t.level};}return t;});
+            if(storeChanged)MarkedTargetStore.save(updatedTargets);
+            const statuses=new Map();
+            for(const t of updatedTargets){
+                const p=profiles.get(Number(t.id));
+                if(!p||!p.status){statuses.set(t.id,{state:null,until:0,remaining:0,revivable:null,inFactionWar:false});continue;}
+                const state=p.status.state;
+                const until=p.status.until||0;
+                const desc=p.status.description||"";
+                const inFactionWar=!!(p.faction_id&&warSet.has(Number(p.faction_id)));
+                let landingTs=0;
+                if(state==="Traveling"||state==="Abroad"){
+                    const cacheKey=Number(t.id);
+                    const cached=this._travelCache.get(cacheKey);
+                    if(cached&&cached.desc===desc&&cached.landingTs>nowSec){
+                        landingTs=cached.landingTs;
+                    } else if(state==="Traveling"){
+                        landingTs=computeLandingTs(desc,p.plane||"airliner");
+                        if(landingTs>nowSec)this._travelCache.set(cacheKey,{desc,landingTs});
+                    } else {
+                        this._travelCache.delete(cacheKey);
+                    }
+                } else {
+                    this._travelCache.delete(Number(t.id));
+                }
+                statuses.set(t.id,{state,until,remaining:Math.max(0,until-nowSec),revivable:p.revivable??null,inFactionWar,description:desc,landingTs});
+            }
+            this.lastMarkedStatuses=statuses;
+            if(this.onMarkedUpdate)this.onMarkedUpdate();
+            if(this.onMarkedAlert)this.onMarkedAlert(updatedTargets,statuses);
+        }
+        secondsUntilRefresh() { if(!this._nextAt)return 0; return Math.max(0,Math.round((this._nextAt-Date.now())/1000)); }
+    }
+
+    // ── Toaster ────────────────────────────────────────────────
+    class Toaster {
+        constructor(){this.container=null;this._cards=[];this._clearAllEl=null;}
+        ensureContainer(){if(this.container&&document.body.contains(this.container))return;const c=document.createElement("div");c.id="bh4-toasts";document.body.appendChild(c);this.container=c;}
+        showMany(bounties){this.ensureContainer();const maxVisible=toastMaxVisible(),existing=this._cards.filter((c)=>!c.isMore&&!c.isClearAll).length,slots=Math.max(0,maxVisible-existing),toShow=bounties.slice(0,slots),overflow=bounties.length-toShow.length;for(const b of toShow)this._showOne(b);if(overflow>0)this._showMoreCard(overflow);this._updateClearAllButton();}
+        _showOne(b){
+            const stale=this._cards.find((c)=>c.id===Number(b.target_id)&&!c.isMore);if(stale)this._remove(stale);
+            const el=document.createElement("div"); el.className="bh4-toast";
+            const isHosp=b.statusState==="Hospital",statusLabel=isHosp?fmt.hospLabel(b.hospUntil):"OKAY",statusClass=isHosp?"bh4-badge-hosp":"bh4-badge-ok",hospAttr=isHosp?` data-hosp-until="${b.hospUntil}"`:"",countBadge=b.bountyCount>1?` <span class="bh4-count">×${b.bountyCount}</span>`:"",revChip=isHosp?`<span class="bh4-chip bh4-chip-rev">${revivableEmoji(b.revivable,b.statusState)}</span>`:"";
+            el.innerHTML=`<button class="bh4-toast-close" title="Dismiss">&times;</button><div class="bh4-toast-head"><div class="bh4-toast-name">${escHtml(b.target_name)} <span class="bh4-toast-lvl">L${b.target_level}</span>${countBadge}</div><div class="bh4-toast-reward">${escHtml(fmt.money(b.reward))}</div></div><div class="bh4-toast-meta"><span class="bh4-chip">FF ${b.ff==null?"?":b.ff.toFixed(2)}</span>${b.bs?`<span class="bh4-chip">BS ${escHtml(b.bs)}</span>`:""}<span class="bh4-chip ${statusClass}"${hospAttr}>${statusLabel}</span>${revChip}</div><button class="bh4-toast-attack">ATTACK →</button>`;
+            const card={id:Number(b.target_id),el,timer:null,remaining:TOAST_TIMEOUT_MS,enteredAt:0,isMore:false},dismiss=()=>this._remove(card);
+            el.querySelector(".bh4-toast-close").addEventListener("click",(e)=>{e.stopPropagation();dismiss();});
+            const attack=(e)=>{if(e){e.preventDefault();e.stopPropagation();}openTornUrl(PROFILE_URL+b.target_id);dismiss();};
+            el.querySelector(".bh4-toast-attack").addEventListener("click",attack); el.addEventListener("click",attack);
+            el.addEventListener("pointerenter",()=>this._pauseTimer(card)); el.addEventListener("pointerleave",()=>this._resumeTimer(card));
+            this._resumeTimer(card); this.container.appendChild(el); this._cards.push(card);
+        }
+        _showMoreCard(count){const existing=this._cards.find((c)=>c.isMore);if(existing){existing.count+=count;existing.el.querySelector(".bh4-toast-more-label").textContent=`+${existing.count} MORE`;return;}const el=document.createElement("div");el.className="bh4-toast bh4-toast-more";el.innerHTML=`<div class="bh4-toast-more-label">+${count} MORE</div><div class="bh4-toast-more-hint">Click to open the Hunt list</div>`;const card={id:null,el,timer:null,remaining:TOAST_TIMEOUT_MS,enteredAt:0,isMore:true,count};el.addEventListener("click",()=>{if(window.__bh4UI)window.__bh4UI.toggle(true);this._remove(card);});el.addEventListener("pointerenter",()=>this._pauseTimer(card));el.addEventListener("pointerleave",()=>this._resumeTimer(card));this._resumeTimer(card);this.container.appendChild(el);this._cards.push(card);}
+        _updateClearAllButton(){const toastCount=this._cards.filter((c)=>!c.isClearAll).length,existing=this._clearAllEl;if(toastCount<2){if(existing){existing.remove();this._clearAllEl=null;}return;}if(existing){this.container.appendChild(existing);return;}const btn=document.createElement("button");btn.type="button";btn.className="bh4-toast-clear-btn";btn.textContent="✕ CLEAR ALL";btn.addEventListener("click",(e)=>{e.stopPropagation();this.clearAll();});this.container.appendChild(btn);this._clearAllEl=btn;}
+        _pauseTimer(card){if(!card.timer)return;clearTimeout(card.timer);card.timer=null;card.remaining=Math.max(0,card.remaining-(Date.now()-card.enteredAt));}
+        _resumeTimer(card){card.enteredAt=Date.now();if(card.timer)clearTimeout(card.timer);card.timer=setTimeout(()=>this._remove(card),card.remaining);}
+        _remove(card){if(card.timer)clearTimeout(card.timer);if(card.el&&card.el.parentNode)card.el.parentNode.removeChild(card.el);this._cards=this._cards.filter((c)=>c!==card);this._updateClearAllButton();}
+        clearAll(){for(const c of[...this._cards])this._remove(c);if(this._clearAllEl){this._clearAllEl.remove();this._clearAllEl=null;}}
+        showClaimed(bounties){this.ensureContainer();for(const b of bounties)this._showClaimedOne(b);this._updateClearAllButton();}
+        _showClaimedOne(b){
+            const el=document.createElement("div"); el.className="bh4-toast bh4-toast-claimed";
+            el.innerHTML=`<button class="bh4-toast-close" title="Dismiss">&times;</button><div class="bh4-toast-head"><div class="bh4-toast-name">LOST ${escHtml(b.target_name)} <span class="bh4-toast-lvl">L${b.target_level}</span></div><div class="bh4-toast-reward">${escHtml(fmt.money(b.reward))}</div></div><div class="bh4-toast-meta"><span class="bh4-chip">Bounty claimed by someone else</span></div><button class="bh4-toast-profile">VIEW PROFILE →</button>`;
+            const card={id:Number(b.target_id),el,timer:null,remaining:TOAST_TIMEOUT_MS*2,enteredAt:0,isMore:false};
+            const dismiss=()=>this._remove(card);
+            el.querySelector(".bh4-toast-close").addEventListener("click",(e)=>{e.stopPropagation();dismiss();});
+            el.querySelector(".bh4-toast-profile").addEventListener("click",()=>{openTornUrl(PROFILE_URL+b.target_id);dismiss();});
+            el.addEventListener("pointerenter",()=>this._pauseTimer(card));el.addEventListener("pointerleave",()=>this._resumeTimer(card));
+            this._resumeTimer(card);this.container.appendChild(el);this._cards.push(card);
+        }
+    }
+
+    // ── Hospital Alert Manager ─────────────────────────────────
+    class HospAlertManager {
+        constructor(){this._scheduled=new Map();this._fired=new Map();
+            this._manualSet=new Set();this._cancelledSet=new Set();this.enabled=false;}
+        static isSupported(){return typeof Notification!=="undefined"&&Notification!==null;}
+        static permission(){return HospAlertManager.isSupported()?Notification.permission:"unsupported";}
+        static async requestPermission(){if(!HospAlertManager.isSupported())return"unsupported";try{return await Notification.requestPermission();}catch{return"denied";}}
+        toggle(id){id=String(id);if(this.enabled){if(this._cancelledSet.has(id))this._cancelledSet.delete(id);else this._cancelledSet.add(id);}else{if(this._manualSet.has(id))this._manualSet.delete(id);else this._manualSet.add(id);}}
+        isAlertActive(id){id=String(id);if(this.enabled)return!this._cancelledSet.has(id);return this._manualSet.has(id);}
+        sync(matches){
+            if(!Array.isArray(matches))matches=[];
+            const nowSec=Math.floor(Date.now()/1000),liveHospIds=new Set();
+            for(const m of matches){
+                if(m.statusState!=="Hospital")continue;
+                if(m.hospUntil<=nowSec)continue;
+                const id=String(m.target_id);
+                liveHospIds.add(id);
+                const shouldAlert=this.enabled?!this._cancelledSet.has(id):this._manualSet.has(id);
+                if(!shouldAlert)continue;
+                const firedUntil=this._fired.get(id);
+                if(firedUntil!==undefined&&Math.abs(m.hospUntil-firedUntil)<300)continue;
+                const existing=this._scheduled.get(id);
+                if(existing&&Math.abs(existing.hospUntil-m.hospUntil)<=5)continue;
+                if(existing){clearTimeout(existing.timer);this._scheduled.delete(id);}
+                const alertAtSec=m.hospUntil-60;
+                if(alertAtSec<nowSec-10)continue;
+                const delayMs=Math.max(0,(alertAtSec-nowSec)*1000);
+                const snapUntil=m.hospUntil;
+                const timer=setTimeout(()=>{this._fired.set(id,snapUntil);this._scheduled.delete(id);this._fire(m);},delayMs);
+                this._scheduled.set(id,{timer,hospUntil:m.hospUntil,match:m});
+            }
+            for(const[id,entry]of this._scheduled){if(!liveHospIds.has(id)){clearTimeout(entry.timer);this._scheduled.delete(id);}}
+            for(const[id,firedUntil]of this._fired){if(firedUntil+120<nowSec)this._fired.delete(id);}
+        }
+        _fire(m){
+            const remSec=Math.max(0,m.hospUntil-Math.floor(Date.now()/1000)),remLabel=remSec<=0?"out NOW":`~${remSec}s`;
+            try{if(navigator.vibrate)navigator.vibrate([400,150,400,150,600]);}catch{}
+            try{const ACtx=window.AudioContext||window.webkitAudioContext;if(ACtx){const ctx=new ACtx(),beep=(freq,st,dur)=>{const osc=ctx.createOscillator(),g=ctx.createGain();osc.connect(g);g.connect(ctx.destination);osc.type="sine";osc.frequency.value=freq;g.gain.setValueAtTime(0.4,st);g.gain.exponentialRampToValueAtTime(0.001,st+dur);osc.start(st);osc.stop(st+dur);};beep(880,ctx.currentTime,0.18);beep(880,ctx.currentTime+0.22,0.18);beep(1100,ctx.currentTime+0.44,0.30);}}catch{}
+            this._showBanner(m,remLabel);
+            if(HospAlertManager.isSupported()&&HospAlertManager.permission()==="granted"){try{const n=new Notification(`${m.target_name} exits hospital ${remLabel}`,{body:[`Reward: ${fmt.money(m.reward)}`,m.ff!=null?`FF: ${m.ff.toFixed(2)}`:null,m.revivable===true?"Revivable":null].filter(Boolean).join(" · "),icon:"https://www.torn.com/favicon.ico",tag:`bh4-hosp-${m.target_id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(ATTACK_URL+m.target_id);n.close();});}catch{}}
+        }
+        _showBanner(m,remLabel){
+            const prev=document.getElementById(`bh4-alert-${m.target_id}`);if(prev)prev.remove();
+            const el=document.createElement("div"); el.id=`bh4-alert-${m.target_id}`; el.className="bh4-alert-banner";
+            el.innerHTML=`<div class="bh4-alert-top"><span class="bh4-alert-icon">▲</span><span class="bh4-alert-title">${escHtml(m.target_name)} <span class="bh4-alert-lvl">L${m.target_level}</span></span><span class="bh4-alert-timer">${escHtml(remLabel)}</span><button class="bh4-alert-close" title="Dismiss">&times;</button></div><div class="bh4-alert-sub"><span class="bh4-chip">${escHtml(fmt.money(m.reward))}</span>${m.ff!=null?`<span class="bh4-chip">FF ${m.ff.toFixed(2)}</span>`:""} ${m.revivable===true?`<span class="bh4-chip">REV</span>`:""}</div><button class="bh4-alert-attack">ATTACK → ${escHtml(m.target_name)}</button>`;
+            document.body.appendChild(el);
+            const dismiss=()=>{el.style.animation="bh4-banner-out .25s ease-in forwards";setTimeout(()=>el.remove(),260);};
+            const auto=setTimeout(dismiss,30_000);
+            el.querySelector(".bh4-alert-close").addEventListener("click",(e)=>{e.stopPropagation();clearTimeout(auto);dismiss();});
+            el.querySelector(".bh4-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(ATTACK_URL+m.target_id);dismiss();});
+        }
+        cancelAll(){for(const{timer}of this._scheduled.values())clearTimeout(timer);this._scheduled.clear();}
+        pendingCount(){return this._scheduled.size;}
+    }
+
+    // ── Target Alert Manager ──────────────────────────────────
+    class TargetAlertManager {
+        constructor(){this._scheduled=new Map();this._fired=new Map();this._manualSet=new Set();this._cancelledSet=new Set();this.enabled=false;}
+        toggle(id){id=String(id);if(this.enabled){if(this._cancelledSet.has(id))this._cancelledSet.delete(id);else this._cancelledSet.add(id);}else{if(this._manualSet.has(id))this._manualSet.delete(id);else this._manualSet.add(id);}}
+        isAlertActive(id){id=String(id);if(this.enabled)return!this._cancelledSet.has(id);return this._manualSet.has(id);}
+        sync(targets,statuses){
+            if(!Array.isArray(targets))targets=[];
+            if(!statuses)statuses=new Map();
+            const nowSec=Math.floor(Date.now()/1000),liveIds=new Set();
+            for(const t of targets){
+                const s=statuses.get(t.id);
+                if(!s||!s.state)continue;
+                const isTravel=s.state==="Abroad"||s.state==="Traveling";
+                const alertUntil=isTravel?(s.landingTs||0):s.until;
+                const alertable=(s.state==="Hospital"||isTravel)&&alertUntil>nowSec;
+                if(!alertable)continue;
+                const id=String(t.id); liveIds.add(id);
+                const shouldAlert=this.enabled?!this._cancelledSet.has(id):this._manualSet.has(id);
+                if(!shouldAlert)continue;
+                const firedUntil=this._fired.get(id);
+                if(firedUntil!==undefined&&Math.abs(alertUntil-firedUntil)<300)continue;
+                const existing=this._scheduled.get(id);
+                if(existing&&Math.abs(existing.until-alertUntil)<=5)continue;
+                if(existing){clearTimeout(existing.timer);this._scheduled.delete(id);}
+                const alertAtSec=alertUntil-60;
+                if(alertAtSec<nowSec-10)continue;
+                const delayMs=Math.max(0,(alertAtSec-nowSec)*1000);
+                const snapUntil=alertUntil;
+                const match={...t,statusState:s.state,hospUntil:alertUntil,revivable:s.revivable,inFactionWar:s.inFactionWar};
+                const timer=setTimeout(()=>{this._fired.set(id,snapUntil);this._scheduled.delete(id);this._fire(match,isTravel);},delayMs);
+                this._scheduled.set(id,{timer,until:alertUntil});
+            }
+            for(const[id,entry]of this._scheduled){if(!liveIds.has(id)){clearTimeout(entry.timer);this._scheduled.delete(id);}}
+            for(const[id,firedUntil]of this._fired){if(firedUntil+120<nowSec)this._fired.delete(id);}
+        }
+        _fire(m,isTravel){
+            const remSec=Math.max(0,m.hospUntil-Math.floor(Date.now()/1000));
+            const remLabel=remSec<=0?(isTravel?"landing NOW":"out NOW"):`~${remSec}s`;
+            try{if(navigator.vibrate)navigator.vibrate([400,150,400,150,600]);}catch{}
+            try{const ACtx=window.AudioContext||window.webkitAudioContext;if(ACtx){const ctx=new ACtx(),beep=(freq,st,dur)=>{const osc=ctx.createOscillator(),g=ctx.createGain();osc.connect(g);g.connect(ctx.destination);osc.type="sine";osc.frequency.value=freq;g.gain.setValueAtTime(0.4,st);g.gain.exponentialRampToValueAtTime(0.001,st+dur);osc.start(st);osc.stop(st+dur);};beep(660,ctx.currentTime,0.18);beep(880,ctx.currentTime+0.22,0.18);beep(1100,ctx.currentTime+0.44,0.30);}}catch{}
+            this._showBanner(m,remLabel,isTravel);
+            if(typeof Notification!=="undefined"&&Notification!==null&&Notification.permission==="granted"){try{const n=new Notification(`${isTravel?"FLIGHT":"HOSPITAL"} ${m.name} ${isTravel?"landing":"exits hospital"} ${remLabel}`,{body:`L${m.level}${m.inFactionWar?" · WAR":""}`,icon:"https://www.torn.com/favicon.ico",tag:`bh4-target-${m.id}`,requireInteraction:false});n.addEventListener("click",()=>{try{window.focus();}catch{}openTornUrl(ATTACK_URL+m.id);n.close();});}catch{}}
+        }
+        _showBanner(m,remLabel,isTravel){
+            const prev=document.getElementById(`bh4-ta-${m.id}`);if(prev)prev.remove();
+            const el=document.createElement("div");el.id=`bh4-ta-${m.id}`;el.className="bh4-alert-banner bh4-target-alert-banner";
+            el.innerHTML=`<div class="bh4-alert-top"><span class="bh4-alert-icon">${isTravel?"✈":"▲"}</span><span class="bh4-alert-title">${escHtml(m.name)} <span class="bh4-alert-lvl">L${m.level}</span></span><span class="bh4-alert-timer">${escHtml(remLabel)}</span><button class="bh4-alert-close" title="Dismiss">&times;</button></div><div class="bh4-alert-sub"><span class="bh4-chip">${isTravel?"Landing soon — marked target":"Exits hospital soon — marked target"}</span>${m.inFactionWar?`<span class="bh4-chip">WAR</span>`:""}</div><button class="bh4-alert-attack">ATTACK → ${escHtml(m.name)}</button>`;
+            document.body.appendChild(el);
+            const dismiss=()=>{el.style.animation="bh4-target-banner-out .25s ease-in forwards";setTimeout(()=>el.remove(),260);};
+            const auto=setTimeout(dismiss,30_000);
+            el.querySelector(".bh4-alert-close").addEventListener("click",(e)=>{e.stopPropagation();clearTimeout(auto);dismiss();});
+            el.querySelector(".bh4-alert-attack").addEventListener("click",()=>{clearTimeout(auto);openTornUrl(ATTACK_URL+m.id);dismiss();});
+        }
+        cancelAll(){for(const{timer}of this._scheduled.values())clearTimeout(timer);this._scheduled.clear();}
+    }
+
+    // ── CSS — tactical theme ───────────────────────────────────
+    function injectCSS(){
+        if(document.getElementById("bh4-style"))return;
+        const style=document.createElement("style"); style.id="bh4-style";
+        style.textContent=`
+#bh4-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.78)}
+#bh4-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#0f1110;border:1px solid #2a2d28;border-radius:3px;overflow:hidden;resize:both;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;color:#d8dad2;font-size:13px;width:840px;max-width:100vw;max-height:88vh;min-width:340px;min-height:300px;flex-direction:column;box-shadow:0 0 0 1px #000,0 20px 60px rgba(0,0,0,.6)}
+#bh4-panel.bh4-open{display:flex}#bh4-overlay.bh4-open{display:block}#bh4-panel *{box-sizing:border-box;color:inherit}
+#bh4-panel ::-webkit-scrollbar{width:6px;height:6px}#bh4-panel ::-webkit-scrollbar-track{background:#0f1110}#bh4-panel ::-webkit-scrollbar-thumb{background:#33362f;border-radius:0}#bh4-panel ::-webkit-scrollbar-thumb:hover{background:#454a3d}
+#bh4-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#141614;border-bottom:2px solid #c8a84b;flex-shrink:0}
+#bh4-header h2{margin:0;font-size:15px;color:#e9e6da;letter-spacing:1.5px;text-transform:uppercase;font-weight:700}#bh4-header .bh4-ver{color:#6b6e64;font-size:11px;margin-left:8px;letter-spacing:0;text-transform:none}
+#bh4-close{background:none;border:none;color:#888;font-size:20px;cursor:pointer;padding:4px 8px;font-family:inherit}#bh4-close:hover{color:#dc2626}
+#bh4-tabs{display:flex;background:#121310;border-bottom:1px solid #2a2d28;overflow-x:auto;flex-shrink:0}
+.bh4-tab{padding:9px 18px;cursor:pointer;color:#777b6e!important;border-bottom:2px solid transparent;white-space:nowrap;font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:600;transition:all .12s}.bh4-tab:hover{color:#c8c4ad!important;background:#181a16}.bh4-tab.active{color:#c8a84b!important;border-bottom-color:#c8a84b;background:#181a16}
+#bh4-content{padding:14px 16px;overflow-y:auto;flex:1;min-height:0}
+#bh4-status-line{display:flex;gap:14px;align-items:center;margin-bottom:12px;color:#7c7f72;font-size:11px;flex-wrap:wrap;letter-spacing:.3px}#bh4-status-line .bh4-err{color:#dc2626}
+.bh4-rl-banner{background:#1d1310;border:1px solid #dc2626;border-left:4px solid #dc2626;border-radius:0;padding:10px 14px;margin:0 0 12px;color:#d8dad2;font-size:12px}.bh4-rl-title{color:#dc2626;font-weight:700;font-size:12px;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px}.bh4-rl-body{color:#bdbfb5;line-height:1.5;font-size:12px}.bh4-rl-tips{margin:6px 0 6px 20px;padding:0;color:#d8dad2}.bh4-rl-tips li{margin:2px 0}.bh4-rl-hint{color:#7c7f72;font-size:11px;font-style:italic}
+#bh4-refresh-btn{padding:5px 12px;background:#1a1c18;border:1px solid #c8a84b;color:#c8a84b;border-radius:0;cursor:pointer;font-size:11px;letter-spacing:.8px;text-transform:uppercase;font-weight:700;font-family:inherit}#bh4-refresh-btn:hover{background:#c8a84b;color:#0f1110}#bh4-refresh-btn:disabled{opacity:.5;cursor:not-allowed;background:#1a1c18;color:#777}
+table.bh4-table{width:100%;border-collapse:collapse}
+.bh4-table th,.bh4-table td{padding:7px 10px;text-align:left;border-bottom:1px solid #1f211d;font-size:12px;color:#d8dad2;vertical-align:middle;white-space:nowrap}
+.bh4-table th{color:#8a8d7f!important;font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:.8px;position:sticky;top:0;background:#0f1110;border-bottom:2px solid #2a2d28;user-select:none}
+.bh4-table th[data-sort]{cursor:pointer}.bh4-table th[data-sort]:hover{color:#c8a84b!important}.bh4-table th[data-sort]::after{content:" ⇅";color:#454a3d;font-size:9px}.bh4-table th[data-sort].sort-asc::after{content:" ▲";color:#c8a84b;font-size:9px}.bh4-table th[data-sort].sort-desc::after{content:" ▼";color:#c8a84b;font-size:9px}
+.bh4-table tbody tr:hover td{background:#161814}.bh4-table td.num,.bh4-table th.num{text-align:right;font-variant-numeric:tabular-nums}.bh4-table td.bh4-col-divider,.bh4-table th.bh4-col-divider{padding-left:14px;border-left:1px solid #1f211d}
+.bh4-attack{display:inline-block;padding:4px 10px;background:#dc2626;color:#fff!important;border-radius:0;text-decoration:none;font-weight:700;font-size:11px;letter-spacing:.5px;text-transform:uppercase;border:none;cursor:pointer;font-family:inherit}.bh4-attack:hover{background:#ef4444}
+.bh4-name-link{color:#e9e6da!important;text-decoration:none;font-weight:600}.bh4-name-link:hover{color:#c8a84b!important;text-decoration:underline}
+.bh4-badge{display:inline-block;padding:2px 7px;border-radius:0;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-variant-numeric:tabular-nums}.bh4-badge-ok{background:#102417;color:#22c55e;border:1px solid #1c3a26}.bh4-badge-hosp{background:#2a1608;color:#f97316;border:1px solid #43250e}
+.bh4-revive-cell{font-size:10px;text-align:center!important;letter-spacing:.5px;font-weight:700;color:#8a8d7f}
+.bh4-badge-war{display:inline-block;padding:2px 6px;border-radius:0;font-size:10px;font-weight:700;letter-spacing:.5px;background:#1d1310;color:#dc2626;border:1px solid #43250e;margin-left:5px;vertical-align:middle;cursor:default}
+.bh4-count{display:inline-block;padding:1px 6px;margin-left:6px;background:#1a1c18;color:#c8a84b;border:1px solid #33362f;border-radius:0;font-size:10px;font-weight:700;vertical-align:middle}
+.bh4-empty{text-align:center;color:#6b6e64;padding:30px 8px;font-size:13px}
+.bh4-section{margin-bottom:20px}.bh4-section h3{margin:0 0 8px;font-size:12px;color:#c8a84b;text-transform:uppercase;letter-spacing:1px;font-weight:700}.bh4-section p,.bh4-hint{color:#7c7f72;font-size:11px;margin:4px 0;line-height:1.5}
+.bh4-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.bh4-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}.bh4-field label{color:#a3a695;font-size:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+.bh4-input,.bh4-select{background:#121310;border:1px solid #2a2d28;color:#d8dad2;padding:6px 10px;border-radius:0;font-size:13px;width:100%;font-family:inherit}.bh4-input:focus,.bh4-select:focus{outline:none;border-color:#c8a84b}
+.bh4-input-masked{-webkit-text-security:disc;text-security:disc;letter-spacing:2px}
+.bh4-btn{padding:7px 14px;border:1px solid transparent;border-radius:0;cursor:pointer;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#d8dad2;font-family:inherit}.bh4-btn-primary{background:#c8a84b;border-color:#c8a84b;color:#0f1110!important}.bh4-btn-primary:hover{background:#d9bc66}.bh4-btn-danger{background:#dc2626;border-color:#dc2626;color:#fff!important}.bh4-btn-danger:hover{background:#ef4444}.bh4-btn-muted{background:#1a1c18;border:1px solid #2a2d28;color:#d8dad2}.bh4-btn-muted:hover{background:#22241f;border-color:#454a3d}.bh4-btn:disabled{opacity:.5;cursor:not-allowed}
+.bh4-row-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.bh4-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:#bdbfb5;font-size:12px}.bh4-check input{accent-color:#c8a84b}
+.bh4-bs-grid{display:grid;grid-template-columns:repeat(3,auto);gap:4px 18px;margin-top:4px}.bh4-bs-grid label{display:flex;align-items:center;gap:6px;color:#bdbfb5;font-size:12px;cursor:pointer;white-space:nowrap}.bh4-bs-grid input{accent-color:#c8a84b}
+.bh4-save-status{margin-top:8px;min-height:1em;font-size:11px}.bh4-save-ok{color:#22c55e}.bh4-save-err{color:#dc2626}.bh4-save-info{color:#a3a695}
+.bh4-debug-log{margin-top:8px;max-height:220px;overflow-y:auto;background:#0a0b09;border:1px solid #1f211d;border-radius:0;padding:6px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.5}
+.bh4-debug-hint{color:#5a5d52;font-size:11px}.bh4-debug-row{padding:1px 0;color:#a3a695;word-break:break-all}.bh4-debug-ts{color:#5a5d52;margin-right:4px}.bh4-debug-ms{color:#22c55e;margin-left:4px}.bh4-debug-ok{color:#a3a695}.bh4-debug-info{color:#bdbfb5}.bh4-debug-warn{color:#f97316}.bh4-debug-err{color:#dc2626}
+#bh4-auth{padding:24px;color:#d8dad2;line-height:1.6}#bh4-auth h3{margin:0 0 12px;color:#c8a84b;text-transform:uppercase;letter-spacing:1px;font-size:14px}#bh4-auth .bh4-auth-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+#bh4-toasts{position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column-reverse;gap:8px;z-index:2147483646;pointer-events:none;max-width:calc(100vw - 32px)}
+.bh4-toast{pointer-events:auto;width:310px;max-width:100%;background:#141614;border:1px solid #2a2d28;border-left:3px solid #c8a84b;border-radius:0;padding:10px 12px;color:#d8dad2;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;box-shadow:0 4px 20px rgba(0,0,0,.6);position:relative;cursor:pointer;animation:bh4-toast-in .2s ease-out}
+@keyframes bh4-toast-in{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+.bh4-toast:hover{border-color:#454a3d}.bh4-toast-close{position:absolute;top:4px;right:6px;background:none;border:none;color:#777;font-size:18px;cursor:pointer;padding:0 4px;line-height:1;font-family:inherit}.bh4-toast-close:hover{color:#dc2626}
+.bh4-toast-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 18px 4px 0}.bh4-toast-name{color:#e9e6da;font-weight:700;overflow:hidden;text-overflow:ellipsis}.bh4-toast-lvl{color:#7c7f72;font-size:10px;font-weight:400;margin-left:4px}.bh4-toast-reward{color:#22c55e;font-weight:700;font-size:14px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.bh4-toast-meta{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}.bh4-chip{background:#1a1c18;border:1px solid #2a2d28;padding:2px 7px;border-radius:0;font-size:10px;color:#a3a695;letter-spacing:.3px}.bh4-chip.bh4-badge-ok{background:#102417;color:#22c55e;border-color:#1c3a26}.bh4-chip.bh4-badge-hosp{background:#2a1608;color:#f97316;border-color:#43250e}.bh4-chip-rev{border:none;background:transparent;padding:2px 4px;font-size:10px;font-weight:700}
+.bh4-toast-attack{width:100%;padding:6px 10px;background:#dc2626;color:#fff;border:none;border-radius:0;cursor:pointer;font-weight:700;font-size:11px;letter-spacing:.6px;text-transform:uppercase;font-family:inherit}.bh4-toast-attack:hover{background:#ef4444}
+.bh4-toast-more{border-left-color:#454a3d;text-align:center}.bh4-toast-more-label{color:#e9e6da;font-weight:700;font-size:15px;letter-spacing:.5px}.bh4-toast-more-hint{color:#7c7f72;font-size:11px;margin-top:2px}
+.bh4-toast-clear-btn{pointer-events:auto;align-self:flex-end;background:rgba(20,22,20,0.95);color:#a3a695;border:1px solid #2a2d28;border-radius:0;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;cursor:pointer;font-family:inherit;box-shadow:0 2px 6px rgba(0,0,0,.4)}.bh4-toast-clear-btn:hover{background:#1a1c18;color:#e9e6da;border-color:#454a3d}
+.bh4-toast-claimed{border-left-color:#f97316}
+.bh4-toast-claimed .bh4-toast-name{color:#f97316}
+.bh4-toast-profile{width:100%;padding:6px 10px;background:#1a1c18;color:#d8dad2;border:1px solid #2a2d28;border-radius:0;cursor:pointer;font-weight:700;font-size:11px;letter-spacing:.5px;text-transform:uppercase;margin-top:2px;font-family:inherit}
+.bh4-toast-profile:hover{background:#22241f}
+.bh4-bell{background:none;border:1px solid #2a2d28;border-radius:0;cursor:pointer;font-size:11px;padding:2px 6px;opacity:.45;transition:opacity .15s,border-color .15s;margin-left:5px;vertical-align:middle;color:#a3a695;font-family:inherit}.bh4-bell:hover{opacity:.8;border-color:#454a3d}.bh4-bell.bh4-bell-on{opacity:1;border-color:#f97316;background:#2a1608;color:#f97316}.bh4-bell.bh4-bell-on:hover{border-color:#fb923c}
+.bh4-notif-badge{display:inline-block;padding:2px 9px;border-radius:0;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-left:8px;vertical-align:middle}.bh4-notif-granted{background:#102417;color:#22c55e}.bh4-notif-denied{background:#1d1310;color:#dc2626}.bh4-notif-default{background:#1a1c18;color:#a3a695}.bh4-notif-unsupported{background:#1a1c18;color:#5a5d52}.bh4-notif-hint{color:#7c7f72;font-size:11px;margin:6px 0 0;font-style:italic}
+.bh4-alert-banner{position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:linear-gradient(160deg,#150806,#1f0c08);border-top:3px solid #dc2626;padding:14px 16px 16px;color:#e9e6da;box-shadow:0 -4px 30px rgba(0,0,0,.75);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;animation:bh4-banner-in .3s cubic-bezier(.22,.61,.36,1) forwards}
+@keyframes bh4-banner-in{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}@keyframes bh4-banner-out{from{transform:translateY(0);opacity:1}to{transform:translateY(100%);opacity:0}}
+.bh4-alert-top{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.bh4-alert-icon{font-size:18px;flex-shrink:0;color:#dc2626;animation:bh4-pulse 1s ease-in-out infinite}@keyframes bh4-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.bh4-alert-title{font-size:15px;font-weight:700;color:#e9e6da;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.3px}.bh4-alert-lvl{color:#7c7f72;font-size:11px;font-weight:400;margin-left:4px}.bh4-alert-timer{font-size:14px;font-weight:700;color:#dc2626;white-space:nowrap;flex-shrink:0;font-variant-numeric:tabular-nums}.bh4-alert-close{background:none;border:none;color:#888;font-size:20px;cursor:pointer;padding:0 4px;line-height:1;flex-shrink:0;font-family:inherit}.bh4-alert-close:hover{color:#fff}
+.bh4-alert-sub{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.bh4-alert-attack{width:100%;padding:10px;background:#dc2626;color:#fff;border:none;border-radius:0;cursor:pointer;font-weight:700;font-size:13px;letter-spacing:.6px;text-transform:uppercase;font-family:inherit}.bh4-alert-attack:hover{background:#ef4444}
+.bh4-mark-profile-btn{position:fixed;bottom:80px;right:16px;z-index:999997;padding:10px 18px;background:#141614;border:2px solid #c8a84b;border-radius:0;color:#c8a84b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;cursor:pointer;box-shadow:0 4px 24px rgba(0,0,0,.7);transition:all .15s}
+.bh4-mark-profile-btn:hover{background:#1a1c18;border-color:#d9bc66}
+.bh4-mark-profile-btn-active{background:#102417!important;border-color:#22c55e!important;color:#22c55e!important}
+.bh4-target-remove{background:none;border:1px solid #2a2d28;border-radius:0;color:#7c7f72;cursor:pointer;font-size:11px;padding:2px 8px;line-height:1.4;font-family:inherit}
+.bh4-target-remove:hover{background:#1d1310;border-color:#dc2626;color:#dc2626}
+.bh4-target-alert-banner{top:0;bottom:auto;border-top:none;border-bottom:3px solid #c8a84b;background:linear-gradient(160deg,#15120a,#1f1a0c);animation:bh4-target-banner-in .3s cubic-bezier(.22,.61,.36,1) forwards}
+.bh4-target-alert-banner .bh4-alert-icon{color:#c8a84b}.bh4-target-alert-banner .bh4-alert-timer{color:#c8a84b}
+@keyframes bh4-target-banner-in{from{transform:translateY(-100%);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes bh4-target-banner-out{from{transform:translateY(0);opacity:1}to{transform:translateY(-100%);opacity:0}}
+.bh4-badge-travel{background:#15120a;color:#c8a84b;border:1px solid #33362f}
+@media(max-width:768px){#bh4-panel{width:100vw!important;max-width:100vw;min-width:0;border-radius:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}.bh4-grid-2{grid-template-columns:1fr}.bh4-bs-grid{grid-template-columns:repeat(2,auto)}.bh4-table td,.bh4-table th{padding:6px 6px;font-size:11px}#bh4-toasts{left:8px;right:8px;bottom:8px;align-items:stretch}.bh4-toast{width:auto}}
+`;
+        document.head.appendChild(style);
+    }
+
+    // ── UI ─────────────────────────────────────────────────────
+    class UI {
+        constructor(hunter,toaster,alertMgr,targetAlertMgr){this.hunter=hunter;this.toaster=toaster;this.alertMgr=alertMgr;this.targetAlertMgr=targetAlertMgr;this.activeTab="hunt";this._countdownTimer=null;this._panel=null;this._overlay=null;this._authed=false;this._sortCol="reward";this._sortDir="desc";this._refreshing=false;}
+        inject(){
+            injectCSS();
+            const overlay=document.createElement("div"); overlay.id="bh4-overlay"; document.body.appendChild(overlay);
+            const panel=document.createElement("div"); panel.id="bh4-panel";
+            panel.innerHTML=`<div id="bh4-header"><h2>Bounty Hunter 4<span class="bh4-ver">v${VERSION}</span></h2><button id="bh4-close">&times;</button></div><div id="bh4-tabs"><div class="bh4-tab active" data-tab="hunt">Hunt</div><div class="bh4-tab" data-tab="targets">Targets</div><div class="bh4-tab" data-tab="settings">Settings</div></div><div id="bh4-content"></div>`;
+            document.body.appendChild(panel); this._panel=panel; this._overlay=overlay;
+            overlay.addEventListener("click",()=>this.toggle(false));
+            panel.querySelector("#bh4-close").addEventListener("click",()=>this.toggle(false));
+            panel.querySelector("#bh4-tabs").addEventListener("click",(e)=>{const t=e.target.closest(".bh4-tab");if(!t)return;this.activeTab=t.dataset.tab;this._syncTabs();this._renderActive();});
+            this.hunter.onUpdate=()=>{if(this._isOpen())this._renderActive();};
+            this.hunter.onToast=(bounties)=>this.toaster.showMany(bounties);
+            this._countdownTimer=setInterval(()=>{
+                if(this._isOpen()&&this.activeTab==="hunt"){const el=document.getElementById("bh4-countdown");if(el)el.textContent=this.hunter.secondsUntilRefresh()+"s";}
+                if(this._isOpen()&&this.activeTab==="targets"){document.querySelectorAll("[data-abroad-until]").forEach((el)=>{const lts=parseInt(el.dataset.abroadUntil,10);const desc=el.dataset.abroadDesc||"";if(!lts)return;el.textContent=fmt.travelLabel(desc,lts);});}
+                document.querySelectorAll("[data-hosp-until]").forEach((el)=>{const until=parseInt(el.dataset.hospUntil,10);if(!Number.isFinite(until))return;el.textContent=fmt.hospLabel(until);});
+            },1000);
+        }
+        _isOpen(){return this._panel&&this._panel.classList.contains("bh4-open");}
+        toggle(open){const isOpen=open!=null?open:!this._isOpen();this._panel.classList.toggle("bh4-open",isOpen);this._overlay.classList.toggle("bh4-open",isOpen);if(isOpen)this._renderActive();}
+        _syncTabs(){for(const t of this._panel.querySelectorAll(".bh4-tab"))t.classList.toggle("active",t.dataset.tab===this.activeTab);}
+        _renderActive(){if(!this._authed){this._renderAuth();return;}if(this.activeTab==="hunt")this._renderHunt();else if(this.activeTab==="targets")this._renderTargets();else this._renderSettings();}
+        setAuthed(b){this._authed=b;if(this._isOpen())this._renderActive();}
+
+        _renderAuth(){
+            const content=this._panel.querySelector("#bh4-content"),spaAvailable=!IS_PDA&&KeyResolver.hasSPAKey();
+            content.innerHTML=`<div id="bh4-auth"><h3>Set your Torn API key</h3><p>Bounty Hunter 4 needs a <b>public</b> Torn API key. Stored in localStorage, sent only to <code>api.torn.com</code>.</p><p class="bh4-hint">Get one at <a class="bh4-name-link" href="https://www.torn.com/preferences.php#tab=api" target="_blank" rel="noopener">torn.com → Preferences → API Key</a>. "Public" access is sufficient — a higher-access key will not raise your call rate.</p><div class="bh4-field"><label>Torn API key (16 chars)</label><input id="bh4-auth-key" class="bh4-input bh4-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other"></div><div class="bh4-auth-actions"><button id="bh4-auth-save" class="bh4-btn bh4-btn-primary">Save &amp; start</button>${spaAvailable?`<button id="bh4-auth-spa" class="bh4-btn bh4-btn-muted">Use Supply Pack Analyzer key</button>`:""}</div><p class="bh4-hint" id="bh4-auth-err" style="color:#dc2626;min-height:1em"></p><hr style="border:none;border-top:1px solid #2a2d28;margin:16px 0"><h3>Optional: FFScouter key</h3><p>Required for fair-fight and BS bracket filtering.</p><div class="bh4-field"><label>FFScouter key (16 chars)</label><input id="bh4-auth-ffkey" class="bh4-input bh4-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(KeyResolver.getFFKey())}"></div></div>`;
+            const keyInput=content.querySelector("#bh4-auth-key"),err=content.querySelector("#bh4-auth-err");
+            const save=async()=>{err.textContent="";const k=keyInput.value.trim();if(!/^[A-Za-z0-9]{16}$/.test(k)){err.textContent="That doesn't look like a 16-character Torn key.";return;}await this._adoptKey(k,content.querySelector("#bh4-auth-ffkey").value.trim());};
+            content.querySelector("#bh4-auth-save").addEventListener("click",save);
+            keyInput.addEventListener("keydown",(e)=>{if(e.key==="Enter")save();});
+            const spaBtn=content.querySelector("#bh4-auth-spa");
+            if(spaBtn)spaBtn.addEventListener("click",async()=>{err.textContent="";const k=KeyResolver.getSPAKey();if(!k){err.textContent="Supply Pack Analyzer key not available.";return;}await this._adoptKey(k,content.querySelector("#bh4-auth-ffkey").value.trim());});
+        }
+        async _adoptKey(tornKey,ffKey){
+            const err=this._panel.querySelector("#bh4-auth-err");
+            if(err)err.textContent="Validating…";
+            this.hunter.api.setKey(tornKey);
+            try{await this.hunter.api.validateKey();}catch(e){if(err)err.textContent="Torn rejected that key: "+(e.message||"invalid");return;}
+            KeyResolver.saveTornKey(tornKey);
+            if(ffKey&&/^[A-Za-z0-9]{16}$/.test(ffKey))KeyResolver.saveFFKey(ffKey);
+            this.setAuthed(true); this.hunter.start();
+        }
+
+        _renderHunt(){
+            const content=this._panel.querySelector("#bh4-content"),rows=this._sortMatches(this.hunter.lastMatches),c=this.hunter.lastCounts,nextIn=this.hunter.secondsUntilRefresh(),rateLimited=isRateLimitError(this.hunter.lastError);
+            const errLine=(this.hunter.lastError&&!rateLimited)?`<span class="bh4-err">${escHtml(this.hunter.lastError.message||"error")}</span>`:"";
+            const ffKeyMissing=!KeyResolver.getFFKey()&&!this.hunter.settings.includeUnknownFF?`<span class="bh4-err">No FFScouter key — all targets excluded. Add one in Settings.</span>`:"";
+            const ffError=c&&c.ffError?(c.ffNetworkFail?`<span style="color:#f97316">FFScouter unreachable — showing all targets without FF filter.</span>`:`<span class="bh4-err">FFScouter: ${escHtml(c.ffError)}</span>`):"";
+            const thCls=(col)=>this._sortCol!==col?"":(this._sortDir==="asc"?"sort-asc":"sort-desc");
+            const rlBanner=rateLimited?`<div class="bh4-rl-banner"><div class="bh4-rl-title">${rows.length>0?"Rate limit hit — showing previous results":"Rate limit hit — no results"}</div><div class="bh4-rl-body">${rows.length>0?"The table below is from the last successful refresh.":"No successful refresh completed yet."}<br><br><b>To reduce API load:</b><ul class="bh4-rl-tips"><li>Raise <b>Min reward</b></li><li>Narrow <b>FF</b> or <b>BS bracket</b></li><li>Shrink the <b>Attack window</b></li><li>Increase <b>Auto-refresh</b> interval</li></ul><span class="bh4-rl-hint">Auto-retry continues in the background.</span></div></div>`:"";
+            content.innerHTML=`<div id="bh4-status-line"><button id="bh4-refresh-btn" class="bh4-btn-muted"${this._refreshing?" disabled":""}>${this._refreshing?"Refreshing…":"Refresh now"}</button><span>Next in <span id="bh4-countdown">${nextIn}</span>s</span><span>${rows.length} match${rows.length===1?"":"es"}</span>${errLine}${ffKeyMissing}${ffError}</div>${rlBanner}${rows.length===0?(rateLimited?"":` <div class="bh4-empty">No bounties match your filters right now.<br><span style="color:#5a5d52">Adjust reward, FF, BS bracket, attack window, or status filter under Settings.</span></div>`):`<table class="bh4-table"><thead><tr><th data-sort="target" class="${thCls("target")}">Target</th><th data-sort="reward" class="num ${thCls("reward")}">Reward</th><th data-sort="ff" class="num ${thCls("ff")}">FF</th><th data-sort="bs" class="num bh4-col-divider ${thCls("bs")}">BS Est.</th><th data-sort="status" class="bh4-col-divider ${thCls("status")}">Status</th><th class="bh4-col-divider" title="Revivable">Rev.</th><th></th></tr></thead><tbody>${rows.map((row)=>this._renderRow(row)).join("")}</tbody></table>`}`;
+            const refreshBtn=content.querySelector("#bh4-refresh-btn");
+            refreshBtn.addEventListener("click",async()=>{
+                if(this._refreshing)return;
+                this._refreshing=true; refreshBtn.disabled=true; refreshBtn.textContent="Refreshing…";
+                try{await this.hunter.refresh();}
+                catch{/* surfaced via hunter.lastError + onUpdate */}
+                finally{this._refreshing=false; if(refreshBtn.isConnected){refreshBtn.disabled=false; refreshBtn.textContent="Refresh now";}}
+            });
+            content.querySelectorAll(".bh4-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(PROFILE_URL+el.dataset.id);}));
+            content.querySelectorAll("th[data-sort]").forEach((el)=>el.addEventListener("click",()=>{const col=el.dataset.sort;if(this._sortCol===col)this._sortDir=this._sortDir==="asc"?"desc":"asc";else{this._sortCol=col;this._sortDir=(col==="target")?"asc":"desc";}this._renderHunt();}));
+            content.querySelectorAll(".bh4-bell").forEach((btn)=>btn.addEventListener("click",(e)=>{e.stopPropagation();const id=btn.dataset.bellId;this.alertMgr.toggle(id);this.alertMgr.sync(this.hunter.lastMatches);const active=this.alertMgr.isAlertActive(id);btn.classList.toggle("bh4-bell-on",active);btn.title=active?"Cancel alert":"Alert 1 min before exit";}));
+        }
+
+        _sortMatches(list){
+            const col=this._sortCol,dir=this._sortDir==="asc"?1:-1;
+            const keyFor=(m)=>{switch(col){case"target":return String(m.target_name||"").toLowerCase();case"reward":return m.reward||0;case"ff":return m.ff==null?Infinity:m.ff;case"bs":return parseBS(m.bs)==null?Infinity:parseBS(m.bs);case"status":{const rem=m.statusState==="Hospital"?Math.max(0,(m.hospUntil||0)-Math.floor(Date.now()/1000)):0;return(m.statusState==="Okay"?0:1)*1e6+rem;}default:return m.reward||0;}};
+            return[...list].sort((a,b)=>{const ka=keyFor(a),kb=keyFor(b);if(ka===Infinity&&kb!==Infinity)return 1;if(kb===Infinity&&ka!==Infinity)return-1;if(ka<kb)return-1*dir;if(ka>kb)return 1*dir;return(b.reward||0)-(a.reward||0);});
+        }
+
+        _renderRow(b){
+            const isHosp=b.statusState==="Hospital",statusClass=isHosp?"bh4-badge-hosp":"bh4-badge-ok",hospAttr=isHosp?` data-hosp-until="${b.hospUntil}"`:"",statusText=isHosp?fmt.hospLabel(b.hospUntil):"OKAY",ffCell=b.ff==null?"—":b.ff.toFixed(2),countBadge=b.bountyCount>1?` <span class="bh4-count">×${b.bountyCount}</span>`:"",revLabel=revivableEmoji(b.revivable,b.statusState),bellActive=isHosp&&this.alertMgr.isAlertActive(b.target_id),bellBtn=isHosp?`<button class="bh4-bell${bellActive?" bh4-bell-on":""}" data-bell-id="${b.target_id}" title="${bellActive?"Cancel alert":"Alert 1 min before exit"}">⏰</button>`:"";
+            const warBadge=!!b.inFactionWar?`<span class="bh4-badge-war" title="Faction at war — outside attackers blocked">WAR</span>`:"";return`<tr><td><a class="bh4-name-link" href="${PROFILE_URL}${b.target_id}" target="_blank" rel="noopener">${escHtml(b.target_name)}</a><span style="color:#5a5d52;font-size:11px"> L${b.target_level}</span>${countBadge}${warBadge}</td><td class="num">${escHtml(fmt.moneyFull(b.reward))}</td><td class="num">${ffCell}</td><td class="num bh4-col-divider">${escHtml(b.bs||"—")}</td><td class="bh4-col-divider"><span class="bh4-badge ${statusClass}"${hospAttr}>${statusText}</span>${bellBtn}</td><td class="bh4-revive-cell bh4-col-divider" title="${revLabel==="REV"?"Revivable":revLabel==="NO"?"Not revivable":revLabel==="?"?"Unknown":"Not in hospital"}">${revLabel}</td><td><button class="bh4-attack" data-id="${b.target_id}">Attack →</button></td></tr>`;
+        }
+
+        _renderTargets(){
+            const content=this._panel.querySelector("#bh4-content");
+            const targets=MarkedTargetStore.load();
+            const statuses=this.hunter.lastMarkedStatuses||new Map();
+            const statusLine=`<div id="bh4-status-line"><button id="bh4-tgt-refresh" class="bh4-btn-muted">Refresh now</button><span>${targets.length} marked target${targets.length===1?"":"s"}</span></div>`;
+            if(targets.length===0){
+                content.innerHTML=statusLine+`<div class="bh4-empty">No marked targets yet.<br><span style="color:#5a5d52">Tap <b>Mark</b> on any player profile to add them here.</span></div>`;
+                content.querySelector("#bh4-tgt-refresh").addEventListener("click",async()=>{await this.hunter.refreshMarked().catch(()=>{});});
+                return;
+            }
+            const rows=targets.map((t)=>{
+                const s=statuses.get(t.id);
+                const state=s?s.state:null;
+                let statusCell="";
+                if(!s||!state){statusCell=`<span class="bh4-badge" style="background:#1a1c18;color:#5a5d52">Loading…</span>`;}
+                else if(state==="Okay"){statusCell=`<span class="bh4-badge bh4-badge-ok">Okay</span>`;}
+                else if(state==="Hospital"){statusCell=`<span class="bh4-badge bh4-badge-hosp" data-hosp-until="${s.until}">${fmt.hospLabel(s.until)}</span>`;}
+                else if(state==="Abroad"||state==="Traveling"){const _desc=s.description||"";const _lts=s.landingTs||0;const _ats=`data-abroad-until="${_lts}" data-abroad-desc="${escHtml(_desc)}"`;statusCell=`<span class="bh4-badge bh4-badge-travel" ${_lts?_ats:""}>${fmt.travelLabel(_desc,_lts)}</span>`;}
+                else if(state==="Jail"){statusCell=`<span class="bh4-badge" style="background:#1a1c18;color:#a3a695">Jailed</span>`;}
+                else{statusCell=`<span class="bh4-badge" style="background:#1a1c18;color:#a3a695">${escHtml(state)}</span>`;}
+                const warBadge=s&&s.inFactionWar?`<span class="bh4-badge-war" title="Faction at war — outside attackers blocked">WAR</span>`:"";
+                const bellActive=this.targetAlertMgr.isAlertActive(t.id);
+                const canAlert=state==="Hospital"||state==="Abroad"||state==="Traveling";
+                const bellBtn=canAlert?`<button class="bh4-bell bh4-tgt-bell${bellActive?" bh4-bell-on":""}" data-tgt-id="${t.id}" title="${bellActive?"Cancel alert":"Alert 1 min before exit/landing"}">⏰</button>`:"";
+                return`<tr>
+                    <td><a class="bh4-name-link" href="${PROFILE_URL}${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a> <span style="color:#5a5d52;font-size:11px">L${t.level}</span>${warBadge}</td>
+                    <td>${statusCell}${bellBtn}</td>
+                    <td><button class="bh4-attack" data-id="${t.id}">Attack →</button></td>
+                    <td><button class="bh4-target-remove" data-id="${t.id}" data-name="${escHtml(t.name)}">✕</button></td>
+                </tr>`;
+            }).join("");
+            content.innerHTML=statusLine+`<table class="bh4-table"><thead><tr><th>Target</th><th>Status</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+            content.querySelector("#bh4-tgt-refresh").addEventListener("click",async()=>{await this.hunter.refreshMarked().catch(()=>{});});
+            content.querySelectorAll(".bh4-attack").forEach((el)=>el.addEventListener("click",(e)=>{e.preventDefault();openTornUrl(ATTACK_URL+el.dataset.id);}));
+            content.querySelectorAll(".bh4-target-remove").forEach((btn)=>btn.addEventListener("click",()=>{
+                const id=Number(btn.dataset.id),name=btn.dataset.name;
+                if(!confirm(`Remove ${name} from marked targets?`))return;
+                MarkedTargetStore.remove(id);
+                this.targetAlertMgr.cancelAll();
+                this._renderTargets();
+                this.hunter.refreshMarked().catch(()=>{});
+            }));
+            content.querySelectorAll(".bh4-tgt-bell").forEach((btn)=>btn.addEventListener("click",(e)=>{
+                e.stopPropagation();
+                const id=btn.dataset.tgtId;
+                this.targetAlertMgr.toggle(id);
+                this.targetAlertMgr.sync(MarkedTargetStore.load(),this.hunter.lastMarkedStatuses);
+                const active=this.targetAlertMgr.isAlertActive(id);
+                btn.classList.toggle("bh4-bell-on",active);
+                btn.title=active?"Cancel alert":"Alert 1 min before exit/landing";
+            }));
+        }
+        _renderSettings(){
+            const content=this._panel.querySelector("#bh4-content"),s=this.hunter.settings,tornKey=KeyResolver.resolveTornKey()||"",pdaNote=KeyResolver.isPDAKey()?`<p class="bh4-hint">Your Torn key is provided by Torn PDA and is not editable here.</p>`:"";
+            const bsCheckboxes=BS_RANGES.map((r)=>`<label><input type="checkbox" id="${r.id}" value="${r.id}"${(s.bsRanges||[]).includes(r.id)?" checked":""}> ${escHtml(r.label)}</label>`).join("");
+            content.innerHTML=`
+<div class="bh4-section"><h3>Reward &amp; Combat Filters</h3><div class="bh4-grid-2"><div class="bh4-field"><label>Min reward ($)</label><input id="bh4-set-price" class="bh4-input" type="number" min="0" step="10000" value="${s.minPrice}"></div><div class="bh4-field"><label>Attack window (minutes)</label><input id="bh4-set-hosp" class="bh4-input" type="number" min="0" max="60" step="1" value="${s.hospitalMaxMin}"><span class="bh4-hint">Only targets attackable now (Okay) or exiting hospital within this window are shown. Default 30.</span></div><div class="bh4-field"><label>Fair-fight min</label><input id="bh4-set-ffmin" class="bh4-input" type="number" min="1" max="10" step="0.1" value="${s.minFF}"></div><div class="bh4-field"><label>Fair-fight max</label><input id="bh4-set-ffmax" class="bh4-input" type="number" min="1" max="10" step="0.1" value="${s.maxFF}"></div></div>
+<div class="bh4-field" style="margin-top:4px;max-width:280px"><label>Status filter</label><select id="bh4-set-statusfilter" class="bh4-select"><option value="all"${s.statusFilter==="all"?" selected":""}>Okay + Hospital (window)</option><option value="okay"${s.statusFilter==="okay"?" selected":""}>Okay only</option><option value="hospital"${s.statusFilter==="hospital"?" selected":""}>Hospital only (window)</option></select><span class="bh4-hint">Narrows the attack window above to one status.</span></div>
+</div>
+<div class="bh4-section"><h3>Battle Stats Bracket Filter <span style="font-size:10px;color:#5a5d52;font-weight:400;text-transform:none;letter-spacing:0">(requires FFScouter key)</span></h3><p class="bh4-hint">Leave all unchecked to show every level.</p><div class="bh4-bs-grid">${bsCheckboxes}</div></div>
+<div class="bh4-section"><h3>Revivable Filter <span style="font-size:10px;color:#5a5d52;font-weight:400;text-transform:none;letter-spacing:0">(hospital targets only)</span></h3><label class="bh4-check"><input type="checkbox" id="bh4-set-revivable"${s.revivableOnly?" checked":""}> Show only revivable hospital targets</label><p class="bh4-hint">When enabled, hospital targets with revive off (NO) are hidden.</p></div>
+<div class="bh4-section"><h3>Faction War Filter</h3><label class="bh4-check"><input type="checkbox" id="bh4-set-warfilter"${s.hideWarTargets?" checked":""}> Hide targets whose faction is in an active war</label><p class="bh4-hint">During Ranked Wars and Territory Wars, only members of the warring factions can attack each other — outside attackers are blocked. Enabling this hides those targets. War status is fetched from the Torn API and cached for 5 minutes. Targets without a faction, or whose faction status cannot be fetched, are always shown. If a target shows WAR but the filter is off, you can still see them but the attack will likely fail.</p></div>
+<div class="bh4-section"><h3>Hospital Exit Alerts</h3><p class="bh4-hint">When a hospital timer hits ~60 seconds, fires a <b>full-screen in-app banner</b> + phone vibration + audio beep. No special permission required — works inside Torn PDA.</p><p class="bh4-hint" style="margin-bottom:8px">Tap the bell on any hospital row in the Hunt tab to alert on that specific target. Or enable all below.</p><label class="bh4-check"><input type="checkbox" id="bh4-set-hospalerts"${s.hospAlerts?" checked":""}> Auto-alert all hospital targets</label><div style="margin-top:10px;padding-top:10px;border-top:1px solid #1f211d"><div style="color:#a3a695;font-size:11px;margin-bottom:6px">Optional: Web Notifications (bonus for desktop / some Android browsers)</div><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:#7c7f72;font-size:11px">Permission:</span><span id="bh4-notif-perm-badge" class="bh4-notif-badge">…</span><button id="bh4-notif-req-btn" class="bh4-btn bh4-btn-muted" style="font-size:10px;padding:4px 10px">Request permission</button></div><p class="bh4-notif-hint" id="bh4-notif-hint-text"></p></div><p class="bh4-notif-hint" style="margin-top:8px">Screen fully off suspends JS timers on Android — keep the screen on while actively hunting.</p></div>
+<div class="bh4-section" style="border-top:2px solid #1f211d;padding-top:16px;margin-top:4px">
+<h3>Marked Targets</h3>
+<p class="bh4-hint">Targets you mark from their profile pages appear in the <b>Targets</b> tab with live status, timers, and war detection. Alerts work for both hospital and travel.</p>
+<label class="bh4-check"><input type="checkbox" id="bh4-set-markedalerts"${s.markedAlerts?" checked":""}> Auto-alert all marked targets (60s before hospital exit or landing)</label>
+<p class="bh4-hint">You can also set per-target alerts with the bell in the Targets tab. Marked targets refresh on the same cycle as the bounty board.</p>
+</div>
+<div class="bh4-section"><h3>Refresh &amp; Notifications</h3><div class="bh4-grid-2"><div class="bh4-field"><label>Auto-refresh</label><select id="bh4-set-refresh" class="bh4-select"><option value="30"${s.refreshSec===30?" selected":""}>Every 30 s</option><option value="60"${s.refreshSec===60?" selected":""}>Every 60 s</option><option value="120"${s.refreshSec===120?" selected":""}>Every 2 min</option><option value="300"${s.refreshSec===300?" selected":""}>Every 5 min</option><option value="0"${s.refreshSec===0?" selected":""}>Off (manual only)</option></select><span class="bh4-hint">60 s is comfortably under the rate limit.</span></div><div class="bh4-field"><label>Options</label><label class="bh4-check"><input type="checkbox" id="bh4-set-toasts"${s.toastsEnabled?" checked":""}> Show toast for new matches</label><label class="bh4-check" style="margin-top:6px"><input type="checkbox" id="bh4-set-unkff"${s.includeUnknownFF?" checked":""}> Include targets with unknown FF score</label></div></div></div>
+<div class="bh4-section"><h3>Torn API key</h3>${pdaNote}<div class="bh4-field"><input id="bh4-set-tornkey" class="bh4-input bh4-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(tornKey)}" ${KeyResolver.isPDAKey()?"disabled":""}></div>${!KeyResolver.isPDAKey()?`<div class="bh4-row-actions"><button id="bh4-key-save" class="bh4-btn bh4-btn-primary">Save Torn key</button><button id="bh4-key-clear" class="bh4-btn bh4-btn-danger">Clear &amp; log out</button></div><div id="bh4-key-status" class="bh4-save-status"></div>`:""}</div>
+<div class="bh4-section"><h3>FFScouter key</h3><p class="bh4-hint">Used for fair-fight and BS bracket filtering (one bulk call per refresh cycle).</p><div class="bh4-field"><input id="bh4-set-ffkey" class="bh4-input bh4-input-masked" type="text" maxlength="16" spellcheck="false" autocomplete="off" data-lpignore="true" data-form-type="other" value="${escHtml(KeyResolver.getFFKey())}"></div><div class="bh4-row-actions"><button id="bh4-ffkey-save" class="bh4-btn bh4-btn-primary">Save FFScouter key</button><button id="bh4-ffkey-clear" class="bh4-btn bh4-btn-muted">Clear</button></div><div id="bh4-ffkey-status" class="bh4-save-status"></div></div>
+<div class="bh4-section"><h3>Debug log</h3><label class="bh4-check"><input type="checkbox" id="bh4-set-debug"${isDebugOn()?" checked":""}> Record API requests &amp; rate-limit hits</label><div id="bh4-debug-log" class="bh4-debug-log"></div><div class="bh4-row-actions" style="margin-top:6px"><button id="bh4-debug-clear" class="bh4-btn bh4-btn-muted">Clear log</button></div></div>
+<div class="bh4-section"><h3>Environment</h3><p class="bh4-hint">Version ${VERSION} · Platform: ${IS_PDA?"Torn PDA":"Desktop"}</p><button id="bh4-reset" class="bh4-btn bh4-btn-muted">Reset all filters to defaults</button></div>
+`;
+            const $=(id)=>content.querySelector("#"+id);
+            const persistFilters=()=>{
+                const minFF=parseFloat($("bh4-set-ffmin").value),maxFF=parseFloat($("bh4-set-ffmax").value),cleanMin=Number.isFinite(minFF)?Math.max(1,minFF):1.0,cleanMax=Number.isFinite(maxFF)?Math.max(cleanMin,maxFF):cleanMin;
+                const selectedBS=BS_RANGES.filter((r)=>{const el=document.getElementById(r.id);return el&&el.checked;}).map((r)=>r.id);
+                this.hunter.updateSettings({minPrice:Math.max(0,parseInt($("bh4-set-price").value,10)||0),hospitalMaxMin:Math.max(0,Math.min(60,parseInt($("bh4-set-hosp").value,10)||0)),statusFilter:$("bh4-set-statusfilter").value,minFF:cleanMin,maxFF:cleanMax,refreshSec:parseInt($("bh4-set-refresh").value,10),toastsEnabled:$("bh4-set-toasts").checked,includeUnknownFF:$("bh4-set-unkff").checked,revivableOnly:$("bh4-set-revivable").checked,bsRanges:selectedBS,hospAlerts:!!($("bh4-set-hospalerts")&&$("bh4-set-hospalerts").checked),hideWarTargets:!!($("bh4-set-warfilter")&&$("bh4-set-warfilter").checked),markedAlerts:!!($("bh4-set-markedalerts")&&$("bh4-set-markedalerts").checked)});
+                this.alertMgr.enabled=this.hunter.settings.hospAlerts; this.alertMgr.sync(this.hunter.lastMatches);
+                this.targetAlertMgr.enabled=this.hunter.settings.markedAlerts; this.targetAlertMgr.sync(MarkedTargetStore.load(),this.hunter.lastMarkedStatuses);
+                if(this.hunter.settings.refreshSec>0){this.hunter.stop();this.hunter.start();}else this.hunter.stop();
+            };
+            ["bh4-set-price","bh4-set-hosp","bh4-set-statusfilter","bh4-set-ffmin","bh4-set-ffmax","bh4-set-refresh","bh4-set-toasts","bh4-set-unkff","bh4-set-revivable","bh4-set-hospalerts","bh4-set-warfilter","bh4-set-markedalerts"].forEach((id)=>$(id)&&$(id).addEventListener("change",persistFilters));
+            BS_RANGES.forEach((r)=>{const el=document.getElementById(r.id);if(el)el.addEventListener("change",persistFilters);});
+
+            const updatePermBadge=()=>{const badge=$("bh4-notif-perm-badge"),hint=$("bh4-notif-hint-text"),reqBtn=$("bh4-notif-req-btn");if(!badge)return;const perm=HospAlertManager.permission(),map={granted:["Granted","bh4-notif-granted",false,"Web notifications allowed."],denied:["Denied","bh4-notif-denied",false,"Blocked — allow in browser/app settings for torn.com."],default:["Not asked yet","bh4-notif-default",true,'Click "Request permission" to enable.'],unsupported:["Not supported","bh4-notif-unsupported",false,"In-app banner still works."]};const[text,cls,showBtn,hintText]=map[perm]||map.unsupported;badge.textContent=text;badge.className=`bh4-notif-badge ${cls}`;if(reqBtn)reqBtn.style.display=showBtn?"":"none";if(hint)hint.textContent=hintText;};
+            updatePermBadge();
+            const reqBtn=$("bh4-notif-req-btn");
+            if(reqBtn)reqBtn.addEventListener("click",async()=>{reqBtn.disabled=true;await HospAlertManager.requestPermission();updatePermBadge();reqBtn.disabled=false;});
+            const permPoll=setInterval(()=>{if(!($("bh4-notif-perm-badge")&&$("bh4-notif-perm-badge").isConnected)){clearInterval(permPoll);return;}updatePermBadge();},1500);
+
+            const setStatus=(elId,kind,msg)=>{const el=$(elId);if(!el)return;el.className="bh4-save-status bh4-save-"+kind;el.textContent=msg;};
+            if(!KeyResolver.isPDAKey()){
+                $("bh4-key-save").addEventListener("click",async()=>{const k=$("bh4-set-tornkey").value.trim();if(!/^[A-Za-z0-9]{16}$/.test(k)){setStatus("bh4-key-status","err","Must be 16 alphanumeric characters.");return;}setStatus("bh4-key-status","info","Validating…");this.hunter.api.setKey(k);try{await this.hunter.api.validateKey();}catch(e){setStatus("bh4-key-status","err","Key rejected: "+(e.message||"invalid"));return;}KeyResolver.saveTornKey(k);this.hunter.myUserId=null;this.hunter.myUserLevel=null;this.hunter.myUserAge=null;setStatus("bh4-key-status","ok","Saved. Refreshing…");await this.hunter.refresh().catch(()=>{});setStatus("bh4-key-status","ok","Saved ✓");});
+                $("bh4-key-clear").addEventListener("click",()=>{if(!confirm("Clear the Torn API key and return to the auth screen?"))return;KeyResolver.clearTornKey();this.hunter.stop();this.toaster.clearAll();this.setAuthed(false);});
+            }
+            $("bh4-ffkey-save").addEventListener("click",async()=>{const k=$("bh4-set-ffkey").value.trim();if(!k){KeyResolver.clearFFKey();if(this.hunter.lastCounts)this.hunter.lastCounts.ffError=null;setStatus("bh4-ffkey-status","info","Cleared.");this.hunter.refresh().catch(()=>{});return;}setStatus("bh4-ffkey-status","info","Validating with FFScouter…");const result=await validateFFScouterKey(k);if(!result.ok){setStatus("bh4-ffkey-status","err",result.message);return;}KeyResolver.saveFFKey(k);if(this.hunter.lastCounts)this.hunter.lastCounts.ffError=null;setStatus("bh4-ffkey-status","ok",result.message+" Refreshing…");await this.hunter.refresh().catch(()=>{});setStatus("bh4-ffkey-status","ok",result.message+" Saved ✓");});
+            $("bh4-ffkey-clear").addEventListener("click",()=>{KeyResolver.clearFFKey();$("bh4-set-ffkey").value="";if(this.hunter.lastCounts)this.hunter.lastCounts.ffError=null;setStatus("bh4-ffkey-status","info","Cleared.");this.hunter.refresh().catch(()=>{});});
+            $("bh4-reset").addEventListener("click",()=>{if(!confirm("Reset all filters to defaults?"))return;this.hunter.updateSettings({...DEFAULT_SETTINGS,toastsEnabled:this.hunter.settings.toastsEnabled});this._renderActive();});
+
+            const debugToggle=$("bh4-set-debug"),debugEl=$("bh4-debug-log");
+            const renderLog=()=>{if(!debugEl.isConnected)return;if(!isDebugOn()){debugEl.innerHTML=`<span class="bh4-debug-hint">Debug is off.</span>`;return;}if(debugLog.length===0){debugEl.innerHTML=`<span class="bh4-debug-hint">No events yet.</span>`;return;}debugEl.innerHTML=[...debugLog].reverse().map((r)=>{const ms=(r.ms!=null)?` <span class="bh4-debug-ms">${r.ms}ms</span>`:"";return`<div class="bh4-debug-row bh4-debug-${r.level}"><span class="bh4-debug-ts">${r.ts}</span> ${escHtml(r.label)}${ms}</div>`;}).join("");};
+            debugToggle.addEventListener("change",()=>{try{localStorage.setItem(LS.debug,debugToggle.checked?"1":"");}catch{}if(!debugToggle.checked)debugLog.length=0;renderLog();});
+            $("bh4-debug-clear").addEventListener("click",()=>{debugLog.length=0;renderLog();});
+            const onEntry=()=>renderLog(); debugBus.addEventListener("entry",onEntry);
+            const detach=new MutationObserver(()=>{if(!debugEl.isConnected){debugBus.removeEventListener("entry",onEntry);detach.disconnect();}});
+            detach.observe(this._panel,{childList:true,subtree:true}); renderLog();
+        }
+    }
+
+    // ── Shared Footer Menu ─────────────────────────────────────
+    (function setupEugFooterMenu(){
+        const W=(typeof unsafeWindow!=="undefined")?unsafeWindow:window;
+        if(W.__eugFooterMenuLoaded)return; W.__eugFooterMenuLoaded=true; W.__eugeneScripts=W.__eugeneScripts||[];
+        const ROW_ID="eug-footer-row";
+        function injectFMCSS(){if(document.getElementById("eug-footer-style"))return;const s=document.createElement("style");s.id="eug-footer-style";s.textContent=`[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`;document.head.appendChild(s);}
+        function injectEntryCSS(entry){if(!entry.color)return;const id=`eug-color-${entry.id}`,dark=entry.colorDark||"#222",hover=entry.hoverColor||entry.color,css=`[data-eug-id="${entry.id}"]{background:linear-gradient(to bottom,${entry.color},${dark})!important}[data-eug-id="${entry.id}"]:hover{background:linear-gradient(to bottom,${hover},${entry.color})!important}`;const ex=document.getElementById(id);if(ex){ex.textContent=css;return;}const el=document.createElement("style");el.id=id;el.textContent=css;document.head.appendChild(el);}
+        const findRefBtn=()=>document.getElementById("notes_panel_button")||document.getElementById("people_panel_button"),getRow=()=>document.getElementById(ROW_ID),closeRow=()=>{const r=getRow();if(r)r.classList.remove("eug-open");};
+        const openRow=(btn)=>{const row=getRow();if(!row)return;const rect=btn.getBoundingClientRect();row.classList.add("eug-open");const rr=row.getBoundingClientRect();let left=Math.max(4,Math.min(rect.left+rect.width/2-rr.width/2,window.innerWidth-rr.width-4));row.style.left=left+"px";row.style.bottom=(window.innerHeight-rect.top+6)+"px";};
+        function makeScriptBtn(entry,refBtn,role){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title=entry.name;btn.setAttribute("data-eug",role);btn.setAttribute("data-eug-id",entry.id);btn.innerHTML=(entry.iconSVG||"").replace(/<svg\b([^>]*)>/,(m,a)=>/\sclass\s*=/.test(a)?m:`<svg${a} class="${ic}">`);btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();closeRow();try{entry.onClick();}catch{}});injectEntryCSS(entry);return btn;}
+        function makeMenuBtn(refBtn){const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title="My userscripts";btn.setAttribute("data-eug","menu");btn.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`;btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();const row=getRow();if(row&&row.classList.contains("eug-open"))closeRow();else openRow(btn);});return btn;}
+        const LEGACY=["tat-footer-btn","spa-footer-btn"];
+        function render(){const refBtn=findRefBtn();if(!refBtn)return false;injectFMCSS();const parent=refBtn.parentNode;parent.querySelectorAll("[data-eug]").forEach((el)=>el.remove());LEGACY.forEach((id)=>{const el=document.getElementById(id);if(el)el.remove();});const oldRow=getRow();if(oldRow)oldRow.remove();const scripts=W.__eugeneScripts||[];if(scripts.length===0)return true;if(scripts.length===1){parent.insertBefore(makeScriptBtn(scripts[0],refBtn,"solo"),refBtn);}else{const mb=makeMenuBtn(refBtn);parent.insertBefore(mb,refBtn);const row=document.createElement("div");row.id=ROW_ID;row.setAttribute("data-eug-row","");for(const s of scripts)row.appendChild(makeScriptBtn(s,refBtn,"item"));document.body.appendChild(row);}return true;}
+        function mount(){render();let pending=false;const obs=new MutationObserver(()=>{if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;const r=findRefBtn();if(r&&!r.parentNode.querySelector("[data-eug]"))render();});});obs.observe(document.body,{childList:true,subtree:true});}
+        W.addEventListener("eugene-scripts-updated",render);
+        document.addEventListener("click",(e)=>{const row=getRow();if(!row||!row.classList.contains("eug-open"))return;const mb=document.querySelector('[data-eug="menu"]');if(mb&&mb.contains(e.target))return;if(row.contains(e.target))return;closeRow();});
+        document.addEventListener("keydown",(e)=>{if(e.key==="Escape")closeRow();});
+        W.addEventListener("scroll",closeRow,{passive:true}); W.addEventListener("resize",closeRow);
+        W.registerEugeneScript=function(entry){const list=W.__eugeneScripts,i=list.findIndex((s)=>s.id===entry.id);if(i>=0)list[i]=entry;else list.push(entry);W.dispatchEvent(new CustomEvent("eugene-scripts-updated"));};
+        W.mountEugeneFooterMenu=mount;
+    })();
+
+    // ── Profile Button Injector ───────────────────────────────
+    function setupProfileButtonInjector(){
+        let lastUrl="",lastXid="";
+        const tryInject=()=>{
+            const url=location.href;
+            if(!url.includes("profiles.php")){
+                const b=document.getElementById("bh4-mark-btn");if(b)b.remove();lastXid="";return;
+            }
+            const xid=new URLSearchParams(location.search).get("XID")||"";
+            if(!xid){const b=document.getElementById("bh4-mark-btn");if(b)b.remove();lastXid="";return;}
+            if(document.getElementById("bh4-mark-btn")&&lastXid===xid)return;
+            const prev=document.getElementById("bh4-mark-btn");if(prev)prev.remove();
+            lastXid=xid;
+            const id=Number(xid);if(!id)return;
+            let name=`Player ${id}`,level=0;
+            for(const sel of ["[class*='playerName']","[class*='player-name']","[class*='name___']",".profile-header h4","h4.bold"]) {
+                const el=document.querySelector(sel);
+                if(el&&el.textContent.trim()&&el.textContent.trim().length<40){name=el.textContent.trim();break;}
+            }
+            const isMarked=MarkedTargetStore.has(id);
+            const btn=document.createElement("button");
+            btn.id="bh4-mark-btn";
+            btn.className="bh4-mark-profile-btn"+(isMarked?" bh4-mark-profile-btn-active":"");
+            btn.textContent=isMarked?"✓ MARKED":"+ MARK";
+            btn.addEventListener("click",()=>{
+                if(MarkedTargetStore.has(id)){MarkedTargetStore.remove(id);btn.textContent="+ MARK";btn.classList.remove("bh4-mark-profile-btn-active");}
+                else{MarkedTargetStore.add({id,name,level});btn.textContent="✓ MARKED";btn.classList.add("bh4-mark-profile-btn-active");}
+            });
+            document.body.appendChild(btn);
+        };
+        // Poll for SPA URL changes
+        setInterval(()=>{if(location.href!==lastUrl){lastUrl=location.href;setTimeout(tryInject,500);setTimeout(tryInject,1500);}},400);
+        tryInject();setTimeout(tryInject,800);setTimeout(tryInject,2000);
+    }
+
+    // ── Main ───────────────────────────────────────────────────
+    const BH4_ICON_SVG=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><g fill="#c8a84b"><path d="M12 1 2 6v6c0 5.2 4.1 9.5 10 11 5.9-1.5 10-5.8 10-11V6Z"/><path fill="#0f1110" d="M12 3.3 4 7.2v4.8c0 4.2 3.2 7.7 8 9 4.8-1.3 8-4.8 8-9V7.2Z"/></g><path fill="#c8a84b" d="M11 7h2v4h4v2h-4v4h-2v-4H7v-2h4Z"/></svg>`;
+
+    function main(){
+        const initialKey=KeyResolver.resolveTornKey(),api=new TornAPI(initialKey||""),hunter=new Hunter(api),toaster=new Toaster(),alertMgr=new HospAlertManager(),targetAlertMgr=new TargetAlertManager(),ui=new UI(hunter,toaster,alertMgr,targetAlertMgr);
+        window.__bh4UI=ui; ui.inject(); ui.setAuthed(!!initialKey);
+        hunter.onHospAlert=(matches)=>{alertMgr.enabled=hunter.settings.hospAlerts;alertMgr.sync(matches);};
+        hunter.onBountyClaimed=(claimed)=>{if(hunter.settings.toastsEnabled)toaster.showClaimed(claimed);};
+        hunter.onMarkedUpdate=()=>{if(ui._isOpen()&&ui.activeTab==="targets")ui._renderTargets();};
+        hunter.onMarkedAlert=(targets,statuses)=>{targetAlertMgr.enabled=hunter.settings.markedAlerts;targetAlertMgr.sync(targets,statuses);};
+        setupProfileButtonInjector();
+        window.addEventListener("storage",(e)=>{if(e.key!==LS.shared||!e.newValue)return;try{hunter.adoptSharedPayload(JSON.parse(e.newValue));}catch{}});
+        const W=(typeof unsafeWindow!=="undefined")?unsafeWindow:window;
+        W.registerEugeneScript({id:"bh4",name:"Bounty Hunter 4",color:"#c8a84b",colorDark:"#7a6328",hoverColor:"#ddc06a",iconSVG:BH4_ICON_SVG,onClick:()=>ui.toggle(true)});
+        W.mountEugeneFooterMenu();
+        if(initialKey)hunter.start();
+    }
+    if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);
+    else main();
+})();
