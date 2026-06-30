@@ -18,7 +18,7 @@
 
     const PDA_API_KEY   = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION = "3.1.0";
+    const VERSION = "3.1.1";
 
     const LS = {
         apiKey:   "bh3_apiKey",
@@ -177,14 +177,15 @@
 
     async function _httpGetOnceRaw(url) {
         if (IS_PDA) {
-            const r = await PDA_httpGet(url);
-            if (r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
-            return JSON.parse(r.responseText);
+            let r;
+            try { r = await PDA_httpGet(url); } catch(e) { throw new Error("PDA network error: " + (e?.message || e)); }
+            if (!r || r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r?.status ?? "no response"}`); e.status = r?.status; throw e; }
+            return JSON.parse(r.responseText || "null");
         }
         if (GM_XHR) {
             const r = await _gmGet(url);
-            if (r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
-            return JSON.parse(r.text);
+            if (!r || r.status < 200 || r.status >= 300) { const e = new Error(`HTTP ${r?.status ?? "no response"}`); e.status = r?.status; throw e; }
+            return JSON.parse(r.text || "null");
         }
         const r = await fetch(url);
         if (!r.ok) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; }
@@ -365,7 +366,8 @@
                 const delay = await this.refresh();
                 waitSec = Math.max(this.settings.refreshSec, delay || 0);
             } catch(err) {
-                this.lastError = err;
+                this.lastError   = err;
+                this._loadingMsg = null;
                 if (this.onUpdate) this.onUpdate();
                 waitSec = Math.max(this.settings.refreshSec, 30);
             }
