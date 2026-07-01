@@ -17,7 +17,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "4.2.1";
+    const VERSION = "4.2.2";
     const API_BASE = "https://api.torn.com/v2";
     const FF_BASE  = "https://ffscouter.com/api/v1";
     const ATTACK_URL  = "https://www.torn.com/page.php?sid=attack&user2ID=";
@@ -202,7 +202,7 @@
             this.myId = null; this.myLevel = null; this.myAge = null;
             this.lastMatches = []; this.lastMatchKeys = new Set(); this.lastCounts = null;
             this._statusCache = new Map(); this._warCache = null; this._timer = null;
-            this._running = false; this._nextAt = 0; this.lastError = null;
+            this._running = false; this._nextAt = 0; this._isLoading = false; this.lastError = null;
             this.onUpdate = null; this.onToast = null; this.onHospAlert = null;
             this.onClaimed = null; this.onMarkedUpdate = null; this.onMarkedAlert = null;
             this.lastMarkedStatuses = new Map();
@@ -259,7 +259,9 @@
         }
         async refresh() {
             this.lastError = null;
-            if (this.onUpdate) this.onUpdate({ loading:true });
+            this._isLoading = true;
+            if (this.onUpdate) this.onUpdate();
+            try {
             try {
                 const p = await this.api.validateKey();
                 if (p) { this.myId = p.id ?? this.myId; this.myLevel = p.level ?? this.myLevel; this.myAge = p.age ?? this.myAge; }
@@ -344,8 +346,11 @@
             this.lastCounts = counts;
             this._applyMatches(matches);
             this._writeShared();
-            if (this.onUpdate) this.onUpdate({ loading:false });
             return delaySec;
+            } finally {
+                this._isLoading = false;
+                if (this.onUpdate) this.onUpdate();
+            }
         }
         async _fetchProfiles(ids) {
             const out = new Map(), now = Date.now(), stale = [], unique = [...new Set(ids)];
@@ -457,7 +462,7 @@
             const card = { id:Number(b.target_id), el, rem:TOAST_MS, at:0, timer:null };
             const dismiss = () => this._rm(card);
             el.querySelector(".bh4-tc").addEventListener("click", e => { e.stopPropagation(); dismiss(); });
-            el.querySelector(".bh4-ta").addEventListener("click", () => { openUrl(PROFILE_URL + b.target_id); dismiss(); });
+            el.querySelector(".bh4-ta").addEventListener("click", () => { openUrl(ATTACK_URL + b.target_id); dismiss(); });
             el.addEventListener("click", () => { openUrl(PROFILE_URL + b.target_id); dismiss(); });
             el.addEventListener("pointerenter", () => this._pause(card));
             el.addEventListener("pointerleave", () => this._resume(card));
@@ -718,7 +723,7 @@ table.bh4-t{width:100%;border-collapse:collapse}
         constructor(hunter, toaster, alertMgr, markedAlertMgr) {
             this.hunter = hunter; this.toaster = toaster; this.alertMgr = alertMgr; this.markedAlertMgr = markedAlertMgr;
             this.tab = "hunt"; this._panel = null; this._overlay = null; this._authed = false;
-            this._sortCol = "reward"; this._sortDir = "desc"; this._refreshing = false; this._tick = null;
+            this._sortCol = "reward"; this._sortDir = "desc"; this._tick = null;
         }
         inject() {
             injectCSS();
@@ -746,7 +751,8 @@ table.bh4-t{width:100%;border-collapse:collapse}
             this.hunter.onToast = b => this.toaster.showMany(b);
             this._tick = setInterval(() => {
                 if (this._open() && this.tab === "hunt") {
-                    const el = document.getElementById("bh4-cd"); if (el) el.textContent = this.hunter.secondsUntilRefresh();
+                    const el = document.getElementById("bh4-cd");
+                    if (el) el.textContent = this.hunter._isLoading ? "…" : this.hunter.secondsUntilRefresh() + "s";
                 }
                 document.querySelectorAll("[data-hu]").forEach(el => {
                     const u = parseInt(el.dataset.hu); if (Number.isFinite(u)) el.textContent = fmtHosp(u);
@@ -816,9 +822,10 @@ table.bh4-t{width:100%;border-collapse:collapse}
 
             body.innerHTML = `
                 <div id="bh4-sl">
-                    <button id="bh4-rbtn"${this._refreshing?" disabled":""}>Refresh</button>
-                    <span>Next in <span id="bh4-cd">${next}</span>s</span>
+                    <button id="bh4-rbtn"${this.hunter._isLoading?" disabled":""}>${this.hunter._isLoading?"Working…":"Refresh"}</button>
+                    <span>Next in <span id="bh4-cd">${this.hunter._isLoading?"…":next+"s"}</span></span>
                     <span>${rows.length} match${rows.length===1?"":"es"}</span>
+                    ${c ? `<span style="color:#2e3a2e;font-size:10px">${c.total}→${c.afterBasic}→${c.matches}</span>` : ""}
                     ${errLine}${ffWarn}
                 </div>
                 ${rl ? `<div class="bh4-rl"><div class="bh4-rl-t">Rate limit hit</div><div class="bh4-rl-b">${rows.length?"Showing last results.":"No results yet."} Raise min reward or refresh interval to stay under the limit.</div></div>` : ""}
@@ -834,13 +841,10 @@ table.bh4-t{width:100%;border-collapse:collapse}
                     </tr></thead><tbody>${rows.map(r => this._row(r)).join("")}</tbody></table>`}`;
 
             body.querySelector("#bh4-rbtn").addEventListener("click", async () => {
-                if (this._refreshing) return;
-                this._refreshing = true; body.querySelector("#bh4-rbtn").disabled = true;
+                if (this.hunter._isLoading) return;
                 try { await this.hunter.refresh(); } catch {}
-                this._refreshing = false;
-                if (this._open() && this.tab === "hunt") this._renderHunt();
             });
-            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(PROFILE_URL + el.dataset.id); }));
+            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(ATTACK_URL + el.dataset.id); }));
             body.querySelectorAll("th[data-sort]").forEach(el => el.addEventListener("click", () => {
                 const col = el.dataset.sort;
                 if (this._sortCol === col) this._sortDir = this._sortDir === "asc" ? "desc" : "asc";
@@ -916,7 +920,7 @@ table.bh4-t{width:100%;border-collapse:collapse}
                 <div id="bh4-sl"><button id="bh4-tref" class="bh4-btn">Refresh</button><span>${targets.length} marked target${targets.length===1?"":"s"}</span></div>
                 <table class="bh4-t"><thead><tr><th>Target</th><th>Status</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
             body.querySelector("#bh4-tref").addEventListener("click", () => this.hunter.refreshMarked().catch(() => {}));
-            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(PROFILE_URL + el.dataset.id); }));
+            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(ATTACK_URL + el.dataset.id); }));
             body.querySelectorAll(".bh4-trm").forEach(btn => btn.addEventListener("click", () => {
                 const id = Number(btn.dataset.id);
                 if (!confirm(`Remove ${btn.dataset.name} from marked targets?`)) return;
