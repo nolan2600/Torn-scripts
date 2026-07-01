@@ -1,17 +1,15 @@
 // ==UserScript==
 // @name         Bounty Hunter 4
 // @namespace    https://github.com/nolan2600/torn-scripts/bounty-hunter-4
-// @version      4.1.0
-// @description  DOM-native bounty board filter — 30-min attack window, FF enrichment, marked-target highlights. Desktop + Torn PDA.
+// @version      4.2.0
+// @description  Live Torn bounty board — reward, FF, BS bracket, hospital window, war filter, marked targets, alerts. Tactical UI.
 // @author       nolan2600
-// @match        https://www.torn.com/bounties.php*
-// @match        https://torn.com/bounties.php*
-// @match        https://www.torn.com/profiles.php*
-// @match        https://torn.com/profiles.php*
+// @match        https://www.torn.com/*
+// @match        https://torn.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
-// @connect      ffscouter.com
 // @connect      api.torn.com
+// @connect      ffscouter.com
 // @run-at       document-end
 // @license      GPL-3.0-or-later
 // ==/UserScript==
@@ -19,88 +17,76 @@
 (function () {
     "use strict";
 
-    const ON_BOUNTIES = /bounties\.php/.test(location.href);
-    const ON_PROFILE  = /profiles\.php/.test(location.href);
+    const VERSION = "4.2.0";
+    const API_BASE = "https://api.torn.com/v2";
+    const FF_BASE  = "https://ffscouter.com/api/v1";
+    const ATTACK_URL  = "https://www.torn.com/page.php?sid=attack&user2ID=";
+    const PROFILE_URL = "https://www.torn.com/profiles.php?XID=";
 
-    // ── Constants ────────────────────────────────────────────────────────────
-    const VERSION   = "4.1.0";
-    const FF_BASE   = "https://ffscouter.com/api/v1";
-    const TORN_BASE = "https://api.torn.com";
-
-    const LS = {
-        settings : "bh4_settings",
-        marks    : "bh4_marks",
-        ffKey    : "bh4_ffkey",
-        tornKey  : "bh4_tornkey",
-    };
+    const LS = { apiKey:"bh4_apiKey", ffKey:"bh4_ffKey", settings:"bh4_settings", marks:"bh4_marks", shared:"bh4_shared" };
+    const API_DELAY_MS = 750, STATUS_CONCURRENCY = 3, STATUS_CACHE_MS = 20_000;
+    const FACTION_CACHE_MS = 300_000, TOAST_MS = 15_000, SHARED_FRESH_RATIO = 0.8;
 
     const W      = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
     const IS_PDA = typeof W.PDA_httpGet === "function";
     const PDA_PH = "###PDA-APIKEY###";
+    const HAS_PDA_KEY = IS_PDA && PDA_PH !== "###" + "PDA-APIKEY" + "###" && /^[A-Za-z0-9]{16}$/.test(PDA_PH);
 
-    // ── Settings ──────────────────────────────────────────────────────────────
+    const BS_RANGES = [
+        { id:"bs-2k",   label:"2k–25k",    min:2_000,       max:25_000       },
+        { id:"bs-20k",  label:"20k–250k",  min:20_000,      max:250_000      },
+        { id:"bs-200k", label:"200k–2.5m", min:200_000,     max:2_500_000    },
+        { id:"bs-2m",   label:"2m–25m",    min:2_000_000,   max:25_000_000   },
+        { id:"bs-20m",  label:"20m–250m",  min:20_000_000,  max:250_000_000  },
+        { id:"bs-200m", label:"200m+",     min:200_000_000, max:Infinity     },
+    ];
+
     const DEFAULTS = {
-        hospitalMaxMin     : 30,
-        statusFilter       : "all",   // "all" | "okay" | "hospital"
-        minReward          : 0,
-        maxLevel           : 100,
-        minFF              : 1.0,
-        maxFF              : 3.0,
-        hideWar            : false,
-        includeUnknownFF   : true,
-        includeUnknownTimer: true,
+        minPrice:500_000, minFF:1.0, maxFF:3.0, hospitalMaxMin:30,
+        refreshSec:60, toastsEnabled:true, includeUnknownFF:true,
+        revivableOnly:false, bsRanges:[], hospAlerts:false,
+        hideWarTargets:false, markedAlerts:false,
     };
 
+    // ── Utilities ─────────────────────────────────────────────────────────────
+    const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function fmtMoney(n) {
+        if (n == null) return "$0";
+        const a = Math.abs(n);
+        const s = a >= 1e9 ? (a/1e9).toFixed(2)+"B" : a >= 1e6 ? (a/1e6).toFixed(2)+"M" : a >= 1e3 ? (a/1e3).toFixed(1)+"K" : a.toLocaleString();
+        return (n < 0 ? "-$" : "$") + s;
+    }
+    function fmtMoneyFull(n) { return (n < 0 ? "-" : "") + "$" + Math.abs(n).toLocaleString(); }
+    function fmtHosp(untilSec) {
+        const rem = Math.max(0, untilSec - Math.floor(Date.now()/1000));
+        if (rem <= 0) return "OUT";
+        const h = Math.floor(rem/3600), m = Math.floor((rem%3600)/60), s = rem%60;
+        if (h > 0) return `${h}h ${m}m`;
+        return m === 0 ? `${s}s` : `${m}m ${s}s`;
+    }
+    function parseBS(human) {
+        if (!human) return null;
+        const m = String(human).match(/^\s*([\d.]+)\s*([kKmMbB]?)\s*$/);
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        if (!Number.isFinite(n)) return null;
+        const mult = ({k:1e3,m:1e6,b:1e9})[m[2].toLowerCase()] ?? 1;
+        return n * mult;
+    }
     function loadSettings() {
-        try {
-            const raw = localStorage.getItem(LS.settings);
-            return raw ? { ...DEFAULTS, ...JSON.parse(raw) } : { ...DEFAULTS };
-        } catch { return { ...DEFAULTS }; }
+        try { const r = localStorage.getItem(LS.settings); return { ...DEFAULTS, ...(r ? JSON.parse(r) : {}) }; }
+        catch { return { ...DEFAULTS }; }
     }
-
-    function saveSettings(s) {
-        try { localStorage.setItem(LS.settings, JSON.stringify(s)); } catch {}
-    }
-
-    // ── Keys ──────────────────────────────────────────────────────────────────
-    const Keys = {
-        getFF()    { try { return localStorage.getItem(LS.ffKey)   || ""; } catch { return ""; } },
-        saveFF(k)  { try { localStorage.setItem(LS.ffKey, k);          } catch {} },
-        clearFF()  { try { localStorage.removeItem(LS.ffKey);          } catch {} },
-
-        getTorn()  {
-            if (IS_PDA) return PDA_PH;
-            try { return localStorage.getItem(LS.tornKey) || ""; } catch { return ""; }
-        },
-        saveTorn(k)  { try { localStorage.setItem(LS.tornKey, k);  } catch {} },
-        clearTorn()  { try { localStorage.removeItem(LS.tornKey);  } catch {} },
-    };
-
-    // ── Marked targets ────────────────────────────────────────────────────────
-    const Marks = {
-        load()     { try { return JSON.parse(localStorage.getItem(LS.marks) || "[]"); } catch { return []; } },
-        save(list) { try { localStorage.setItem(LS.marks, JSON.stringify(list)); } catch {} },
-        ids()      { return new Set(this.load().map(m => m.id)); },
-        has(id)    { return this.load().some(m => m.id === id); },
-        add(m)     { const l = this.load(); if (!l.some(x => x.id === m.id)) { l.push(m); this.save(l); } },
-        remove(id) { this.save(this.load().filter(m => m.id !== id)); },
-    };
+    function saveSettings(s) { try { localStorage.setItem(LS.settings, JSON.stringify(s)); } catch {} }
+    function openUrl(url) { const a = document.createElement("a"); a.href=url; a.target="_blank"; a.rel="noopener noreferrer"; document.body.appendChild(a); a.click(); a.remove(); }
 
     // ── HTTP ──────────────────────────────────────────────────────────────────
     function gmGet(url) {
         return new Promise((resolve, reject) => {
-            if (IS_PDA && url.includes("api.torn.com")) {
-                const resolved = url.replace(PDA_PH, W.PDA_API_KEY || "");
-                W.PDA_httpGet(resolved, r => {
-                    try { resolve(JSON.parse(r)); } catch { reject(new Error("parse")); }
-                });
-                return;
-            }
             GM_xmlhttpRequest({
-                method      : "GET",
-                url,
-                responseType: "json",
-                timeout     : 20_000,
+                method:"GET", url, responseType:"json", timeout:25_000,
                 onload(r) {
                     const d = r.response ?? (() => { try { return JSON.parse(r.responseText); } catch { return null; } })();
                     if (d !== null) resolve(d); else reject(new Error("parse"));
@@ -110,890 +96,1054 @@
             });
         });
     }
-
-    // ── FFScouter ─────────────────────────────────────────────────────────────
-    const _ffData = {};   // playerId → { ff: number|null, bs: string|null }
-
-    async function validateFFKey(key) {
-        if (!/^[A-Za-z0-9]{16}$/.test(key)) return { ok: false, msg: "Must be 16 alphanumeric characters." };
-        try {
-            const data = await gmGet(`${FF_BASE}/check-key?key=${encodeURIComponent(key)}`);
-            if (data?.code)          return { ok: false, msg: data.error || `FFScouter error ${data.code}` };
-            if (!data?.is_registered) return { ok: false, msg: "Key not registered — sign up at ffscouter.com first." };
-            return { ok: true, msg: data.is_premium ? "Valid (premium)." : "Valid." };
-        } catch (e) { return { ok: false, msg: e?.message || "Could not reach FFScouter." }; }
+    async function httpGet(url) {
+        if (IS_PDA && url.includes("api.torn.com")) {
+            return new Promise((resolve, reject) => {
+                W.PDA_httpGet(url, r => {
+                    try { resolve(JSON.parse(r.responseText ?? r)); }
+                    catch { reject(new Error("pda_parse")); }
+                });
+            });
+        }
+        try { return await gmGet(url); }
+        catch (e) { await sleep(400); return gmGet(url); }
     }
 
-    async function enrichFF(ids) {
-        const key = Keys.getFF();
-        if (!key || ids.length === 0) return;
+    // ── Key store ─────────────────────────────────────────────────────────────
+    const Keys = {
+        getTorn()  { if (HAS_PDA_KEY) return PDA_PH; try { return localStorage.getItem(LS.apiKey) || ""; } catch { return ""; } },
+        saveTorn(k){ try { localStorage.setItem(LS.apiKey, k); } catch {} },
+        clearTorn(){ try { localStorage.removeItem(LS.apiKey); } catch {} },
+        getFF()    { try { return localStorage.getItem(LS.ffKey) || ""; } catch { return ""; } },
+        saveFF(k)  { try { localStorage.setItem(LS.ffKey, k); } catch {} },
+        clearFF()  { try { localStorage.removeItem(LS.ffKey); } catch {} },
+        isPDA()    { return HAS_PDA_KEY; },
+    };
 
-        const fresh = ids.filter(id => !(id in _ffData));
-        if (fresh.length === 0) return;
+    // ── Marked targets ────────────────────────────────────────────────────────
+    const Marks = {
+        load()       { try { return JSON.parse(localStorage.getItem(LS.marks) || "[]"); } catch { return []; } },
+        save(l)      { try { localStorage.setItem(LS.marks, JSON.stringify(l)); } catch {} },
+        has(id)      { return this.load().some(t => t.id === Number(id)); },
+        add(t)       { const l = this.load(); if (!l.some(x => x.id === Number(t.id))) { l.push({id:Number(t.id),name:String(t.name||`Player ${t.id}`),level:Number(t.level)||0}); this.save(l); } },
+        remove(id)   { this.save(this.load().filter(t => t.id !== Number(id))); },
+        updateInfo(id, name, level) { const l = this.load(), t = l.find(x => x.id === Number(id)); if (t && name) { t.name = name; if (level) t.level = level; this.save(l); } },
+    };
 
-        for (let i = 0; i < fresh.length; i += 200) {
-            const chunk = fresh.slice(i, i + 200);
+    // ── Torn API ──────────────────────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key = key; this._last = 0; }
+        setKey(k) { this.key = k; }
+        async _rl() { const w = API_DELAY_MS - (Date.now() - this._last); this._last = Date.now() + Math.max(0, w); if (w > 0) await sleep(w); }
+        async _get(path, params = {}) {
+            await this._rl();
+            const url = new URL(/^https?:\/\//.test(path) ? path : API_BASE + path);
+            for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+            if (!url.searchParams.has("key")) url.searchParams.set("key", this.key);
+            const data = await httpGet(url.toString());
+            if (data?.error) { const e = new Error(data.error.error || "Torn API error"); e.tornCode = data.error.code; throw e; }
+            return data;
+        }
+        async fetchBounties() {
+            const all = []; let url = `${API_BASE}/torn/bounties?limit=100&offset=0`, delay = 0, safety = 10;
+            while (url && safety-- > 0) {
+                const data = await this._get(url);
+                if (Array.isArray(data.bounties)) all.push(...data.bounties);
+                if (typeof data.bounties_delay === "number") delay = data.bounties_delay;
+                const next = data._metadata?.links?.next;
+                if (!next || !data.bounties?.length) break;
+                url = next;
+            }
+            return { bounties: all, delaySec: delay };
+        }
+        async fetchProfile(id) {
+            const d = await this._get(`/user/${id}/profile`);
+            return d?.profile ?? (d?.id ? d : null);
+        }
+        async validateKey() { const d = await this._get("/user/profile"); return d?.profile ?? null; }
+        async fetchWars() { return this._get("https://api.torn.com/torn/?selections=rankedwars,territorywars"); }
+    }
+
+    // ── FFScouter ─────────────────────────────────────────────────────────────
+    async function validateFFKey(key) {
+        if (!/^[A-Za-z0-9]{16}$/.test(key)) return { ok:false, msg:"Must be 16 alphanumeric characters." };
+        try {
+            const d = await gmGet(`${FF_BASE}/check-key?key=${encodeURIComponent(key)}`);
+            if (d?.code) return { ok:false, msg:d.error || `FFScouter error ${d.code}` };
+            if (!d?.is_registered) return { ok:false, msg:"Key not registered." };
+            return { ok:true, msg:d.is_premium ? "Valid (premium)" : "Valid" };
+        } catch(e) { return { ok:false, msg:e?.message || "Could not reach FFScouter." }; }
+    }
+    async function fetchFF(key, ids) {
+        const map = new Map(); let networkFail = false, error = null;
+        if (!key || !ids.length) return { map, networkFail, error };
+        for (let i = 0; i < ids.length; i += 200) {
+            const chunk = ids.slice(i, i + 200);
             try {
                 const data = await gmGet(`${FF_BASE}/get-stats?key=${encodeURIComponent(key)}&targets=${chunk.join(",")}`);
                 if (Array.isArray(data)) {
                     for (const p of data) {
-                        _ffData[Number(p.player_id)] = {
-                            ff : p.fair_fight != null ? Number(p.fair_fight) : null,
-                            bs : p.bs_estimate_human ?? null,
-                        };
+                        if (p.fair_fight != null) map.set(Number(p.player_id), { ff:Number(p.fair_fight), bs:p.bs_estimate_human ?? null });
                     }
-                }
+                } else { error = data?.error || "unexpected"; }
+            } catch(e) { error = e.message; networkFail = true; }
+        }
+        return { map, networkFail, error };
+    }
+
+    // ── Hunter ────────────────────────────────────────────────────────────────
+    class Hunter {
+        constructor(api) {
+            this.api = api; this.settings = loadSettings();
+            this.myId = null; this.myLevel = null; this.myAge = null;
+            this.lastMatches = []; this.lastMatchKeys = new Set(); this.lastCounts = null;
+            this._statusCache = new Map(); this._warCache = null; this._timer = null;
+            this._running = false; this._nextAt = 0; this.lastError = null;
+            this.onUpdate = null; this.onToast = null; this.onHospAlert = null;
+            this.onClaimed = null; this.onMarkedUpdate = null; this.onMarkedAlert = null;
+            this.lastMarkedStatuses = new Map();
+        }
+        updateSettings(next) {
+            this.settings = { ...this.settings, ...next };
+            saveSettings(this.settings);
+            this.lastMatchKeys = new Set();
+            this._warCache = null;
+            try { localStorage.removeItem(LS.shared); } catch {}
+        }
+        _readShared() {
+            try { const r = localStorage.getItem(LS.shared); if (!r) return null; const s = JSON.parse(r); return s?.writtenAt ? s : null; }
+            catch { return null; }
+        }
+        _writeShared() {
+            try { localStorage.setItem(LS.shared, JSON.stringify({ writtenAt:Date.now(), refreshSec:this.settings.refreshSec, matches:this.lastMatches, lastCounts:this.lastCounts, myId:this.myId, myLevel:this.myLevel, myAge:this.myAge, lastError:this.lastError?.message ?? null })); } catch {}
+        }
+        _applyMatches(matches) {
+            const key = m => `${m.target_id}|${m.reward}`;
+            const cur = new Set(matches.map(key));
+            const newOnes = matches.filter(m => !this.lastMatchKeys.has(key(m)));
+            if (this.settings.toastsEnabled && this.onToast && newOnes.length) this.onToast(newOnes);
+            this.lastMatches = matches; this.lastMatchKeys = cur;
+            if (this.onHospAlert) this.onHospAlert(matches);
+        }
+        adoptShared(s) {
+            if (!s) return;
+            if (s.myId != null && this.myId == null) this.myId = s.myId;
+            if (s.myLevel != null && this.myLevel == null) this.myLevel = s.myLevel;
+            if (s.myAge != null && this.myAge == null) this.myAge = s.myAge;
+            if (Array.isArray(s.matches)) { this.lastCounts = s.lastCounts ?? null; this._applyMatches(s.matches); }
+            if (this.onUpdate) this.onUpdate();
+        }
+        stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } this._running = false; }
+        start() { if (this._running) return; this._running = true; this._tick(); }
+        async _tick() {
+            if (!this._running) return;
+            let waitSec = this.settings.refreshSec;
+            try {
+                const shared = this._readShared();
+                const fresh = shared && (Date.now() - shared.writtenAt) < (this.settings.refreshSec * 1000 * SHARED_FRESH_RATIO);
+                if (fresh) { this.adoptShared(shared); }
+                else { const d = await this.refresh(); waitSec = Math.max(this.settings.refreshSec, d || 0); }
+            } catch(e) {
+                this.lastError = e;
+                if (this.onUpdate) this.onUpdate();
+                waitSec = Math.max(this.settings.refreshSec, 30);
+            }
+            await this.refreshMarked().catch(() => {});
+            if (!this.settings.refreshSec) return;
+            this._nextAt = Date.now() + waitSec * 1000;
+            this._timer = setTimeout(() => this._tick(), waitSec * 1000);
+        }
+        async refresh() {
+            this.lastError = null;
+            if (this.onUpdate) this.onUpdate({ loading:true });
+            try {
+                const p = await this.api.validateKey();
+                if (p) { this.myId = p.id ?? this.myId; this.myLevel = p.level ?? this.myLevel; this.myAge = p.age ?? this.myAge; }
             } catch {}
-            // Mark any remaining IDs in chunk as null so we don't re-fetch
-            for (const id of chunk) if (!(id in _ffData)) _ffData[id] = { ff: null, bs: null };
+
+            const { bounties, delaySec } = await this.api.fetchBounties();
+
+            // Deduplicate by target — keep highest reward
+            const grouped = new Map();
+            for (const b of bounties) {
+                const id = String(b.target_id), qty = (typeof b.quantity === "number" && b.quantity > 0) ? b.quantity : 1;
+                if (!grouped.has(id)) { grouped.set(id, { ...b, bountyCount:qty }); }
+                else {
+                    const ex = grouped.get(id);
+                    const nc = ex.bountyCount + qty;
+                    if (b.reward > ex.reward) grouped.set(id, { ...b, bountyCount:nc });
+                    else ex.bountyCount = nc;
+                }
+            }
+            const deduped = [...grouped.values()];
+
+            // Detect claimed (hospital targets that vanished)
+            if (this.lastMatches.length) {
+                const board = new Set(deduped.map(b => String(b.target_id)));
+                const claimed = this.lastMatches.filter(m => m.statusState === "Hospital" && !board.has(String(m.target_id)));
+                if (claimed.length && this.onClaimed) this.onClaimed(claimed);
+            }
+
+            const counts = { total:bounties.length, afterBasic:0, withFF:0, ffError:null, ffNetworkFail:false, afterFF:0, afterBS:0, matches:0, inWar:0 };
+            const byBasic = deduped.filter(b => b.reward >= this.settings.minPrice && (this.myId == null || b.target_id !== this.myId));
+            counts.afterBasic = byBasic.length;
+
+            const ffKey = Keys.getFF();
+            const ids = [...new Set(byBasic.map(b => Number(b.target_id)))];
+            const ff = await fetchFF(ffKey, ids);
+            counts.withFF = ff.map.size; counts.ffError = ff.error; counts.ffNetworkFail = ff.networkFail;
+
+            const includeUnknown = !!this.settings.includeUnknownFF || ff.networkFail;
+            const byFF = byBasic.map(b => {
+                const e = ff.map.get(Number(b.target_id));
+                if (e) return { ...b, ff:e.ff, bs:e.bs };
+                return includeUnknown ? { ...b, ff:null, bs:null } : null;
+            }).filter(b => {
+                if (!b) return false;
+                if (b.ff == null) return true;
+                return b.ff >= this.settings.minFF && b.ff <= this.settings.maxFF;
+            });
+            counts.afterFF = byFF.length;
+
+            const sel = this.settings.bsRanges || [];
+            const byBS = sel.length === 0 ? byFF : byFF.filter(b => {
+                if (b.bs == null) return true;
+                const n = parseBS(b.bs); if (n == null) return true;
+                return sel.some(rid => { const r = BS_RANGES.find(x => x.id === rid); return r && n >= r.min && n <= r.max; });
+            });
+            counts.afterBS = byBS.length;
+
+            const profiles = await this._fetchProfiles(byBS.map(b => Number(b.target_id)));
+            const warSet = await this._fetchWarFactions();
+
+            const nowSec = Math.floor(Date.now()/1000);
+            const hospWindowSec = this.settings.hospitalMaxMin * 60;
+            const matches = [];
+
+            for (const b of byBS) {
+                const p = profiles.get(Number(b.target_id));
+                if (!p?.status || typeof p.status !== "object") continue;
+                const state = p.status.state;
+                const until = p.status.until || 0;
+                const remaining = Math.max(0, until - nowSec);
+                const inWar = !!(p.faction_id && warSet.has(Number(p.faction_id)));
+                if (this.settings.hideWarTargets && inWar) { counts.inWar++; continue; }
+                if (state === "Okay") {
+                    matches.push({ ...b, statusState:"Okay", hospUntil:0, revivable:null, inWar });
+                } else if (state === "Hospital" && remaining <= hospWindowSec) {
+                    if (this.settings.revivableOnly && p.revivable !== true) continue;
+                    matches.push({ ...b, statusState:"Hospital", hospUntil:until, revivable:p.revivable ?? null, inWar });
+                }
+            }
+            matches.sort((a, b) => b.reward - a.reward);
+            counts.matches = matches.length;
+            this.lastCounts = counts;
+            this._applyMatches(matches);
+            this._writeShared();
+            if (this.onUpdate) this.onUpdate({ loading:false });
+            return delaySec;
         }
-    }
-
-    // ── War detection ──────────────────────────────────────────────────────────
-    let _warFactions  = new Set();
-    let _warFetchedAt = 0;
-    const WAR_TTL = 300_000;
-
-    async function fetchWar() {
-        const key = Keys.getTorn();
-        if (!key) return;
-        if (Date.now() - _warFetchedAt < WAR_TTL) return;
-        try {
-            const data = await gmGet(`${TORN_BASE}/torn/?selections=rankedwars,territorywars&key=${key}`);
+        async _fetchProfiles(ids) {
+            const out = new Map(), now = Date.now(), stale = [], unique = [...new Set(ids)];
+            for (const id of unique) {
+                const c = this._statusCache.get(id);
+                if (c) {
+                    const hospLocked = c.data?.status?.state === "Hospital" && c.data.status.until && (c.data.status.until * 1000) > now;
+                    if (hospLocked || (now - c.fetchedAt < STATUS_CACHE_MS)) { out.set(id, c.data); continue; }
+                }
+                stale.push(id);
+            }
+            let i = 0, rlErr = null;
+            const workers = Array.from({ length:STATUS_CONCURRENCY }, async () => {
+                while (i < stale.length && !rlErr) {
+                    const id = stale[i++];
+                    try {
+                        const p = await this.api.fetchProfile(id);
+                        if (p && typeof p === "object") {
+                            const data = {
+                                status:p.status ?? null, age:typeof p.age === "number" ? p.age : null,
+                                faction_id:p.faction?.id ?? p.faction?.faction_id ?? p.faction_id ?? null,
+                                revivable:typeof p.revivable === "boolean" ? p.revivable : null,
+                                name:p.name ?? p.player_name ?? null, level:typeof p.level === "number" ? p.level : null,
+                            };
+                            out.set(id, data); this._statusCache.set(id, { data, fetchedAt:Date.now() });
+                        }
+                    } catch(e) { if (e.tornCode === 5 || e.status === 429) { rlErr = e; return; } }
+                }
+            });
+            await Promise.all(workers);
+            if (rlErr) throw rlErr;
+            return out;
+        }
+        async _fetchWarFactions() {
+            const now = Date.now();
+            if (this._warCache && (now - this._warCache.fetchedAt) < FACTION_CACHE_MS) return this._warCache.ids;
             const ids = new Set();
-            for (const w of Object.values(data?.rankedwars    || {}))
-                for (const f of Object.values(w?.factions || {})) ids.add(f.faction_id ?? f.id);
-            for (const w of Object.values(data?.territorywars || {})) {
-                if (w.assaulting_faction) ids.add(w.assaulting_faction);
-                if (w.defending_faction)  ids.add(w.defending_faction);
+            try {
+                const data = await this.api.fetchWars();
+                for (const w of Object.values(data.rankedwars || {}))
+                    for (const fid of Object.keys(w.factions || {})) { const n = Number(fid); if (n > 0) ids.add(n); }
+                for (const w of Object.values(data.territorywars || {})) {
+                    for (const k of ["assaulting_faction","defending_faction"]) { const n = Number(w[k]); if (n > 0) ids.add(n); }
+                }
+            } catch { return this._warCache?.ids ?? ids; }
+            this._warCache = { ids, fetchedAt:now };
+            return ids;
+        }
+        async refreshMarked() {
+            const targets = Marks.load();
+            if (!targets.length) { this.lastMarkedStatuses = new Map(); if (this.onMarkedUpdate) this.onMarkedUpdate(); return; }
+            const profiles = await this._fetchProfiles(targets.map(t => Number(t.id)));
+            const warSet = await this._fetchWarFactions();
+            let changed = false;
+            const updated = targets.map(t => {
+                const p = profiles.get(Number(t.id));
+                if (p?.name && (p.name !== t.name || (p.level && p.level !== t.level))) { changed = true; return { ...t, name:p.name, level:p.level || t.level }; }
+                return t;
+            });
+            if (changed) Marks.save(updated);
+            const nowSec = Math.floor(Date.now()/1000);
+            const statuses = new Map();
+            for (const t of updated) {
+                const p = profiles.get(Number(t.id));
+                if (!p?.status) { statuses.set(t.id, { state:null, until:0, remaining:0, revivable:null, inWar:false }); continue; }
+                statuses.set(t.id, {
+                    state:p.status.state, until:p.status.until || 0,
+                    remaining:Math.max(0, (p.status.until || 0) - nowSec),
+                    revivable:p.revivable ?? null,
+                    inWar:!!(p.faction_id && warSet.has(Number(p.faction_id))),
+                    description:p.status.description || "",
+                });
             }
-            _warFactions  = ids;
-            _warFetchedAt = Date.now();
-        } catch {}
-    }
-
-    // ── DOM parsers ────────────────────────────────────────────────────────────
-    function parsePlayerId(li) {
-        const id = parseInt(li.dataset.id ?? li.dataset.userId ?? "");
-        if (!isNaN(id) && id > 0) return id;
-        const link = li.querySelector("a[href*='profiles.php']");
-        if (link) { const m = link.href.match(/XID=(\d+)/); if (m) return parseInt(m[1]); }
-        return null;
-    }
-
-    function parsePlayerName(li) {
-        const link = li.querySelector("a[href*='profiles.php']");
-        if (link) return link.textContent.trim().replace(/\s*\[.*?\]$/, "");
-        const el = li.querySelector(".name, [class*='playerName'], [class*='player-name']");
-        return el ? el.textContent.trim().replace(/\s*\[.*?\]$/, "") : null;
-    }
-
-    function parseLevel(li) {
-        const el = li.querySelector(".level");
-        if (!el) return null;
-        const m = el.textContent.match(/\d+/);
-        return m ? parseInt(m[0]) : null;
-    }
-
-    function parseReward(li) {
-        const el = li.querySelector(".reward, [class*='reward']");
-        if (!el) return null;
-        const num = el.textContent.replace(/[^0-9]/g, "");
-        return num.length ? parseInt(num) : null;
-    }
-
-    function parseStatus(li) {
-        if (li.querySelector(".user-red-status"))  return "hospital";
-        if (li.querySelector(".user-blue-status")) return "traveling";
-        const txt = li.querySelector("[class*='status']")?.textContent.toLowerCase() ?? "";
-        if (txt.includes("hospital")) return "hospital";
-        if (txt.includes("travel"))   return "traveling";
-        return "okay";
-    }
-
-    function parseTimeText(text) {
-        if (!text) return null;
-        const s = text.toLowerCase();
-        if (/\d+\s*d/.test(s)) return 99_999;
-        const hms = s.match(/(\d+)\s*h\s*(\d+)\s*m(?:\s*(\d+)\s*s)?/);
-        if (hms) return +hms[1] * 3600 + +hms[2] * 60 + +(hms[3] ?? 0);
-        const ms = s.match(/(\d+)\s*m(?:in)?(?:\s*(\d+)\s*s)?/);
-        if (ms)  return +ms[1] * 60 + +(ms[2] ?? 0);
-        const sec = s.match(/^(\d+)\s*s/);
-        if (sec) return +sec[1];
-        const hmss = s.match(/(\d+):(\d{2}):(\d{2})/);
-        if (hmss) return +hmss[1] * 3600 + +hmss[2] * 60 + +hmss[3];
-        const mss = s.match(/(\d{1,3}):(\d{2})/);
-        if (mss)  return +mss[1] * 60 + +mss[2];
-        return null;
-    }
-
-    function parseHospSeconds(li) {
-        for (const attr of ["data-time", "data-end", "data-timestamp", "data-timer"]) {
-            const el = li.querySelector(`[${attr}]`);
-            if (!el) continue;
-            const t = parseInt(el.getAttribute(attr));
-            if (isNaN(t)) continue;
-            if (t > 10_000_000_000) return Math.max(0, Math.round((t - Date.now()) / 1000));
-            if (t >  1_000_000_000) return Math.max(0, t - Math.floor(Date.now() / 1000));
-            return Math.max(0, t);
+            this.lastMarkedStatuses = statuses;
+            if (this.onMarkedUpdate) this.onMarkedUpdate();
+            if (this.onMarkedAlert) this.onMarkedAlert(updated, statuses);
         }
-        const statusEl = li.querySelector(".user-red-status, [class*='hospital']");
-        if (statusEl) { const t = parseTimeText(statusEl.textContent); if (t !== null) return t; }
-        return parseTimeText(li.textContent);
+        secondsUntilRefresh() { return this._nextAt ? Math.max(0, Math.round((this._nextAt - Date.now()) / 1000)) : 0; }
     }
 
-    function parseFactionId(li) {
-        const link = li.querySelector("a[href*='factions.php']");
-        if (!link) return null;
-        const m = link.href.match(/(?:ID|factionID)=(\d+)/i);
-        return m ? parseInt(m[1]) : null;
-    }
-
-    // ── Runtime state ──────────────────────────────────────────────────────────
-    let settings = loadSettings();
-    let statsEl  = null;
-
-    // ── Filter logic ───────────────────────────────────────────────────────────
-    function rowPasses(li) {
-        const status = parseStatus(li);
-        if (status === "traveling") return false;
-
-        const level   = parseLevel(li);
-        const reward  = parseReward(li);
-        if (level  !== null && level  > settings.maxLevel)  return false;
-        if (reward !== null && reward < settings.minReward) return false;
-
-        const windowSec = settings.hospitalMaxMin * 60;
-
-        if (status === "hospital") {
-            if (settings.statusFilter === "okay") return false;
-            const secs = parseHospSeconds(li);
-            if (secs === null && !settings.includeUnknownTimer) return false;
-            if (secs !== null && secs > windowSec)               return false;
-        } else {
-            if (settings.statusFilter === "hospital") return false;
+    // ── Toaster ───────────────────────────────────────────────────────────────
+    class Toaster {
+        constructor() { this._el = null; this._cards = []; }
+        _ensure() {
+            if (this._el && document.body.contains(this._el)) return;
+            const c = document.createElement("div"); c.id = "bh4-toasts"; document.body.appendChild(c); this._el = c;
         }
-
-        if (Keys.getFF()) {
-            const id = parsePlayerId(li);
-            const ff = id !== null ? (_ffData[id]?.ff ?? null) : null;
-            if (ff === null && !settings.includeUnknownFF)                   return false;
-            if (ff !== null && (ff < settings.minFF || ff > settings.maxFF)) return false;
+        showMany(bounties) {
+            this._ensure();
+            const MAX = window.matchMedia("(max-width:768px)").matches ? 1 : 3;
+            const slots = Math.max(0, MAX - this._cards.length);
+            bounties.slice(0, slots).forEach(b => this._show(b));
         }
-
-        if (settings.hideWar && _warFetchedAt > 0) {
-            const fid = parseFactionId(li);
-            if (fid && _warFactions.has(fid)) return false;
+        _show(b) {
+            const el = document.createElement("div"); el.className = "bh4-toast";
+            const isH = b.statusState === "Hospital";
+            el.innerHTML = `
+                <button class="bh4-tc">&times;</button>
+                <div class="bh4-th">
+                    <span class="bh4-tn">${esc(b.target_name)} <span class="bh4-tlv">L${b.target_level}</span>${b.bountyCount>1?`<span class="bh4-tct">×${b.bountyCount}</span>`:""}</span>
+                    <span class="bh4-tr">${esc(fmtMoney(b.reward))}</span>
+                </div>
+                <div class="bh4-tm">
+                    <span class="bh4-chip">${b.ff != null ? `FF ${b.ff.toFixed(2)}` : "FF ?"}</span>
+                    ${b.bs ? `<span class="bh4-chip">BS ${esc(b.bs)}</span>` : ""}
+                    <span class="bh4-chip ${isH ? "bh4-ch" : "bh4-co"}"${isH ? ` data-hu="${b.hospUntil}"` : ""}>${isH ? fmtHosp(b.hospUntil) : "OKAY"}</span>
+                </div>
+                <button class="bh4-ta">ATTACK →</button>`;
+            const card = { id:Number(b.target_id), el, rem:TOAST_MS, at:0, timer:null };
+            const dismiss = () => this._rm(card);
+            el.querySelector(".bh4-tc").addEventListener("click", e => { e.stopPropagation(); dismiss(); });
+            el.querySelector(".bh4-ta").addEventListener("click", () => { openUrl(PROFILE_URL + b.target_id); dismiss(); });
+            el.addEventListener("click", () => { openUrl(PROFILE_URL + b.target_id); dismiss(); });
+            el.addEventListener("pointerenter", () => this._pause(card));
+            el.addEventListener("pointerleave", () => this._resume(card));
+            this._resume(card); this._el.appendChild(el); this._cards.push(card);
         }
-
-        return true;
+        _pause(card) { if (!card.timer) return; clearTimeout(card.timer); card.timer = null; card.rem = Math.max(0, card.rem - (Date.now() - card.at)); }
+        _resume(card) { card.at = Date.now(); if (card.timer) clearTimeout(card.timer); card.timer = setTimeout(() => this._rm(card), card.rem); }
+        _rm(card) { clearTimeout(card.timer); card.el?.parentNode?.removeChild(card.el); this._cards = this._cards.filter(c => c !== card); }
+        clearAll() { [...this._cards].forEach(c => this._rm(c)); }
     }
 
-    let _filterTimer = null;
-    function scheduleFilter() {
-        clearTimeout(_filterTimer);
-        _filterTimer = setTimeout(applyFilters, 60);
-    }
-
-    function fmtSecs(secs) {
-        if (secs < 60)   return `${secs}s`;
-        if (secs < 3600) return `${Math.ceil(secs / 60)}m`;
-        return `${Math.floor(secs / 3600)}h ${Math.round((secs % 3600) / 60)}m`;
-    }
-
-    function applyFilters() {
-        const list = document.querySelector(".bounties-list");
-        if (!list) return;
-
-        const rows      = list.querySelectorAll(":scope > li[data-id]");
-        const markedIds = Marks.ids();
-        let visible = 0;
-
-        for (const li of rows) {
-            const passes = rowPasses(li);
-            li.classList.toggle("bh4-hidden", !passes);
-
-            if (!passes) {
-                li.querySelectorAll(".bh4-badge").forEach(b => b.remove());
-                continue;
+    // ── Hospital Alert Manager ────────────────────────────────────────────────
+    class AlertMgr {
+        constructor() { this._sched = new Map(); this._fired = new Map(); this._manual = new Set(); this._cancel = new Set(); this.enabled = false; }
+        toggle(id) {
+            id = String(id);
+            if (this.enabled) { if (this._cancel.has(id)) this._cancel.delete(id); else this._cancel.add(id); }
+            else { if (this._manual.has(id)) this._manual.delete(id); else this._manual.add(id); }
+        }
+        isActive(id) { id = String(id); return this.enabled ? !this._cancel.has(id) : this._manual.has(id); }
+        sync(matches) {
+            const nowSec = Math.floor(Date.now()/1000), live = new Set();
+            for (const m of matches) {
+                if (m.statusState !== "Hospital" || m.hospUntil <= nowSec) continue;
+                const id = String(m.target_id); live.add(id);
+                if (!this.isActive(id)) continue;
+                const firedUntil = this._fired.get(id);
+                if (firedUntil != null && Math.abs(m.hospUntil - firedUntil) < 300) continue;
+                const ex = this._sched.get(id);
+                if (ex && Math.abs(ex.hospUntil - m.hospUntil) <= 5) continue;
+                if (ex) { clearTimeout(ex.timer); this._sched.delete(id); }
+                const alertAt = m.hospUntil - 60;
+                if (alertAt < nowSec - 10) continue;
+                const delay = Math.max(0, (alertAt - nowSec) * 1000);
+                const snap = m.hospUntil;
+                const timer = setTimeout(() => { this._fired.set(id, snap); this._sched.delete(id); this._fire(m); }, delay);
+                this._sched.set(id, { timer, hospUntil:m.hospUntil });
             }
-
-            visible++;
-            const id = parsePlayerId(li);
-            li.classList.toggle("bh4-marked-row", id !== null && markedIds.has(id));
-            injectBadges(li, id);
+            for (const [id, e] of this._sched) { if (!live.has(id)) { clearTimeout(e.timer); this._sched.delete(id); } }
+            for (const [id, u] of this._fired) { if (u + 120 < nowSec) this._fired.delete(id); }
         }
-
-        if (statsEl) statsEl.innerHTML = `<strong>${visible}</strong> / ${rows.length}`;
-    }
-
-    function injectBadges(li, id) {
-        li.querySelectorAll(".bh4-badge").forEach(b => b.remove());
-
-        const anchor = li.querySelector(".level, .reward, li:first-child") ?? li;
-
-        // Hospital timer badge
-        if (parseStatus(li) === "hospital") {
-            const secs = parseHospSeconds(li);
-            if (secs !== null) {
-                const b = document.createElement("span");
-                b.className   = "bh4-badge bh4-hosp-badge";
-                b.textContent = `→ ${fmtSecs(secs)}`;
-                anchor.insertAdjacentElement("afterend", b);
+        _fire(m) {
+            const rem = Math.max(0, m.hospUntil - Math.floor(Date.now()/1000));
+            const label = rem <= 0 ? "OUT NOW" : `~${rem}s`;
+            try { if (navigator.vibrate) navigator.vibrate([400,150,400,150,600]); } catch {}
+            try {
+                const ACtx = window.AudioContext || window.webkitAudioContext;
+                if (ACtx) { const ctx = new ACtx(), beep = (f,t,d) => { const o=ctx.createOscillator(),g=ctx.createGain(); o.connect(g); g.connect(ctx.destination); o.type="sine"; o.frequency.value=f; g.gain.setValueAtTime(0.4,t); g.gain.exponentialRampToValueAtTime(0.001,t+d); o.start(t); o.stop(t+d); }; beep(880,ctx.currentTime,0.18); beep(880,ctx.currentTime+0.22,0.18); beep(1100,ctx.currentTime+0.44,0.30); }
+            } catch {}
+            this._banner(m, label);
+            if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+                try { new Notification(`${m.target_name} exits hospital ${label}`, { body:`Reward: ${fmtMoney(m.reward)}${m.ff!=null?" · FF "+m.ff.toFixed(2):""}`, tag:`bh4-h-${m.target_id}`, requireInteraction:false }); } catch {}
             }
         }
-
-        // FF badge
-        if (id !== null && id in _ffData && _ffData[id].ff !== null) {
-            const b = document.createElement("span");
-            b.className   = "bh4-badge bh4-ff-badge";
-            b.textContent = `FF ${_ffData[id].ff.toFixed(2)}`;
-            anchor.insertAdjacentElement("afterend", b);
+        _banner(m, label) {
+            document.getElementById(`bh4-ab-${m.target_id}`)?.remove();
+            const el = document.createElement("div"); el.id = `bh4-ab-${m.target_id}`; el.className = "bh4-alert";
+            el.innerHTML = `<div class="bh4-al"><span class="bh4-ai">!</span><span class="bh4-an">${esc(m.target_name)} <span class="bh4-alv">L${m.target_level}</span></span><span class="bh4-at2">${label}</span><button class="bh4-ax">&times;</button></div><div class="bh4-as"><span class="bh4-chip">${esc(fmtMoney(m.reward))}</span>${m.ff!=null?`<span class="bh4-chip">FF ${m.ff.toFixed(2)}</span>`:""}</div><button class="bh4-aa">ATTACK → ${esc(m.target_name)}</button>`;
+            document.body.appendChild(el);
+            const dismiss = () => { el.style.animation="bh4-aout .25s forwards"; setTimeout(() => el.remove(), 260); };
+            const auto = setTimeout(dismiss, 30_000);
+            el.querySelector(".bh4-ax").addEventListener("click", e => { e.stopPropagation(); clearTimeout(auto); dismiss(); });
+            el.querySelector(".bh4-aa").addEventListener("click", () => { clearTimeout(auto); openUrl(ATTACK_URL + m.target_id); dismiss(); });
         }
+        cancelAll() { for (const { timer } of this._sched.values()) clearTimeout(timer); this._sched.clear(); }
     }
 
-    // ── Enrichment runner ──────────────────────────────────────────────────────
-    async function runEnrichment() {
-        const list = document.querySelector(".bounties-list");
-        if (!list) return;
-
-        // Collect all IDs (not just visible) so FF data drives filtering
-        const ids = [];
-        for (const li of list.querySelectorAll(":scope > li[data-id]")) {
-            const id = parsePlayerId(li);
-            if (id !== null) ids.push(id);
+    // ── Marked Alert Manager ──────────────────────────────────────────────────
+    class MarkedAlertMgr {
+        constructor() { this._sched = new Map(); this._fired = new Map(); this._manual = new Set(); this._cancel = new Set(); this.enabled = false; }
+        toggle(id) { id = String(id); if (this.enabled) { if (this._cancel.has(id)) this._cancel.delete(id); else this._cancel.add(id); } else { if (this._manual.has(id)) this._manual.delete(id); else this._manual.add(id); } }
+        isActive(id) { id = String(id); return this.enabled ? !this._cancel.has(id) : this._manual.has(id); }
+        sync(targets, statuses) {
+            const nowSec = Math.floor(Date.now()/1000), live = new Set();
+            for (const t of targets) {
+                const s = statuses.get(t.id); if (!s?.state) continue;
+                const alertUntil = s.state === "Hospital" ? s.until : 0;
+                if (!alertUntil || alertUntil <= nowSec) continue;
+                const id = String(t.id); live.add(id);
+                if (!this.isActive(id)) continue;
+                const firedU = this._fired.get(id);
+                if (firedU != null && Math.abs(alertUntil - firedU) < 300) continue;
+                const ex = this._sched.get(id);
+                if (ex && Math.abs(ex.until - alertUntil) <= 5) continue;
+                if (ex) { clearTimeout(ex.timer); this._sched.delete(id); }
+                const alertAt = alertUntil - 60;
+                if (alertAt < nowSec - 10) continue;
+                const timer = setTimeout(() => { this._fired.set(id, alertUntil); this._sched.delete(id); this._fire(t, s); }, Math.max(0, (alertAt - nowSec) * 1000));
+                this._sched.set(id, { timer, until:alertUntil });
+            }
+            for (const [id, e] of this._sched) { if (!live.has(id)) { clearTimeout(e.timer); this._sched.delete(id); } }
         }
-
-        await Promise.allSettled([enrichFF(ids), fetchWar()]);
-        applyFilters();
+        _fire(t, s) {
+            const rem = Math.max(0, s.until - Math.floor(Date.now()/1000));
+            this._banner(t, rem <= 0 ? "OUT NOW" : `~${rem}s`);
+        }
+        _banner(t, label) {
+            document.getElementById(`bh4-tab-${t.id}`)?.remove();
+            const el = document.createElement("div"); el.id = `bh4-tab-${t.id}`; el.className = "bh4-alert bh4-alert-top";
+            el.innerHTML = `<div class="bh4-al"><span class="bh4-ai">T</span><span class="bh4-an">${esc(t.name)} <span class="bh4-alv">L${t.level}</span></span><span class="bh4-at2">${label}</span><button class="bh4-ax">&times;</button></div><div class="bh4-as"><span class="bh4-chip">Marked target</span></div><button class="bh4-aa">ATTACK → ${esc(t.name)}</button>`;
+            document.body.appendChild(el);
+            const dismiss = () => { el.remove(); };
+            const auto = setTimeout(dismiss, 30_000);
+            el.querySelector(".bh4-ax").addEventListener("click", e => { e.stopPropagation(); clearTimeout(auto); dismiss(); });
+            el.querySelector(".bh4-aa").addEventListener("click", () => { clearTimeout(auto); openUrl(ATTACK_URL + t.id); dismiss(); });
+        }
+        cancelAll() { for (const { timer } of this._sched.values()) clearTimeout(timer); this._sched.clear(); }
     }
 
-    // ── CSS ────────────────────────────────────────────────────────────────────
+    // ── CSS ───────────────────────────────────────────────────────────────────
     function injectCSS() {
         if (document.getElementById("bh4-style")) return;
-        const st = document.createElement("style");
-        st.id = "bh4-style";
-        st.textContent = `
-            .bh4-hidden { display: none !important; }
+        const s = document.createElement("style"); s.id = "bh4-style";
+        s.textContent = `
+#bh4-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.75)}
+#bh4-overlay.open{display:block}
+#bh4-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;
+  background:#0a0c0a;border:1px solid #1e2a1e;border-top:2px solid #c8a84b;
+  color:#9ca399;font-family:"Courier New",Courier,monospace;font-size:13px;
+  width:820px;max-width:100vw;max-height:88vh;min-width:340px;min-height:300px;
+  flex-direction:column;overflow:hidden}
+#bh4-panel.open{display:flex}
+#bh4-panel *{box-sizing:border-box}
+#bh4-panel ::-webkit-scrollbar{width:5px;height:5px}
+#bh4-panel ::-webkit-scrollbar-track{background:#0a0c0a}
+#bh4-panel ::-webkit-scrollbar-thumb{background:#1e2a1e}
 
-            /* ── Filter bar ── */
-            #bh4-bar {
-                font-family: "Courier New", Courier, monospace;
-                font-size: 11px;
-                background: #0d0f0e;
-                border-left: 3px solid #c8a84b;
-                border-top: 1px solid #1e2019;
-                border-right: 1px solid #1e2019;
-                border-bottom: 1px solid #1e2019;
-                color: #8a8d80;
-                padding: 9px 14px;
-                margin-bottom: 6px;
-                display: flex;
-                flex-wrap: wrap;
-                align-items: center;
-                gap: 8px 16px;
-            }
+#bh4-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#0d100d;border-bottom:1px solid #1e2a1e;flex-shrink:0}
+#bh4-hdr .bh4-brand{color:#c8a84b;font-size:15px;font-weight:700;letter-spacing:3px;text-transform:uppercase}
+#bh4-hdr .bh4-ver{color:#2e3a2e;font-size:10px;margin-left:10px;letter-spacing:1px}
+#bh4-close{background:none;border:none;color:#2e3a2e;font-size:20px;cursor:pointer;padding:2px 6px;line-height:1}
+#bh4-close:hover{color:#c8a84b}
 
-            #bh4-bar .bh4-brand {
-                color: #c8a84b;
-                font-weight: 700;
-                letter-spacing: 3px;
-                text-transform: uppercase;
-                font-size: 11px;
-                flex-shrink: 0;
-            }
+#bh4-tabs{display:flex;background:#0a0c0a;border-bottom:1px solid #1e2a1e;flex-shrink:0;overflow-x:auto}
+.bh4-tab{padding:10px 20px;cursor:pointer;color:#3a4a3a;border-bottom:2px solid transparent;white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;transition:all .15s;font-family:inherit}
+.bh4-tab:hover{color:#7a9a7a;background:#0d100d}
+.bh4-tab.active{color:#c8a84b;border-bottom-color:#c8a84b}
 
-            #bh4-bar .bh4-sep {
-                width: 1px;
-                height: 14px;
-                background: #252820;
-                flex-shrink: 0;
-            }
+#bh4-body{padding:14px;overflow-y:auto;flex:1;min-height:0}
 
-            #bh4-bar .bh4-group {
-                display: flex;
-                align-items: center;
-                gap: 4px;
-                white-space: nowrap;
-            }
+#bh4-sl{display:flex;gap:12px;align-items:center;margin-bottom:12px;font-size:11px;flex-wrap:wrap;color:#3a4a3a;letter-spacing:.5px}
+#bh4-sl .err{color:#dc2626}
+#bh4-rbtn{padding:4px 12px;background:#0d100d;border:1px solid #1e2a1e;color:#5a7a5a;font-family:inherit;font-size:10px;text-transform:uppercase;letter-spacing:1px;cursor:pointer}
+#bh4-rbtn:hover{border-color:#c8a84b88;color:#c8a84b}
+#bh4-rbtn:disabled{opacity:.4;cursor:not-allowed}
 
-            #bh4-bar .bh4-lbl {
-                color: #3e4038;
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: .8px;
-            }
+table.bh4-t{width:100%;border-collapse:collapse}
+.bh4-t th,.bh4-t td{padding:7px 10px;text-align:left;border-bottom:1px solid #0f150f;font-size:12px;color:#8a9a88;vertical-align:middle;white-space:nowrap}
+.bh4-t th{color:#3a4a3a;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.8px;position:sticky;top:0;background:#0a0c0a;border-bottom:1px solid #1e2a1e;user-select:none}
+.bh4-t th[data-sort]{cursor:pointer}.bh4-t th[data-sort]:hover{color:#7a9a7a}
+.bh4-t th[data-sort]::after{content:" ⇅";color:#1e2a1e;font-size:9px}
+.bh4-t th.sa::after{content:" ▲";color:#c8a84b}
+.bh4-t th.sd::after{content:" ▼";color:#c8a84b}
+.bh4-t tbody tr:hover td{background:#0d100d}
+.bh4-t td.num,.bh4-t th.num{text-align:right;font-variant-numeric:tabular-nums}
+.bh4-t td.div,.bh4-t th.div{padding-left:14px;border-left:1px solid #0f150f}
 
-            #bh4-bar input[type=number],
-            #bh4-bar select {
-                background: #141614;
-                border: 1px solid #252820;
-                color: #b5b8ae;
-                font-family: inherit;
-                font-size: 11px;
-                padding: 2px 5px;
-                border-radius: 0;
-                height: 20px;
-                box-sizing: border-box;
-                -moz-appearance: textfield;
-                -webkit-appearance: none;
-                appearance: none;
-            }
+.bh4-att{display:inline-block;padding:3px 10px;background:#0d100d;border:1px solid #c8a84b88;color:#c8a84b;font-family:inherit;font-size:10px;text-transform:uppercase;letter-spacing:.8px;cursor:pointer;transition:background .1s}
+.bh4-att:hover{background:#c8a84b18}
+.bh4-nl{color:#7ca8c8;text-decoration:none;font-family:inherit;font-size:12px}.bh4-nl:hover{text-decoration:underline}
+.bh4-badge{display:inline-block;padding:2px 7px;font-size:10px;font-weight:700;letter-spacing:.5px;font-family:inherit}
+.bh4-bo{background:#0a1a0a;color:#4ade80;border:1px solid #4ade8030}
+.bh4-bh{background:#1a0e00;color:#f97316;border:1px solid #f9731630}
+.bh4-bt{background:#0a1020;color:#7ca8c8;border:1px solid #7ca8c830}
+.bh4-bw{background:#0a0a1a;color:#818cf8;border:1px solid #818cf830;font-size:10px;margin-left:5px;vertical-align:middle}
+.bh4-cnt{display:inline-block;padding:1px 5px;margin-left:5px;background:#1a0a2a;color:#c084fc;font-size:10px;vertical-align:middle;font-family:inherit}
+.bh4-chip{background:#0d100d;border:1px solid #1e2a1e;padding:2px 7px;font-size:10px;color:#5a7a5a;font-family:inherit}
+.bh4-chip.bh4-bo{background:#0a1a0a;color:#4ade80;border-color:#4ade8030}
+.bh4-chip.bh4-bh{background:#1a0e00;color:#f97316;border-color:#f9731630}
+.bh4-bell{background:none;border:1px solid #1e2a1e;cursor:pointer;font-size:11px;padding:1px 4px;opacity:.4;transition:opacity .15s;margin-left:4px;font-family:inherit}
+.bh4-bell:hover{opacity:.7}.bh4-bell.on{opacity:1;border-color:#c8a84b;background:#1a1400}
+.bh4-empty{text-align:center;color:#3a4a3a;padding:32px 8px;font-size:12px;letter-spacing:.5px}
+.bh4-trm{background:none;border:1px solid #1e2a1e;color:#3a4a3a;cursor:pointer;font-size:10px;padding:2px 8px;font-family:inherit;text-transform:uppercase;letter-spacing:.5px}
+.bh4-trm:hover{background:#1a0a0a;border-color:#dc2626;color:#dc2626}
 
-            #bh4-bar input[type=number]:focus,
-            #bh4-bar select:focus { outline: none; border-color: #c8a84b44; }
+.bh4-section{margin-bottom:18px}
+.bh4-section h3{margin:0 0 10px;font-size:10px;color:#5a7a5a;text-transform:uppercase;letter-spacing:2px;padding-bottom:6px;border-bottom:1px solid #1e2a1e}
+.bh4-hint{color:#3a4a3a;font-size:10px;margin:4px 0;line-height:1.5;letter-spacing:.3px}
+.bh4-g2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.bh4-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.bh4-field label{color:#4a5a4a;font-size:10px;text-transform:uppercase;letter-spacing:.8px}
+.bh4-inp,.bh4-sel{background:#0d100d;border:1px solid #1e2a1e;color:#9ca399;padding:6px 10px;font-family:inherit;font-size:12px;width:100%;border-radius:0}
+.bh4-inp:focus,.bh4-sel:focus{outline:none;border-color:#c8a84b44}
+.bh4-inp-mask{-webkit-text-security:disc;font-family:monospace;letter-spacing:2px}
+.bh4-bsb{display:grid;grid-template-columns:repeat(3,auto);gap:4px 18px;margin-top:4px}
+.bh4-bsb label{display:flex;align-items:center;gap:6px;color:#7a9a7a;font-size:11px;cursor:pointer;white-space:nowrap}
+.bh4-bsb input{accent-color:#c8a84b}
+.bh4-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:#7a9a7a;font-size:11px}
+.bh4-check input{accent-color:#c8a84b}
+.bh4-ra{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.bh4-btn{padding:6px 14px;border:1px solid #1e2a1e;background:#0d100d;color:#7a9a7a;font-family:inherit;font-size:10px;text-transform:uppercase;letter-spacing:.8px;cursor:pointer}
+.bh4-btn:hover{border-color:#c8a84b88;color:#c8a84b}
+.bh4-btn-p{border-color:#c8a84b88;color:#c8a84b}
+.bh4-btn-p:hover{background:#c8a84b18}
+.bh4-btn-d{border-color:#dc262688;color:#dc2626}
+.bh4-btn-d:hover{background:#dc262618}
+.bh4-btn:disabled{opacity:.4;cursor:not-allowed}
+.bh4-ss{margin-top:6px;min-height:14px;font-size:10px;letter-spacing:.3px}
+.bh4-ss.ok{color:#4ade80}.bh4-ss.err{color:#dc2626}.bh4-ss.info{color:#5a7a5a}
+.bh4-npb{display:inline-block;padding:2px 8px;font-size:10px;font-family:inherit;letter-spacing:.5px}
+.bh4-ng{background:#0a1a0a;color:#4ade80}.bh4-nd{background:#1a0a0a;color:#dc2626}
+.bh4-nn{background:#0d100d;color:#5a7a5a;border:1px solid #1e2a1e}.bh4-nu{background:#0d100d;color:#3a4a3a}
 
-            #bh4-bar input[type=number]::-webkit-outer-spin-button,
-            #bh4-bar input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+#bh4-auth{padding:20px;color:#9ca399;line-height:1.6}
+#bh4-auth h3{margin:0 0 10px;color:#c8a84b;font-size:12px;text-transform:uppercase;letter-spacing:2px}
+#bh4-auth a{color:#7ca8c8}
 
-            #bh4-bar .w-win { width: 44px; }
-            #bh4-bar .w-lvl { width: 38px; }
-            #bh4-bar .w-ff  { width: 40px; }
-            #bh4-bar .w-re  { width: 76px; }
+#bh4-toasts{position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column-reverse;gap:8px;z-index:2147483646;pointer-events:none;max-width:calc(100vw - 32px)}
+.bh4-toast{pointer-events:auto;width:300px;max-width:100%;background:#0a0c0a;border:1px solid #1e2a1e;border-left:3px solid #c8a84b;padding:10px 12px;color:#9ca399;font-family:"Courier New",Courier,monospace;font-size:12px;box-shadow:0 4px 20px rgba(0,0,0,.6);position:relative;cursor:pointer;animation:bh4-tin .2s ease-out}
+@keyframes bh4-tin{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+.bh4-tc{position:absolute;top:4px;right:6px;background:none;border:none;color:#2e3a2e;font-size:16px;cursor:pointer;padding:0 4px;line-height:1}
+.bh4-tc:hover{color:#9ca399}
+.bh4-th{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 18px 5px 0}
+.bh4-tn{color:#c8a84b;font-weight:700;overflow:hidden;text-overflow:ellipsis}
+.bh4-tlv{color:#3a4a3a;font-size:10px;font-weight:400;margin-left:3px}
+.bh4-tct{padding:0 4px;margin-left:4px;background:#1a0a2a;color:#c084fc;font-size:10px}
+.bh4-tr{color:#4ade80;font-weight:700;font-size:14px;white-space:nowrap}
+.bh4-tm{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px}
+.bh4-ta{width:100%;padding:5px;background:#0d100d;border:1px solid #c8a84b88;color:#c8a84b;font-family:inherit;font-size:10px;text-transform:uppercase;letter-spacing:1px;cursor:pointer}
+.bh4-ta:hover{background:#c8a84b18}
 
-            #bh4-bar .bh4-actions {
-                display: flex;
-                gap: 5px;
-                align-items: center;
-                margin-left: auto;
-            }
+.bh4-alert{position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#0a0c0a;border-top:2px solid #c8a84b;padding:14px 16px 16px;color:#9ca399;font-family:"Courier New",Courier,monospace;box-shadow:0 -4px 24px rgba(0,0,0,.7);animation:bh4-ain .3s cubic-bezier(.22,.61,.36,1) forwards}
+.bh4-alert-top{top:0;bottom:auto;border-top:none;border-bottom:2px solid #7ca8c8;animation:bh4-atin .3s cubic-bezier(.22,.61,.36,1) forwards}
+@keyframes bh4-ain{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes bh4-atin{from{transform:translateY(-100%);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes bh4-aout{from{transform:translateY(0);opacity:1}to{transform:translateY(100%);opacity:0}}
+.bh4-al{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.bh4-ai{font-size:18px;color:#c8a84b;flex-shrink:0;animation:bh4-blink 1s step-end infinite}
+@keyframes bh4-blink{0%,100%{opacity:1}50%{opacity:0}}
+.bh4-an{font-size:15px;font-weight:700;color:#c8a84b;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bh4-alv{color:#5a7a5a;font-size:11px;font-weight:400;margin-left:3px}
+.bh4-at2{font-size:14px;font-weight:700;color:#f97316;white-space:nowrap;flex-shrink:0}
+.bh4-ax{background:none;border:none;color:#3a4a3a;font-size:20px;cursor:pointer;padding:0 4px;line-height:1;flex-shrink:0}
+.bh4-ax:hover{color:#9ca399}
+.bh4-as{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}
+.bh4-aa{width:100%;padding:9px;background:#0d100d;border:1px solid #c8a84b;color:#c8a84b;font-family:inherit;font-size:12px;text-transform:uppercase;letter-spacing:1.5px;cursor:pointer;font-weight:700}
+.bh4-aa:hover{background:#c8a84b18}
 
-            #bh4-bar button {
-                background: #141614;
-                border: 1px solid #252820;
-                color: #4a4d44;
-                font-family: inherit;
-                font-size: 9px;
-                padding: 2px 8px;
-                cursor: pointer;
-                border-radius: 0;
-                text-transform: uppercase;
-                letter-spacing: .8px;
-                height: 20px;
-                line-height: 1;
-                transition: border-color .1s, color .1s;
-            }
+.bh4-mark-btn{position:fixed;bottom:80px;right:16px;z-index:999997;background:#0a0c0a;border:2px solid #c8a84b;color:#c8a84b;font-family:"Courier New",Courier,monospace;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;cursor:pointer}
+.bh4-mark-btn:hover{background:#0d100d}
+.bh4-mark-btn.active{border-color:#4ade80;color:#4ade80}
+.bh4-rl{background:#100a0a;border:1px solid #dc2626;border-left:3px solid #dc2626;padding:10px 14px;margin:0 0 12px;font-size:11px}
+.bh4-rl-t{color:#dc2626;font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
+.bh4-rl-b{color:#7a9a7a;line-height:1.5;font-size:11px}
 
-            #bh4-bar button:hover    { border-color: #c8a84b88; color: #c8a84b; }
-            #bh4-bar button.bh4-on  { border-color: #c8a84b;   color: #c8a84b; }
-            #bh4-bar button:disabled { opacity: .45; cursor: default; }
-
-            #bh4-bar .bh4-count {
-                font-size: 10px;
-                white-space: nowrap;
-                color: #3a3d34;
-                min-width: 54px;
-                text-align: right;
-            }
-            #bh4-bar .bh4-count strong { color: #c8a84b; }
-
-            /* ── Row badges injected into Torn's list ── */
-            .bh4-badge {
-                display: inline-block;
-                font-family: "Courier New", Courier, monospace;
-                font-size: 9px;
-                padding: 0 4px;
-                margin-left: 5px;
-                vertical-align: middle;
-                line-height: 14px;
-                border: 1px solid;
-                border-radius: 0;
-            }
-
-            .bh4-hosp-badge { color: #f97316; border-color: #f9731650; background: #f9731608; }
-            .bh4-ff-badge   { color: #7ca8c8; border-color: #7ca8c850; background: #7ca8c808; }
-
-            .bh4-marked-row {
-                outline: 1px solid #c8a84b !important;
-                background: rgba(200,168,75,.035) !important;
-            }
-
-            /* ── Settings modal ── */
-            #bh4-overlay {
-                position: fixed;
-                inset: 0;
-                background: rgba(0,0,0,.78);
-                z-index: 9999998;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-
-            #bh4-modal {
-                background: #0d0f0e;
-                border: 1px solid #1e2019;
-                border-top: 2px solid #c8a84b;
-                color: #b5b8ae;
-                font-family: "Courier New", Courier, monospace;
-                font-size: 12px;
-                padding: 22px 26px 20px;
-                width: min(400px, 92vw);
-                max-height: 82vh;
-                overflow-y: auto;
-                position: relative;
-            }
-
-            #bh4-modal h3 {
-                color: #c8a84b;
-                font-size: 10px;
-                text-transform: uppercase;
-                letter-spacing: 2.5px;
-                margin: 0 0 16px;
-                padding-bottom: 7px;
-                border-bottom: 1px solid #1e2019;
-            }
-
-            #bh4-modal .bh4-section { margin-bottom: 18px; }
-
-            #bh4-modal .bh4-field-label {
-                display: block;
-                color: #3e4038;
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: .8px;
-                margin-bottom: 5px;
-            }
-
-            #bh4-modal input[type=text] {
-                width: 100%;
-                box-sizing: border-box;
-                background: #141614;
-                border: 1px solid #252820;
-                color: #b5b8ae;
-                font-family: inherit;
-                font-size: 11px;
-                padding: 5px 8px;
-                border-radius: 0;
-                margin-bottom: 7px;
-            }
-
-            #bh4-modal input[type=text]:focus { outline: none; border-color: #c8a84b44; }
-
-            #bh4-modal .bh4-hint {
-                color: #3a3d34;
-                font-size: 10px;
-                margin-bottom: 7px;
-                line-height: 1.45;
-            }
-
-            #bh4-modal .bh4-check-row {
-                display: flex;
-                align-items: center;
-                gap: 7px;
-                font-size: 11px;
-                color: #8a8d80;
-                cursor: pointer;
-                margin-bottom: 6px;
-                text-transform: none;
-                letter-spacing: 0;
-            }
-
-            #bh4-modal .bh4-btn-row { display: flex; gap: 6px; margin-bottom: 4px; }
-
-            #bh4-modal button {
-                background: #141614;
-                border: 1px solid #252820;
-                color: #8a8d80;
-                font-family: inherit;
-                font-size: 9px;
-                padding: 5px 12px;
-                cursor: pointer;
-                border-radius: 0;
-                text-transform: uppercase;
-                letter-spacing: .8px;
-                transition: border-color .1s, color .1s;
-            }
-
-            #bh4-modal button:hover    { border-color: #c8a84b88; color: #c8a84b; }
-            #bh4-modal .bh4-btn-save  { border-color: #c8a84b88; color: #c8a84b; }
-            #bh4-modal .bh4-btn-clear { border-color: #dc262688; color: #dc2626; }
-
-            #bh4-modal .bh4-status {
-                font-size: 10px;
-                min-height: 14px;
-                color: #3a3d34;
-                margin-top: 4px;
-            }
-            #bh4-modal .bh4-status.ok  { color: #22c55e; }
-            #bh4-modal .bh4-status.err { color: #dc2626; }
-
-            #bh4-modal .bh4-close {
-                position: absolute;
-                top: 12px; right: 14px;
-                background: none; border: none;
-                color: #3a3d34;
-                font-size: 15px;
-                cursor: pointer;
-                padding: 2px 5px;
-                line-height: 1;
-                letter-spacing: 0;
-                border-radius: 0;
-            }
-            #bh4-modal .bh4-close:hover { color: #8a8d80; border-color: transparent; }
-
-            #bh4-modal .bh4-ver { color: #2a2d24; font-size: 9px; margin-top: 14px; }
-
-            /* ── Profile mark button ── */
-            .bh4-mark-btn {
-                position: fixed;
-                bottom: 80px; right: 16px;
-                z-index: 999997;
-                background: #0d0f0e;
-                border: 2px solid #c8a84b;
-                border-radius: 0;
-                color: #c8a84b;
-                font-family: "Courier New", Courier, monospace;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 1.5px;
-                text-transform: uppercase;
-                padding: 9px 18px;
-                cursor: pointer;
-                transition: background .1s;
-            }
-            .bh4-mark-btn:hover  { background: #141614; }
-            .bh4-mark-btn.active { border-color: #22c55e; color: #22c55e; }
+@media(max-width:768px){
+  #bh4-panel{width:100vw!important;max-width:100vw;min-width:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}
+  .bh4-g2{grid-template-columns:1fr}.bh4-bsb{grid-template-columns:repeat(2,auto)}
+  .bh4-t td,.bh4-t th{padding:5px 6px;font-size:11px}
+  #bh4-toasts{left:8px;right:8px;bottom:8px}.bh4-toast{width:auto}
+}
         `;
-        document.head.appendChild(st);
+        document.head.appendChild(s);
     }
 
-    // ── Filter bar ──────────────────────────────────────────────────────────────
-    function injectFilterBar() {
-        if (document.getElementById("bh4-bar")) return;
+    // ── UI ────────────────────────────────────────────────────────────────────
+    class UI {
+        constructor(hunter, toaster, alertMgr, markedAlertMgr) {
+            this.hunter = hunter; this.toaster = toaster; this.alertMgr = alertMgr; this.markedAlertMgr = markedAlertMgr;
+            this.tab = "hunt"; this._panel = null; this._overlay = null; this._authed = false;
+            this._sortCol = "reward"; this._sortDir = "desc"; this._refreshing = false; this._tick = null;
+        }
+        inject() {
+            injectCSS();
+            const overlay = document.createElement("div"); overlay.id = "bh4-overlay"; document.body.appendChild(overlay);
+            const panel = document.createElement("div"); panel.id = "bh4-panel";
+            panel.innerHTML = `
+                <div id="bh4-hdr">
+                    <span><span class="bh4-brand">BH4</span><span class="bh4-ver">v${VERSION}</span></span>
+                    <button id="bh4-close">&times;</button>
+                </div>
+                <div id="bh4-tabs">
+                    <div class="bh4-tab active" data-tab="hunt">Hunt</div>
+                    <div class="bh4-tab" data-tab="targets">Targets</div>
+                    <div class="bh4-tab" data-tab="settings">Settings</div>
+                </div>
+                <div id="bh4-body"></div>`;
+            document.body.appendChild(panel); this._panel = panel; this._overlay = overlay;
+            overlay.addEventListener("click", () => this.toggle(false));
+            panel.querySelector("#bh4-close").addEventListener("click", () => this.toggle(false));
+            panel.querySelector("#bh4-tabs").addEventListener("click", e => {
+                const t = e.target.closest(".bh4-tab"); if (!t) return;
+                this.tab = t.dataset.tab; this._syncTabs(); this._render();
+            });
+            this.hunter.onUpdate = () => { if (this._open()) this._render(); };
+            this.hunter.onToast = b => this.toaster.showMany(b);
+            this._tick = setInterval(() => {
+                if (this._open() && this.tab === "hunt") {
+                    const el = document.getElementById("bh4-cd"); if (el) el.textContent = this.hunter.secondsUntilRefresh() + "s";
+                }
+                document.querySelectorAll("[data-hu]").forEach(el => {
+                    const u = parseInt(el.dataset.hu); if (Number.isFinite(u)) el.textContent = fmtHosp(u);
+                });
+            }, 1000);
+        }
+        _open() { return this._panel?.classList.contains("open"); }
+        toggle(open) {
+            const isOpen = open != null ? open : !this._open();
+            this._panel.classList.toggle("open", isOpen);
+            this._overlay.classList.toggle("open", isOpen);
+            if (isOpen) this._render();
+        }
+        _syncTabs() { for (const t of this._panel.querySelectorAll(".bh4-tab")) t.classList.toggle("active", t.dataset.tab === this.tab); }
+        _render() { if (!this._authed) { this._renderAuth(); return; } if (this.tab === "hunt") this._renderHunt(); else if (this.tab === "targets") this._renderTargets(); else this._renderSettings(); }
+        setAuthed(b) { this._authed = b; if (this._open()) this._render(); }
 
-        const hasFF  = !!Keys.getFF();
-        const hasTorn = Keys.getTorn() && Keys.getTorn() !== PDA_PH || IS_PDA;
-
-        const bar = document.createElement("div");
-        bar.id = "bh4-bar";
-        bar.innerHTML = `
-            <span class="bh4-brand">BH4</span>
-            <span class="bh4-sep"></span>
-
-            <div class="bh4-group">
-                <span class="bh4-lbl">Window</span>
-                <input type="number" id="bh4-window" class="w-win" min="0" max="120" step="1"
-                       title="Hospital exit window (minutes). Set 0 to show Okay targets only.">
-                <span class="bh4-lbl">m</span>
-            </div>
-
-            <div class="bh4-group">
-                <span class="bh4-lbl">Status</span>
-                <select id="bh4-status" title="Restrict by target status">
-                    <option value="all">All</option>
-                    <option value="okay">Okay</option>
-                    <option value="hospital">Hospital</option>
-                </select>
-            </div>
-
-            <div class="bh4-group">
-                <span class="bh4-lbl">Min $</span>
-                <input type="number" id="bh4-reward" class="w-re" min="0" step="50000"
-                       title="Minimum bounty reward">
-            </div>
-
-            <div class="bh4-group">
-                <span class="bh4-lbl">Lvl ≤</span>
-                <input type="number" id="bh4-level" class="w-lvl" min="1" max="100" step="1"
-                       title="Maximum target level">
-            </div>
-
-            <div class="bh4-group" id="bh4-ff-group" style="${hasFF ? "" : "display:none"}">
-                <span class="bh4-lbl">FF</span>
-                <input type="number" id="bh4-ffmin" class="w-ff" min="1" max="10" step="0.1" title="Min FF score">
-                <span class="bh4-lbl">–</span>
-                <input type="number" id="bh4-ffmax" class="w-ff" min="1" max="10" step="0.1" title="Max FF score">
-            </div>
-
-            <div class="bh4-actions">
-                <button id="bh4-enrich-btn" style="${hasFF ? "" : "display:none"}"
-                        title="Fetch FF scores for all listed targets">FF+</button>
-                <button id="bh4-war-btn" class="${settings.hideWar ? "bh4-on" : ""}"
-                        style="${hasTorn ? "" : "display:none"}"
-                        title="Toggle faction war filter">WAR</button>
-                <button id="bh4-settings-btn" title="Settings">⚙</button>
-                <div class="bh4-count" id="bh4-stats">—</div>
-            </div>
-        `;
-
-        const anchor = document.querySelector(".bounties-wrap .bounties-total, .bounties-wrap, .content-wrapper");
-        if (anchor) anchor.parentNode.insertBefore(bar, anchor);
-        else document.querySelector(".content-wrapper")?.prepend(bar);
-
-        statsEl = bar.querySelector("#bh4-stats");
-
-        // Sync saved values
-        bar.querySelector("#bh4-window").value = settings.hospitalMaxMin;
-        bar.querySelector("#bh4-status").value = settings.statusFilter;
-        bar.querySelector("#bh4-reward").value = settings.minReward;
-        bar.querySelector("#bh4-level").value  = settings.maxLevel;
-        bar.querySelector("#bh4-ffmin").value  = settings.minFF;
-        bar.querySelector("#bh4-ffmax").value  = settings.maxFF;
-
-        const persist = () => {
-            const ffn = parseFloat(bar.querySelector("#bh4-ffmin").value) || 1.0;
-            const ffx = Math.max(ffn, parseFloat(bar.querySelector("#bh4-ffmax").value) || 3.0);
-            settings = {
-                ...settings,
-                hospitalMaxMin : Math.max(0, parseInt(bar.querySelector("#bh4-window").value) || 0),
-                statusFilter   : bar.querySelector("#bh4-status").value,
-                minReward      : Math.max(0, parseInt(bar.querySelector("#bh4-reward").value) || 0),
-                maxLevel       : Math.min(100, Math.max(1, parseInt(bar.querySelector("#bh4-level").value) || 100)),
-                minFF          : ffn,
-                maxFF          : ffx,
+        _renderAuth() {
+            const body = this._panel.querySelector("#bh4-body");
+            const spa = !IS_PDA && !!localStorage.getItem("spa_apiKey");
+            body.innerHTML = `<div id="bh4-auth">
+                <h3>Torn API Key Required</h3>
+                <p>Bounty Hunter fetches live bounty data from <code>api.torn.com</code>. A <b>Public</b> access key is sufficient.</p>
+                <p class="bh4-hint">Get one at <a href="https://www.torn.com/preferences.php#tab=api" target="_blank" rel="noopener">Torn → Preferences → API</a>.</p>
+                <div class="bh4-field" style="margin-top:14px"><label>Torn API Key (16 chars)</label><input id="bh4-ak" class="bh4-inp bh4-inp-mask" type="text" maxlength="16" spellcheck="false" autocomplete="off" placeholder="••••••••••••••••"></div>
+                <div class="bh4-field"><label>FFScouter Key (optional)</label><input id="bh4-fk" class="bh4-inp bh4-inp-mask" type="text" maxlength="16" spellcheck="false" autocomplete="off" placeholder="For FF / BS filtering" value="${esc(Keys.getFF())}"></div>
+                <div class="bh4-ra">
+                    <button id="bh4-as" class="bh4-btn bh4-btn-p">Connect →</button>
+                    ${spa ? `<button id="bh4-spa" class="bh4-btn">Use SPA Key</button>` : ""}
+                </div>
+                <p class="bh4-ss err" id="bh4-ae"></p>
+            </div>`;
+            const err = body.querySelector("#bh4-ae");
+            const connect = async () => {
+                err.textContent = "";
+                const k = body.querySelector("#bh4-ak").value.trim();
+                if (!/^[A-Za-z0-9]{16}$/.test(k)) { err.className="bh4-ss err"; err.textContent="Enter a valid 16-character key."; return; }
+                await this._adopt(k, body.querySelector("#bh4-fk").value.trim(), err);
             };
-            saveSettings(settings);
-            scheduleFilter();
-        };
-
-        for (const sel of ["#bh4-window","#bh4-status","#bh4-reward","#bh4-level","#bh4-ffmin","#bh4-ffmax"]) {
-            const el = bar.querySelector(sel);
-            el?.addEventListener("input",  persist);
-            el?.addEventListener("change", persist);
-        }
-
-        bar.querySelector("#bh4-enrich-btn")?.addEventListener("click", async () => {
-            const btn = bar.querySelector("#bh4-enrich-btn");
-            btn.textContent = "…"; btn.disabled = true;
-            try { await runEnrichment(); } finally { btn.textContent = "FF+"; btn.disabled = false; }
-        });
-
-        bar.querySelector("#bh4-war-btn")?.addEventListener("click", () => {
-            const btn = bar.querySelector("#bh4-war-btn");
-            settings.hideWar = !settings.hideWar;
-            btn.classList.toggle("bh4-on", settings.hideWar);
-            saveSettings(settings);
-            if (settings.hideWar) fetchWar().then(() => applyFilters()); else applyFilters();
-        });
-
-        bar.querySelector("#bh4-settings-btn").addEventListener("click", openSettings);
-    }
-
-    // ── Settings modal ──────────────────────────────────────────────────────────
-    function esc(s) {
-        return String(s ?? "")
-            .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-    }
-
-    function openSettings() {
-        if (document.getElementById("bh4-overlay")) return;
-
-        const overlay = document.createElement("div");
-        overlay.id = "bh4-overlay";
-        overlay.innerHTML = `
-            <div id="bh4-modal">
-                <button class="bh4-close" title="Close">✕</button>
-                <h3>Bounty Hunter 4 — Settings</h3>
-
-                <div class="bh4-section">
-                    <label class="bh4-field-label">FFScouter API key</label>
-                    <input type="text" id="bh4-ff-input" maxlength="64" spellcheck="false"
-                           autocomplete="off" placeholder="16-character key"
-                           value="${esc(Keys.getFF())}">
-                    <div class="bh4-hint">Enables FF score display and filtering. One batch request per FF+ click.</div>
-                    <div class="bh4-btn-row">
-                        <button id="bh4-ff-save" class="bh4-btn-save">Save</button>
-                        <button id="bh4-ff-clear" class="bh4-btn-clear">Clear</button>
-                    </div>
-                    <div id="bh4-ff-st" class="bh4-status"></div>
-                </div>
-
-                ${IS_PDA ? `<div class="bh4-hint" style="margin-bottom:14px">Torn key provided by Torn PDA.</div>` : `
-                <div class="bh4-section">
-                    <label class="bh4-field-label">
-                        Torn API key
-                        <span style="color:#2a2d24;text-transform:none;letter-spacing:0"> — optional, faction war detection</span>
-                    </label>
-                    <input type="text" id="bh4-torn-input" maxlength="16" spellcheck="false"
-                           autocomplete="off" placeholder="Public access or higher"
-                           value="${esc(Keys.getTorn())}">
-                    <div class="bh4-hint">Single war-status call, cached 5 minutes. Enables the WAR toggle in the filter bar.</div>
-                    <div class="bh4-btn-row">
-                        <button id="bh4-torn-save" class="bh4-btn-save">Save</button>
-                        <button id="bh4-torn-clear" class="bh4-btn-clear">Clear</button>
-                    </div>
-                    <div id="bh4-torn-st" class="bh4-status"></div>
-                </div>`}
-
-                <div class="bh4-section">
-                    <label class="bh4-field-label">Fallback behavior</label>
-                    <label class="bh4-check-row">
-                        <input type="checkbox" id="bh4-unk-ff"    ${settings.includeUnknownFF    ? "checked" : ""}>
-                        Include targets with unknown FF score
-                    </label>
-                    <label class="bh4-check-row">
-                        <input type="checkbox" id="bh4-unk-timer" ${settings.includeUnknownTimer ? "checked" : ""}>
-                        Include hospital targets with unreadable timer
-                    </label>
-                </div>
-
-                <div class="bh4-ver">BH4 v${VERSION} · DOM-native filter</div>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); });
-        overlay.querySelector(".bh4-close").addEventListener("click", () => overlay.remove());
-
-        overlay.querySelector("#bh4-unk-ff").addEventListener("change", e => {
-            settings.includeUnknownFF = e.target.checked; saveSettings(settings); scheduleFilter();
-        });
-        overlay.querySelector("#bh4-unk-timer").addEventListener("change", e => {
-            settings.includeUnknownTimer = e.target.checked; saveSettings(settings); scheduleFilter();
-        });
-
-        // FF key
-        const ffSt = overlay.querySelector("#bh4-ff-st");
-        const setFF = (cls, msg) => { ffSt.className = `bh4-status ${cls}`; ffSt.textContent = msg; };
-
-        overlay.querySelector("#bh4-ff-save").addEventListener("click", async () => {
-            const k = overlay.querySelector("#bh4-ff-input").value.trim();
-            if (!k) { setFF("err", "Enter a key first."); return; }
-            setFF("", "Validating…");
-            const r = await validateFFKey(k);
-            if (!r.ok) { setFF("err", r.msg); return; }
-            Keys.saveFF(k);
-            setFF("ok", r.msg);
-            document.querySelector("#bh4-ff-group")?.style.removeProperty("display");
-            document.querySelector("#bh4-enrich-btn")?.style.removeProperty("display");
-        });
-
-        overlay.querySelector("#bh4-ff-clear").addEventListener("click", () => {
-            Keys.clearFF();
-            overlay.querySelector("#bh4-ff-input").value = "";
-            setFF("", "Cleared.");
-            if (document.querySelector("#bh4-ff-group"))
-                document.querySelector("#bh4-ff-group").style.display   = "none";
-            if (document.querySelector("#bh4-enrich-btn"))
-                document.querySelector("#bh4-enrich-btn").style.display = "none";
-            scheduleFilter();
-        });
-
-        // Torn key (not PDA)
-        if (!IS_PDA) {
-            const tSt  = overlay.querySelector("#bh4-torn-st");
-            const setT = (cls, msg) => { tSt.className = `bh4-status ${cls}`; tSt.textContent = msg; };
-
-            overlay.querySelector("#bh4-torn-save").addEventListener("click", () => {
-                const k = overlay.querySelector("#bh4-torn-input").value.trim();
-                if (!/^[A-Za-z0-9]{16}$/.test(k)) { setT("err", "Must be 16 alphanumeric characters."); return; }
-                Keys.saveTorn(k); _warFetchedAt = 0;
-                setT("ok", "Saved.");
-                document.querySelector("#bh4-war-btn")?.style.removeProperty("display");
-            });
-
-            overlay.querySelector("#bh4-torn-clear").addEventListener("click", () => {
-                Keys.clearTorn();
-                overlay.querySelector("#bh4-torn-input").value = "";
-                _warFactions = new Set(); _warFetchedAt = 0;
-                setT("", "Cleared.");
-                if (document.querySelector("#bh4-war-btn"))
-                    document.querySelector("#bh4-war-btn").style.display = "none";
-                settings.hideWar = false; saveSettings(settings); applyFilters();
+            body.querySelector("#bh4-as").addEventListener("click", connect);
+            body.querySelector("#bh4-ak").addEventListener("keydown", e => { if (e.key === "Enter") connect(); });
+            body.querySelector("#bh4-spa")?.addEventListener("click", async () => {
+                const k = localStorage.getItem("spa_apiKey");
+                if (!k) { err.className="bh4-ss err"; err.textContent="SPA key not found."; return; }
+                body.querySelector("#bh4-ak").value = k;
+                await this._adopt(k, body.querySelector("#bh4-fk").value.trim(), err);
             });
         }
-    }
-
-    // ── Bounty page lifecycle ────────────────────────────────────────────────────
-    let _ready   = false;
-    let _listObs = null;
-
-    function tryInit() {
-        if (!document.querySelector(".bounties-list")) return false;
-
-        injectCSS();
-        injectFilterBar();
-        applyFilters();
-
-        if (Keys.getFF()) setTimeout(runEnrichment, 800);
-        if (settings.hideWar && Keys.getTorn()) fetchWar().then(() => applyFilters());
-
-        if (!_listObs) {
-            _listObs = new MutationObserver(scheduleFilter);
-            _listObs.observe(document.querySelector(".bounties-list"), { childList: true, subtree: true });
+        async _adopt(tornKey, ffKey, errEl) {
+            errEl.className="bh4-ss info"; errEl.textContent="Validating…";
+            this.hunter.api.setKey(tornKey);
+            try { await this.hunter.api.validateKey(); }
+            catch(e) { errEl.className="bh4-ss err"; errEl.textContent="Key rejected: " + (e.message||"invalid"); return; }
+            Keys.saveTorn(tornKey);
+            if (ffKey && /^[A-Za-z0-9]{16}$/.test(ffKey)) Keys.saveFF(ffKey);
+            this.setAuthed(true); this.hunter.start();
         }
 
-        _ready = true;
-        return true;
-    }
+        _renderHunt() {
+            const body = this._panel.querySelector("#bh4-body");
+            const rows = this._sort(this.hunter.lastMatches), c = this.hunter.lastCounts;
+            const rl = this.hunter.lastError?.tornCode === 5;
+            const next = this.hunter.secondsUntilRefresh();
+            const errLine = this.hunter.lastError && !rl ? `<span class="err">${esc(this.hunter.lastError.message||"error")}</span>` : "";
+            const ffWarn = c?.ffNetworkFail ? `<span style="color:#f97316">FFScouter unreachable</span>` : c?.ffError ? `<span class="err">FF: ${esc(c.ffError)}</span>` : "";
+            const th = col => `${this._sortCol===col?(this._sortDir==="asc"?"sa":"sd"):""}`;
 
-    function setup() {
-        if (tryInit()) return;
+            body.innerHTML = `
+                <div id="bh4-sl">
+                    <button id="bh4-rbtn"${this._refreshing?" disabled":""}>Refresh</button>
+                    <span>Next in <span id="bh4-cd">${next}</span>s</span>
+                    <span>${rows.length} match${rows.length===1?"":"es"}</span>
+                    ${errLine}${ffWarn}
+                </div>
+                ${rl ? `<div class="bh4-rl"><div class="bh4-rl-t">Rate limit hit</div><div class="bh4-rl-b">${rows.length?"Showing last results.":"No results yet."} Raise min reward or refresh interval to stay under the limit.</div></div>` : ""}
+                ${rows.length === 0 && !rl
+                    ? `<div class="bh4-empty">No bounties match your filters.<br><span style="color:#2e3a2e">Adjust reward, FF, BS, hospital window, or revivable filter in Settings.</span></div>`
+                    : `<table class="bh4-t"><thead><tr>
+                        <th data-sort="target" class="${th("target")}">Target</th>
+                        <th data-sort="reward" class="num ${th("reward")}">Reward</th>
+                        <th data-sort="ff" class="num ${th("ff")}">FF</th>
+                        <th data-sort="bs" class="num div ${th("bs")}">BS Est.</th>
+                        <th class="div ${th("status")}" data-sort="status">Status</th>
+                        <th></th>
+                    </tr></thead><tbody>${rows.map(r => this._row(r)).join("")}</tbody></table>`}`;
 
-        const bodyObs = new MutationObserver(() => {
-            if (!tryInit()) return;
-            bodyObs.disconnect();
+            body.querySelector("#bh4-rbtn").addEventListener("click", async () => {
+                if (this._refreshing) return;
+                this._refreshing = true; body.querySelector("#bh4-rbtn").disabled = true;
+                try { await this.hunter.refresh(); } catch {}
+                this._refreshing = false;
+            });
+            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(PROFILE_URL + el.dataset.id); }));
+            body.querySelectorAll("th[data-sort]").forEach(el => el.addEventListener("click", () => {
+                const col = el.dataset.sort;
+                if (this._sortCol === col) this._sortDir = this._sortDir === "asc" ? "desc" : "asc";
+                else { this._sortCol = col; this._sortDir = col === "target" ? "asc" : "desc"; }
+                this._renderHunt();
+            }));
+            body.querySelectorAll(".bh4-bell").forEach(btn => btn.addEventListener("click", e => {
+                e.stopPropagation(); const id = btn.dataset.id;
+                this.alertMgr.toggle(id); this.alertMgr.sync(this.hunter.lastMatches);
+                const on = this.alertMgr.isActive(id); btn.classList.toggle("on", on);
+                btn.title = on ? "Cancel alert" : "Alert 1 min before exit";
+            }));
+        }
 
-            // Handle SPA transitions that swap out the content wrapper
-            const wrapper = document.querySelector(".content-wrapper");
-            if (wrapper && !wrapper._bh4) {
-                wrapper._bh4 = true;
-                new MutationObserver(() => {
-                    if (!document.querySelector(".bounties-list")) {
-                        _ready = false; _listObs?.disconnect(); _listObs = null;
-                        document.getElementById("bh4-bar")?.remove();
-                        statsEl = null;
-                    } else if (!_ready) {
-                        setTimeout(tryInit, 150);
-                    }
-                }).observe(wrapper, { childList: true });
+        _sort(list) {
+            const col = this._sortCol, dir = this._sortDir === "asc" ? 1 : -1;
+            const key = m => {
+                if (col === "target") return String(m.target_name||"").toLowerCase();
+                if (col === "reward") return m.reward || 0;
+                if (col === "ff") return m.ff == null ? Infinity : m.ff;
+                if (col === "bs") { const n = parseBS(m.bs); return n == null ? Infinity : n; }
+                if (col === "status") { const rem = m.statusState==="Hospital" ? Math.max(0,(m.hospUntil||0)-Math.floor(Date.now()/1000)) : 0; return (m.statusState==="Okay"?0:1)*1e6+rem; }
+                return m.reward || 0;
+            };
+            return [...list].sort((a, b) => {
+                const ka = key(a), kb = key(b);
+                if (ka === Infinity && kb !== Infinity) return 1;
+                if (kb === Infinity && ka !== Infinity) return -1;
+                if (ka < kb) return -1 * dir; if (ka > kb) return 1 * dir;
+                return (b.reward||0) - (a.reward||0);
+            });
+        }
+
+        _row(b) {
+            const isH = b.statusState === "Hospital";
+            const status = isH ? `<span class="bh4-badge bh4-bh" data-hu="${b.hospUntil}">${fmtHosp(b.hospUntil)}</span>${this.alertMgr.isActive(b.target_id)?`<button class="bh4-bell on" data-id="${b.target_id}" title="Cancel alert">🔔</button>`:`<button class="bh4-bell" data-id="${b.target_id}" title="Alert 1 min before exit">🔔</button>`}`
+                            : `<span class="bh4-badge bh4-bo">OKAY</span>`;
+            return `<tr>
+                <td><a class="bh4-nl" href="${PROFILE_URL}${b.target_id}" target="_blank" rel="noopener">${esc(b.target_name)}</a><span style="color:#3a4a3a;font-size:10px"> L${b.target_level}</span>${b.bountyCount>1?`<span class="bh4-cnt">×${b.bountyCount}</span>`:""} ${b.inWar?`<span class="bh4-bw">WAR</span>`:""}</td>
+                <td class="num">${esc(fmtMoneyFull(b.reward))}</td>
+                <td class="num">${b.ff != null ? b.ff.toFixed(2) : "—"}</td>
+                <td class="num div">${esc(b.bs||"—")}</td>
+                <td class="div">${status}</td>
+                <td><button class="bh4-att" data-id="${b.target_id}">Attack →</button></td>
+            </tr>`;
+        }
+
+        _renderTargets() {
+            const body = this._panel.querySelector("#bh4-body");
+            const targets = Marks.load(), statuses = this.hunter.lastMarkedStatuses;
+            if (!targets.length) {
+                body.innerHTML = `<div id="bh4-sl"><button id="bh4-tref" class="bh4-btn">Refresh</button><span>0 marked targets</span></div><div class="bh4-empty">No marked targets.<br><span style="color:#2e3a2e">Visit a player profile and click the Mark button to track them here.</span></div>`;
+                body.querySelector("#bh4-tref").addEventListener("click", () => this.hunter.refreshMarked().catch(() => {}));
+                return;
             }
-        });
-        bodyObs.observe(document.body, { childList: true, subtree: true });
+            const rows = targets.map(t => {
+                const s = statuses.get(t.id);
+                let badge = `<span class="bh4-badge" style="color:#3a4a3a;background:#0d100d;border:1px solid #1e2a1e">Loading…</span>`;
+                if (s?.state === "Okay")     badge = `<span class="bh4-badge bh4-bo">OKAY</span>`;
+                if (s?.state === "Hospital") badge = `<span class="bh4-badge bh4-bh" data-hu="${s.until}">${fmtHosp(s.until)}</span>`;
+                if (s?.state === "Abroad" || s?.state === "Traveling") badge = `<span class="bh4-badge bh4-bt">TRAVEL</span>`;
+                if (s?.state === "Jail")     badge = `<span class="bh4-badge" style="color:#5a7a5a;background:#0d100d;border:1px solid #1e2a1e">JAILED</span>`;
+                const bell = (s?.state === "Hospital") ? `<button class="bh4-bell bh4-tbell${this.markedAlertMgr.isActive(t.id)?" on":""}" data-tid="${t.id}" title="${this.markedAlertMgr.isActive(t.id)?"Cancel alert":"Alert before exit"}">🔔</button>` : "";
+                const war = s?.inWar ? `<span class="bh4-bw">WAR</span>` : "";
+                return `<tr>
+                    <td><a class="bh4-nl" href="${PROFILE_URL}${t.id}" target="_blank" rel="noopener">${esc(t.name)}</a> <span style="color:#3a4a3a;font-size:10px">L${t.level}</span> ${war}</td>
+                    <td>${badge}${bell}</td>
+                    <td><button class="bh4-att" data-id="${t.id}">Attack →</button></td>
+                    <td><button class="bh4-trm" data-id="${t.id}" data-name="${esc(t.name)}">✕</button></td>
+                </tr>`;
+            }).join("");
+            body.innerHTML = `
+                <div id="bh4-sl"><button id="bh4-tref" class="bh4-btn">Refresh</button><span>${targets.length} marked target${targets.length===1?"":"s"}</span></div>
+                <table class="bh4-t"><thead><tr><th>Target</th><th>Status</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+            body.querySelector("#bh4-tref").addEventListener("click", () => this.hunter.refreshMarked().catch(() => {}));
+            body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(PROFILE_URL + el.dataset.id); }));
+            body.querySelectorAll(".bh4-trm").forEach(btn => btn.addEventListener("click", () => {
+                const id = Number(btn.dataset.id);
+                if (!confirm(`Remove ${btn.dataset.name} from marked targets?`)) return;
+                Marks.remove(id); this.markedAlertMgr.cancelAll(); this._renderTargets();
+                this.hunter.refreshMarked().catch(() => {});
+            }));
+            body.querySelectorAll(".bh4-tbell").forEach(btn => btn.addEventListener("click", e => {
+                e.stopPropagation(); const id = btn.dataset.tid;
+                this.markedAlertMgr.toggle(id); this.markedAlertMgr.sync(Marks.load(), this.hunter.lastMarkedStatuses);
+                const on = this.markedAlertMgr.isActive(id); btn.classList.toggle("on", on);
+                btn.title = on ? "Cancel alert" : "Alert before exit";
+            }));
+        }
+
+        _renderSettings() {
+            const body = this._panel.querySelector("#bh4-body"), s = this.hunter.settings;
+            const bsBoxes = BS_RANGES.map(r => `<label><input type="checkbox" id="${r.id}" value="${r.id}"${(s.bsRanges||[]).includes(r.id)?" checked":""}> ${esc(r.label)}</label>`).join("");
+            const pdaNote = Keys.isPDA() ? `<p class="bh4-hint">Torn key is provided by Torn PDA.</p>` : "";
+            body.innerHTML = `
+<div class="bh4-section"><h3>Filters</h3>
+  <div class="bh4-g2">
+    <div class="bh4-field"><label>Min reward ($)</label><input id="bhs-price" class="bh4-inp" type="number" min="0" step="10000" value="${s.minPrice}"></div>
+    <div class="bh4-field"><label>Hospital window (min)</label><input id="bhs-hosp" class="bh4-inp" type="number" min="0" max="60" value="${s.hospitalMaxMin}"><p class="bh4-hint">0 = Okay only</p></div>
+    <div class="bh4-field"><label>FF min</label><input id="bhs-ffmin" class="bh4-inp" type="number" min="1" max="10" step="0.1" value="${s.minFF}"></div>
+    <div class="bh4-field"><label>FF max</label><input id="bhs-ffmax" class="bh4-inp" type="number" min="1" max="10" step="0.1" value="${s.maxFF}"></div>
+  </div>
+  <label class="bh4-check"><input type="checkbox" id="bhs-unkff"${s.includeUnknownFF?" checked":""}> Include targets with unknown FF score</label>
+</div>
+
+<div class="bh4-section"><h3>Battle Stats Bracket</h3>
+  <p class="bh4-hint">Leave all unchecked for any stats. Requires FFScouter key.</p>
+  <div class="bh4-bsb">${bsBoxes}</div>
+</div>
+
+<div class="bh4-section"><h3>Additional Filters</h3>
+  <label class="bh4-check"><input type="checkbox" id="bhs-rev"${s.revivableOnly?" checked":""}> Hospital targets: revivable only</label><br><br>
+  <label class="bh4-check"><input type="checkbox" id="bhs-war"${s.hideWarTargets?" checked":""}> Hide targets in active faction wars</label>
+  <p class="bh4-hint">War status is fetched once per 5 minutes. Targets show ⚔ WAR badge when their faction is in a ranked or territory war.</p>
+</div>
+
+<div class="bh4-section"><h3>Alerts</h3>
+  <p class="bh4-hint">Full-screen banner + vibration + beep when hospital timer hits ~60 seconds. Tap 🔔 on any hospital row for per-target alerts.</p>
+  <label class="bh4-check"><input type="checkbox" id="bhs-ha"${s.hospAlerts?" checked":""}> Auto-alert all hospital targets (1 min before exit)</label><br><br>
+  <label class="bh4-check"><input type="checkbox" id="bhs-ma"${s.markedAlerts?" checked":""}> Auto-alert all marked targets</label><br><br>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px">
+    <span class="bh4-hint">Web notifications:</span>
+    <span id="bhs-npb" class="bh4-npb">…</span>
+    <button id="bhs-nreq" class="bh4-btn" style="font-size:10px;padding:3px 10px">Request</button>
+  </div>
+</div>
+
+<div class="bh4-section"><h3>Refresh</h3>
+  <div class="bh4-g2">
+    <div class="bh4-field"><label>Auto-refresh interval</label>
+      <select id="bhs-ref" class="bh4-sel">
+        <option value="30"${s.refreshSec===30?" selected":""}>30 seconds</option>
+        <option value="60"${s.refreshSec===60?" selected":""}>60 seconds</option>
+        <option value="120"${s.refreshSec===120?" selected":""}>2 minutes</option>
+        <option value="300"${s.refreshSec===300?" selected":""}>5 minutes</option>
+        <option value="0"${s.refreshSec===0?" selected":""}>Off</option>
+      </select></div>
+    <div class="bh4-field"><label>Options</label>
+      <label class="bh4-check"><input type="checkbox" id="bhs-toast"${s.toastsEnabled?" checked":""}> Toast new matches</label>
+    </div>
+  </div>
+</div>
+
+<div class="bh4-section"><h3>Torn API Key</h3>
+  ${pdaNote}
+  <div class="bh4-field"><input id="bhs-tk" class="bh4-inp bh4-inp-mask" type="text" maxlength="16" spellcheck="false" autocomplete="off" value="${esc(Keys.getTorn())}"${Keys.isPDA()?" disabled":""}></div>
+  ${!Keys.isPDA() ? `<div class="bh4-ra"><button id="bhs-tksave" class="bh4-btn bh4-btn-p">Save Key</button><button id="bhs-tkclear" class="bh4-btn bh4-btn-d">Clear & Logout</button></div><div id="bhs-tkst" class="bh4-ss"></div>` : ""}
+</div>
+
+<div class="bh4-section"><h3>FFScouter Key</h3>
+  <p class="bh4-hint">Enables FF score and BS bracket filtering. One batch request per refresh.</p>
+  <div class="bh4-field"><input id="bhs-fk" class="bh4-inp bh4-inp-mask" type="text" maxlength="16" spellcheck="false" autocomplete="off" value="${esc(Keys.getFF())}"></div>
+  <div class="bh4-ra"><button id="bhs-fksave" class="bh4-btn bh4-btn-p">Save</button><button id="bhs-fkclear" class="bh4-btn">Clear</button></div>
+  <div id="bhs-fkst" class="bh4-ss"></div>
+</div>
+
+<div class="bh4-section"><h3>Reset</h3>
+  <button id="bhs-reset" class="bh4-btn">Reset all filters to defaults</button>
+  <p class="bh4-hint">v${VERSION} · ${IS_PDA?"Torn PDA":"Desktop"}</p>
+</div>`;
+
+            const $ = id => body.querySelector("#" + id);
+            const st = (elId, cls, msg) => { const el=$(elId); if(!el) return; el.className="bh4-ss "+cls; el.textContent=msg; };
+
+            const persist = () => {
+                const fmin = parseFloat($("bhs-ffmin").value), fmax = parseFloat($("bhs-ffmax").value);
+                const cmin = Number.isFinite(fmin) ? Math.max(1,fmin) : 1;
+                const cmax = Number.isFinite(fmax) ? Math.max(cmin,fmax) : cmin;
+                const selBS = BS_RANGES.filter(r => { const el=document.getElementById(r.id); return el&&el.checked; }).map(r => r.id);
+                this.hunter.updateSettings({
+                    minPrice:Math.max(0,parseInt($("bhs-price").value)||0),
+                    hospitalMaxMin:Math.max(0,Math.min(60,parseInt($("bhs-hosp").value)||0)),
+                    minFF:cmin, maxFF:cmax,
+                    refreshSec:parseInt($("bhs-ref").value)||60,
+                    toastsEnabled:$("bhs-toast").checked,
+                    includeUnknownFF:$("bhs-unkff").checked,
+                    revivableOnly:$("bhs-rev").checked,
+                    bsRanges:selBS,
+                    hospAlerts:$("bhs-ha")?.checked ?? false,
+                    hideWarTargets:$("bhs-war")?.checked ?? false,
+                    markedAlerts:$("bhs-ma")?.checked ?? false,
+                });
+                this.alertMgr.enabled = this.hunter.settings.hospAlerts; this.alertMgr.sync(this.hunter.lastMatches);
+                this.markedAlertMgr.enabled = this.hunter.settings.markedAlerts; this.markedAlertMgr.sync(Marks.load(), this.hunter.lastMarkedStatuses);
+                if (this.hunter.settings.refreshSec > 0) { this.hunter.stop(); this.hunter.start(); } else this.hunter.stop();
+            };
+            ["bhs-price","bhs-hosp","bhs-ffmin","bhs-ffmax","bhs-ref","bhs-toast","bhs-unkff","bhs-rev","bhs-ha","bhs-war","bhs-ma"].forEach(id => $(id)?.addEventListener("change", persist));
+            BS_RANGES.forEach(r => { const el=document.getElementById(r.id); if(el) el.addEventListener("change", persist); });
+
+            const upNPB = () => {
+                const badge=$("bhs-npb"), req=$("bhs-nreq"); if(!badge) return;
+                if (typeof Notification === "undefined") { badge.className="bh4-npb bh4-nu"; badge.textContent="Not supported"; if(req) req.style.display="none"; return; }
+                const p = Notification.permission;
+                if (p === "granted")   { badge.className="bh4-npb bh4-ng"; badge.textContent="Granted ✓"; if(req) req.style.display="none"; }
+                else if (p === "denied") { badge.className="bh4-npb bh4-nd"; badge.textContent="Denied"; if(req) req.style.display="none"; }
+                else { badge.className="bh4-npb bh4-nn"; badge.textContent="Not asked"; }
+            };
+            upNPB();
+            $("bhs-nreq")?.addEventListener("click", async () => { $("bhs-nreq").disabled=true; if(typeof Notification!=="undefined") await Notification.requestPermission(); upNPB(); $("bhs-nreq").disabled=false; });
+
+            if (!Keys.isPDA()) {
+                $("bhs-tksave")?.addEventListener("click", async () => {
+                    const k=$("bhs-tk").value.trim();
+                    if(!/^[A-Za-z0-9]{16}$/.test(k)){st("bhs-tkst","err","Must be 16 alphanumeric characters.");return;}
+                    st("bhs-tkst","info","Validating…"); this.hunter.api.setKey(k);
+                    try { await this.hunter.api.validateKey(); } catch(e) { st("bhs-tkst","err","Rejected: "+(e.message||"invalid")); return; }
+                    Keys.saveTorn(k); st("bhs-tkst","ok","Saved ✓"); this.hunter.refresh().catch(()=>{});
+                });
+                $("bhs-tkclear")?.addEventListener("click", () => {
+                    if(!confirm("Clear Torn API key and return to login?")) return;
+                    Keys.clearTorn(); this.hunter.stop(); this.toaster.clearAll(); this.setAuthed(false);
+                });
+            }
+            $("bhs-fksave").addEventListener("click", async () => {
+                const k=$("bhs-fk").value.trim();
+                if(!k){Keys.clearFF();st("bhs-fkst","info","Cleared.");this.hunter.refresh().catch(()=>{});return;}
+                st("bhs-fkst","info","Validating…"); const r=await validateFFKey(k);
+                if(!r.ok){st("bhs-fkst","err",r.msg);return;}
+                Keys.saveFF(k); st("bhs-fkst","ok",r.msg+" — refreshing…"); this.hunter.refresh().catch(()=>{}); st("bhs-fkst","ok",r.msg+" ✓");
+            });
+            $("bhs-fkclear").addEventListener("click", () => { Keys.clearFF(); $("bhs-fk").value=""; st("bhs-fkst","info","Cleared."); this.hunter.refresh().catch(()=>{}); });
+            $("bhs-reset").addEventListener("click", () => { if(!confirm("Reset filters?")) return; this.hunter.updateSettings({...DEFAULTS}); this._render(); });
+        }
     }
 
-    // ── Profile mark button ──────────────────────────────────────────────────────
+    // ── Eugene footer menu ────────────────────────────────────────────────────
+    (function setupEugFooterMenu() {
+        if (W.__eugFooterMenuLoaded) return; W.__eugFooterMenuLoaded = true; W.__eugeneScripts = W.__eugeneScripts || [];
+        const ROW_ID = "eug-footer-row";
+        function injectFMCSS() { if(document.getElementById("eug-footer-style"))return;const s=document.createElement("style");s.id="eug-footer-style";s.textContent=`[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`;document.head.appendChild(s); }
+        function injectEntryCSS(e) { if(!e.color)return;const id=`eug-color-${e.id}`,dark=e.colorDark||"#222",hover=e.hoverColor||e.color,css=`[data-eug-id="${e.id}"]{background:linear-gradient(to bottom,${e.color},${dark})!important}[data-eug-id="${e.id}"]:hover{background:linear-gradient(to bottom,${hover},${e.color})!important}`;const ex=document.getElementById(id);if(ex){ex.textContent=css;return;}const el=document.createElement("style");el.id=id;el.textContent=css;document.head.appendChild(el); }
+        const findRef = () => document.getElementById("notes_panel_button") || document.getElementById("people_panel_button");
+        const getRow = () => document.getElementById(ROW_ID);
+        const closeRow = () => { const r=getRow(); if(r) r.classList.remove("eug-open"); };
+        const openRow = btn => { const row=getRow(); if(!row)return; const rect=btn.getBoundingClientRect(); row.classList.add("eug-open"); const rr=row.getBoundingClientRect(); row.style.left=Math.max(4,Math.min(rect.left+rect.width/2-rr.width/2,window.innerWidth-rr.width-4))+"px"; row.style.bottom=(window.innerHeight-rect.top+6)+"px"; };
+        function makeScriptBtn(entry, refBtn, role) { const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title=entry.name;btn.setAttribute("data-eug",role);btn.setAttribute("data-eug-id",entry.id);btn.innerHTML=(entry.iconSVG||"").replace(/<svg\b([^>]*)>/,(m,a)=>/\sclass\s*=/.test(a)?m:`<svg${a} class="${ic}">`);btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();closeRow();try{entry.onClick();}catch{}});injectEntryCSS(entry);return btn; }
+        function makeMenuBtn(refBtn) { const ic=refBtn.querySelector("svg")?.className?.baseVal||"",btn=document.createElement("button");btn.type="button";btn.className=refBtn.className;btn.title="My userscripts";btn.setAttribute("data-eug","menu");btn.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1=".5" x2=".5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`;btn.addEventListener("click",(e)=>{e.preventDefault();e.stopPropagation();const row=getRow();if(row&&row.classList.contains("eug-open"))closeRow();else openRow(btn);});return btn; }
+        function render() { const refBtn=findRef(); if(!refBtn)return false; injectFMCSS(); const parent=refBtn.parentNode; parent.querySelectorAll("[data-eug]").forEach(el=>el.remove()); const oldRow=getRow(); if(oldRow)oldRow.remove(); const scripts=W.__eugeneScripts||[]; if(!scripts.length)return true; if(scripts.length===1){parent.insertBefore(makeScriptBtn(scripts[0],refBtn,"solo"),refBtn);}else{const mb=makeMenuBtn(refBtn);parent.insertBefore(mb,refBtn);const row=document.createElement("div");row.id=ROW_ID;row.setAttribute("data-eug-row","");for(const s of scripts)row.appendChild(makeScriptBtn(s,refBtn,"item"));document.body.appendChild(row);}return true; }
+        function mount() { render(); let pending=false; const obs=new MutationObserver(()=>{if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;const r=findRef();if(r&&!r.parentNode.querySelector("[data-eug]"))render();});});obs.observe(document.body,{childList:true,subtree:true}); }
+        W.addEventListener("eugene-scripts-updated", render);
+        document.addEventListener("click", e => { const row=getRow(); if(!row||!row.classList.contains("eug-open"))return; const mb=document.querySelector('[data-eug="menu"]'); if(mb&&mb.contains(e.target))return; if(row.contains(e.target))return; closeRow(); });
+        document.addEventListener("keydown", e => { if(e.key==="Escape")closeRow(); });
+        W.addEventListener("scroll", closeRow, { passive:true }); W.addEventListener("resize", closeRow);
+        W.registerEugeneScript = function(entry) { const list=W.__eugeneScripts,i=list.findIndex(s=>s.id===entry.id); if(i>=0)list[i]=entry; else list.push(entry); W.dispatchEvent(new CustomEvent("eugene-scripts-updated")); };
+        W.mountEugeneFooterMenu = mount;
+    })();
+
+    // ── Profile mark button ───────────────────────────────────────────────────
     function setupMarkButton() {
         injectCSS();
         let lastUrl = "", lastXid = "";
-
         const tryInject = () => {
-            if (!location.href.includes("profiles.php")) {
-                document.getElementById("bh4-mark-btn")?.remove(); lastXid = ""; return;
-            }
-            const xid = new URLSearchParams(location.search).get("XID") ?? "";
-            if (!xid) { document.getElementById("bh4-mark-btn")?.remove(); lastXid = ""; return; }
-            if (document.getElementById("bh4-mark-btn") && lastXid === xid) return;
-
-            document.getElementById("bh4-mark-btn")?.remove();
-            lastXid = xid;
-            const id = Number(xid);
-            if (!id) return;
-
-            let name = `Player ${id}`;
+            if (!location.href.includes("profiles.php")) { document.getElementById("bh4-mb")?.remove(); lastXid=""; return; }
+            const xid = new URLSearchParams(location.search).get("XID") || "";
+            if (!xid) { document.getElementById("bh4-mb")?.remove(); lastXid=""; return; }
+            if (document.getElementById("bh4-mb") && lastXid === xid) return;
+            document.getElementById("bh4-mb")?.remove(); lastXid = xid;
+            const id = Number(xid); if (!id) return;
+            let name = `Player ${id}`, level = 0;
             for (const sel of ["[class*='playerName']","[class*='player-name']","[class*='name___']",".profile-header h4","h4.bold"]) {
                 const el = document.querySelector(sel);
-                if (el?.textContent.trim() && el.textContent.trim().length < 40) { name = el.textContent.trim(); break; }
+                if (el?.textContent.trim()?.length < 40) { name = el.textContent.trim(); break; }
             }
-
             const isMarked = Marks.has(id);
             const btn = document.createElement("button");
-            btn.id = "bh4-mark-btn";
-            btn.className = "bh4-mark-btn" + (isMarked ? " active" : "");
+            btn.id = "bh4-mb"; btn.className = "bh4-mark-btn" + (isMarked ? " active" : "");
             btn.textContent = isMarked ? "✓ MARKED" : "+ MARK";
             btn.addEventListener("click", () => {
-                if (Marks.has(id)) { Marks.remove(id); btn.textContent = "+ MARK"; btn.classList.remove("active"); }
-                else               { Marks.add({ id, name }); btn.textContent = "✓ MARKED"; btn.classList.add("active"); }
+                if (Marks.has(id)) { Marks.remove(id); btn.textContent="+ MARK"; btn.classList.remove("active"); }
+                else { Marks.add({ id, name, level }); btn.textContent="✓ MARKED"; btn.classList.add("active"); }
             });
             document.body.appendChild(btn);
         };
-
-        setInterval(() => {
-            if (location.href !== lastUrl) { lastUrl = location.href; setTimeout(tryInject, 500); setTimeout(tryInject, 1500); }
-        }, 400);
+        setInterval(() => { if (location.href !== lastUrl) { lastUrl=location.href; setTimeout(tryInject,500); setTimeout(tryInject,1500); } }, 400);
         tryInject(); setTimeout(tryInject, 800); setTimeout(tryInject, 2000);
     }
 
-    // ── Bootstrap ─────────────────────────────────────────────────────────────────
-    if (ON_BOUNTIES) {
-        if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setup);
-        else setup();
+    // ── Main ──────────────────────────────────────────────────────────────────
+    const BH4_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><defs><linearGradient id="bh4g" x1=".5" x2=".5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#bh4g)"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8Z"/><path d="M12 6a6 6 0 1 0 6 6 6 6 0 0 0-6-6Zm0 10a4 4 0 1 1 4-4 4 4 0 0 1-4 4Z"/><circle cx="12" cy="12" r="1.5"/><path d="M11 0h2v5h-2zM11 19h2v5h-2zM0 11h5v2H0zM19 11h5v2h-5z"/></g></svg>`;
+
+    function main() {
+        const key = Keys.getTorn();
+        const api = new TornAPI(key || "");
+        const hunter = new Hunter(api);
+        const toaster = new Toaster();
+        const alertMgr = new AlertMgr();
+        const markedAlertMgr = new MarkedAlertMgr();
+        const ui = new UI(hunter, toaster, alertMgr, markedAlertMgr);
+
+        window.__bh4UI = ui; ui.inject(); ui.setAuthed(!!key);
+
+        hunter.onHospAlert = matches => { alertMgr.enabled = hunter.settings.hospAlerts; alertMgr.sync(matches); };
+        hunter.onClaimed = claimed => { if (hunter.settings.toastsEnabled) toaster.showMany(claimed); };
+        hunter.onMarkedUpdate = () => { if (ui._open() && ui.tab === "targets") ui._renderTargets(); };
+        hunter.onMarkedAlert = (targets, statuses) => { markedAlertMgr.enabled = hunter.settings.markedAlerts; markedAlertMgr.sync(targets, statuses); };
+
+        setupMarkButton();
+
+        window.addEventListener("storage", e => {
+            if (e.key !== LS.shared || !e.newValue) return;
+            try { hunter.adoptShared(JSON.parse(e.newValue)); } catch {}
+        });
+
+        W.registerEugeneScript({ id:"bh4", name:"Bounty Hunter 4", color:"#7a6020", colorDark:"#4a3a10", hoverColor:"#c8a84b", iconSVG:BH4_ICON, onClick:() => ui.toggle(true) });
+        W.mountEugeneFooterMenu();
+        if (key) hunter.start();
     }
 
-    if (ON_PROFILE) {
-        if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setupMarkButton);
-        else setupMarkButton();
-    }
-
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+    else main();
 })();
