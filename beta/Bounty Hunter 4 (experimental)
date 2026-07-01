@@ -17,7 +17,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "4.2.0";
+    const VERSION = "4.2.1";
     const API_BASE = "https://api.torn.com/v2";
     const FF_BASE  = "https://ffscouter.com/api/v1";
     const ATTACK_URL  = "https://www.torn.com/page.php?sid=attack&user2ID=";
@@ -84,17 +84,21 @@
 
     // ── HTTP ──────────────────────────────────────────────────────────────────
     function gmGet(url) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method:"GET", url, responseType:"json", timeout:25_000,
-                onload(r) {
-                    const d = r.response ?? (() => { try { return JSON.parse(r.responseText); } catch { return null; } })();
-                    if (d !== null) resolve(d); else reject(new Error("parse"));
-                },
-                onerror()   { reject(new Error("network")); },
-                ontimeout() { reject(new Error("timeout")); },
+        if (typeof GM_xmlhttpRequest === "function") {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method:"GET", url, responseType:"json", timeout:25_000,
+                    onload(r) {
+                        const d = r.response ?? (() => { try { return JSON.parse(r.responseText); } catch { return null; } })();
+                        if (d !== null) resolve(d); else reject(new Error("parse"));
+                    },
+                    onerror()   { reject(new Error("network")); },
+                    ontimeout() { reject(new Error("timeout")); },
+                });
             });
-        });
+        }
+        // Fallback for environments without GM_xmlhttpRequest (e.g. Torn PDA inline browser)
+        return fetch(url).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
     }
     async function httpGet(url) {
         if (IS_PDA && url.includes("api.torn.com")) {
@@ -234,7 +238,7 @@
             if (this.onUpdate) this.onUpdate();
         }
         stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } this._running = false; }
-        start() { if (this._running) return; this._running = true; this._tick(); }
+        start() { if (this._running) return; this._running = true; this._nextAt = Date.now() + this.settings.refreshSec * 1000; this._tick(); }
         async _tick() {
             if (!this._running) return;
             let waitSec = this.settings.refreshSec;
@@ -742,7 +746,7 @@ table.bh4-t{width:100%;border-collapse:collapse}
             this.hunter.onToast = b => this.toaster.showMany(b);
             this._tick = setInterval(() => {
                 if (this._open() && this.tab === "hunt") {
-                    const el = document.getElementById("bh4-cd"); if (el) el.textContent = this.hunter.secondsUntilRefresh() + "s";
+                    const el = document.getElementById("bh4-cd"); if (el) el.textContent = this.hunter.secondsUntilRefresh();
                 }
                 document.querySelectorAll("[data-hu]").forEach(el => {
                     const u = parseInt(el.dataset.hu); if (Number.isFinite(u)) el.textContent = fmtHosp(u);
@@ -834,6 +838,7 @@ table.bh4-t{width:100%;border-collapse:collapse}
                 this._refreshing = true; body.querySelector("#bh4-rbtn").disabled = true;
                 try { await this.hunter.refresh(); } catch {}
                 this._refreshing = false;
+                if (this._open() && this.tab === "hunt") this._renderHunt();
             });
             body.querySelectorAll(".bh4-att").forEach(el => el.addEventListener("click", e => { e.preventDefault(); openUrl(PROFILE_URL + el.dataset.id); }));
             body.querySelectorAll("th[data-sort]").forEach(el => el.addEventListener("click", () => {
