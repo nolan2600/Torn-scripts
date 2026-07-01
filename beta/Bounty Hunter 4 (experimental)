@@ -17,7 +17,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "4.2.2";
+    const VERSION = "4.2.3";
     const API_BASE = "https://api.torn.com/v2";
     const FF_BASE  = "https://ffscouter.com/api/v1";
     const ATTACK_URL  = "https://www.torn.com/page.php?sid=attack&user2ID=";
@@ -98,7 +98,15 @@
             });
         }
         // Fallback for environments without GM_xmlhttpRequest (e.g. Torn PDA inline browser)
-        return fetch(url).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+        // Promise-based 25s timeout since fetch() has no built-in timeout
+        return new Promise((resolve, reject) => {
+            const tid = setTimeout(() => reject(new Error("timeout")), 25_000);
+            fetch(url).then(async r => {
+                clearTimeout(tid);
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                resolve(await r.json());
+            }).catch(e => { clearTimeout(tid); reject(e); });
+        });
     }
     async function httpGet(url) {
         if (IS_PDA && url.includes("api.torn.com")) {
@@ -290,7 +298,7 @@
                 if (claimed.length && this.onClaimed) this.onClaimed(claimed);
             }
 
-            const counts = { total:bounties.length, afterBasic:0, withFF:0, ffError:null, ffNetworkFail:false, afterFF:0, afterBS:0, matches:0, inWar:0 };
+            const counts = { total:bounties.length, afterBasic:0, withFF:0, ffError:null, ffNetworkFail:false, afterFF:0, afterBS:0, matches:0, inWar:0, profilesFailed:0 };
             const byBasic = deduped.filter(b => b.reward >= this.settings.minPrice && (this.myId == null || b.target_id !== this.myId));
             counts.afterBasic = byBasic.length;
 
@@ -320,6 +328,7 @@
             counts.afterBS = byBS.length;
 
             const profiles = await this._fetchProfiles(byBS.map(b => Number(b.target_id)));
+            counts.profilesFailed = Math.max(0, byBS.length - profiles.size);
             const warSet = await this._fetchWarFactions();
 
             const nowSec = Math.floor(Date.now()/1000);
@@ -826,6 +835,7 @@ table.bh4-t{width:100%;border-collapse:collapse}
                     <span>Next in <span id="bh4-cd">${this.hunter._isLoading?"…":next+"s"}</span></span>
                     <span>${rows.length} match${rows.length===1?"":"es"}</span>
                     ${c ? `<span style="color:#2e3a2e;font-size:10px">${c.total}→${c.afterBasic}→${c.matches}</span>` : ""}
+                    ${c?.profilesFailed ? `<span class="err">⚠ ${c.profilesFailed} profile${c.profilesFailed===1?"":"s"} failed</span>` : ""}
                     ${errLine}${ffWarn}
                 </div>
                 ${rl ? `<div class="bh4-rl"><div class="bh4-rl-t">Rate limit hit</div><div class="bh4-rl-b">${rows.length?"Showing last results.":"No results yet."} Raise min reward or refresh interval to stay under the limit.</div></div>` : ""}
