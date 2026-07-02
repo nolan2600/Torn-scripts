@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Profit Analytics
 // @namespace    https://github.com/nolan2600/torn-scripts
-// @version      1.1.0
+// @version      1.2.0
 // @description  Track daily/weekly/monthly profits from muggings and bounties — with source breakdown, top events, and trend charts.
 // @author       DieselBlade + nolan2600
 // @match        https://www.torn.com/*
@@ -19,7 +19,7 @@
 
     const PDA_API_KEY     = "###PDA-APIKEY###";
     const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
-    const VERSION         = "1.1.0";
+    const VERSION         = "1.2.0";
     const API_BASE        = "https://api.torn.com/v2";
     const API_DELAY_MS    = 750;
     const SPA_LS_APIKEY   = "spa_apiKey";
@@ -35,6 +35,7 @@
         myId:          "ta_my_id",
         statsCache:    "ta_stats_cache_v1",
         access:        "ta_access_v1",
+        names:         "ta_names_v1",
     };
 
     const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", ATTACK:"attack" };
@@ -120,6 +121,10 @@
     function loadAccess() { try { const a = JSON.parse(localStorage.getItem(LS.access)||"null"); return a && typeof a === "object" ? { attacks:a.attacks!==false, log:a.log!==false } : { attacks:true, log:true }; } catch { return { attacks:true, log:true }; } }
     function saveAccess(a) { try { localStorage.setItem(LS.access, JSON.stringify(a)); } catch {} }
 
+    // Persistent id → player-name cache (log entries carry target IDs only)
+    function loadNames() { try { const n = JSON.parse(localStorage.getItem(LS.names)||"{}"); return n && typeof n === "object" ? n : {}; } catch { return {}; } }
+    function saveNames(n) { try { localStorage.setItem(LS.names, JSON.stringify(n)); } catch {} }
+
     // ── Key Resolver ───────────────────────────────────────────
     const KeyResolver = {
         resolveTornKey() {
@@ -182,14 +187,20 @@
             return data;
         }
 
-        async _getV1(params) {
+        async _getV1(params, userId = "") {
             await this._rateLimit();
-            const url = new URL("https://api.torn.com/user/");
+            const url = new URL("https://api.torn.com/user/" + userId);
             for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
             url.searchParams.set("key", this.key);
             const data = await httpGetJson(url.toString());
             if (data && data.error) { const e = new Error(data.error.error || "Torn API error"); e.tornCode = data.error.code; throw e; }
             return data;
+        }
+
+        // Resolve a player's name by ID — works with any key level
+        async fetchBasic(id) {
+            const data = await this._getV1({ selections:"basic" }, String(id));
+            return data && data.name ? { id: data.player_id || id, name: data.name } : null;
         }
 
         async validateKey() {
@@ -1260,7 +1271,7 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
             body.querySelector("#ta-s-clear").addEventListener("click", () => {
                 if (!confirm("Clear ALL tracked profit data? This cannot be undone.")) return;
-                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastLogTs, LS.lastSnapTs, LS.myId, LS.statsCache, LS.access].forEach(k => {
+                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastLogTs, LS.lastSnapTs, LS.myId, LS.statsCache, LS.access, LS.names].forEach(k => {
                     try { localStorage.removeItem(k); } catch {}
                 });
                 this.myId = null;
@@ -1338,17 +1349,39 @@ table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
 
                 this.syncReport = report;
 
-                // ── Merge, enrich names, save ──────────────────
+                // ── Merge, resolve names, save ─────────────────
                 const merged = mergeEvents(loadEvents(), newEvents);
-                if (nameMap.size > 0) {
-                    for (const ev of merged) {
+
+                // Fold names from attack history into the persistent cache
+                const names = loadNames();
+                for (const [id, nm] of nameMap) names[String(id)] = nm;
+
+                // Log entries only carry IDs — look up unknown names via the
+                // API (basic selection, any key level), a batch per sync.
+                const unresolved = [...new Set(
+                    merged.filter(ev => {
                         const tid = ev.meta && ev.meta.targetId;
-                        if (!tid) continue;
-                        const nm = nameMap.get(Number(tid));
-                        if (nm && ev.meta.targetName !== nm) {
-                            ev.meta.targetName = nm;
-                            if (ev.type === EVENT_TYPES.MUGGING) ev.label = `Mugged ${nm}`;
-                        }
+                        return tid && !names[String(tid)];
+                    }).map(ev => String(ev.meta.targetId))
+                )].slice(0, 20);
+                for (const id of unresolved) {
+                    try {
+                        const b = await api.fetchBasic(id);
+                        if (b && b.name) names[id] = b.name;
+                    } catch (e) {
+                        if (e.tornCode === 5) break; // rate limited — finish next sync
+                    }
+                }
+                saveNames(names);
+
+                // Apply every known name to events and labels
+                for (const ev of merged) {
+                    const tid = ev.meta && ev.meta.targetId;
+                    if (!tid) continue;
+                    const nm = names[String(tid)];
+                    if (nm && ev.meta.targetName !== nm) {
+                        ev.meta.targetName = nm;
+                        if (ev.type === EVENT_TYPES.MUGGING) ev.label = `Mugged ${nm}`;
                     }
                 }
                 saveEvents(pruneEvents(merged, this.settings));
