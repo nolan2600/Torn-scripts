@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn PDA Market Suite
 // @namespace    torn-market-suite-v1
-// @version      1.3
+// @version      1.4
 // @match        https://www.torn.com/*
 // @grant        none
 // ==/UserScript==
@@ -45,6 +45,7 @@
   }
 
   let SETTINGS = loadSettings();
+  let lastMarketSig = ''; // fingerprint of last-rendered market view; '' forces a redraw
 
   const STALENESS = {
     get freshMs() { return SETTINGS.freshMs * 3600000; },
@@ -107,6 +108,7 @@
 
       const inp = document.createElement('input');
       inp.type = type || 'number';
+      inp.inputMode = 'decimal';
       inp.dataset.key = key;
       inp.value = s[key];
       inp.style.cssText = `
@@ -288,6 +290,11 @@
       baseline: Math.round(baseline),
       updatedAt: Date.now()
     };
+    // Entries older than the aging window are never shown; drop anything past 7 days
+    const cutoff = Date.now() - 7 * 86400000;
+    for (const k of Object.keys(store)) {
+      if (((store[k] && store[k].updatedAt) || 0) < cutoff) delete store[k];
+    }
     saveStore(store);
   }
 
@@ -315,6 +322,7 @@
     const old = document.getElementById(BOX_ID);
     if (old) old.remove();
     document.querySelectorAll('.' + BADGE_CLASS).forEach(el => el.remove());
+    document.querySelectorAll('.tpda-bulk-tag').forEach(el => el.remove());
     document.querySelectorAll('.' + HILITE_CLASS).forEach(el => {
       el.classList.remove(HILITE_CLASS);
       el.style.background = '';
@@ -366,25 +374,37 @@
     return null;
   }
 
+  // Cell text with any injected badge stripped, so re-parsing a decorated
+  // cell can't concatenate the badge's digits into the price.
+  function cellText(cell) {
+    if (!cell) return '';
+    if (!cell.querySelector || !cell.querySelector('.' + BADGE_CLASS)) return cell.textContent || '';
+    const c = cell.cloneNode(true);
+    c.querySelectorAll('.' + BADGE_CLASS).forEach(b => b.remove());
+    return c.textContent || '';
+  }
+
   function getRows() {
     const rows = [];
     for (const node of document.querySelectorAll('tr, li, div')) {
       if (node.closest('.bazaar-info-container, [class*="bazaar"], [id*="bazaar"]')) continue;
       const kids = node.children || [];
       if (kids.length < 4) continue;
-      const priceText = kids[1]?.textContent || '';
+      const priceText = cellText(kids[1]);
       if (!/\$\d/.test(priceText)) continue;
       const maybePrice = parsePrice(priceText);
       if (maybePrice <= 0 || maybePrice > 100000000) continue;
       rows.push(node);
     }
-    return rows;
+    // A listing's wrapper and its inner row can both match — keep only the
+    // innermost so prices aren't double-counted in the baseline.
+    return rows.filter(r => !rows.some(o => o !== r && r.contains(o)));
   }
 
   function getListings() {
     return getRows().map(row => {
       const kids = row.children || [];
-      const price = parsePrice(kids[1]?.textContent || '');
+      const price = parsePrice(cellText(kids[1]));
       const qty   = parseInt(String(kids[2]?.textContent || '0').replace(/[^\d]/g, ''), 10) || 0;
       return { price, qty, node: row };
     }).filter(l => l.price > 0);
@@ -446,13 +466,14 @@
     for (const { price, qty, node: row } of listings) {
       const kids = row.children || [];
       const costCell = kids[1]; if (!costCell) continue;
-      const profit = baseline - price - (SETTINGS.applyFee ? price * 0.05 : 0);
+      // The 5% market fee is charged on the sale price (the baseline you list at)
+      const profit = baseline - price - (SETTINGS.applyFee ? baseline * 0.05 : 0);
       const roi    = profit / price;
       if (profit <= 0) continue;
       const strong = profit >= SETTINGS.minProfit && roi >= SETTINGS.minROI;
       addBadge(costCell, profit, roi, strong);
       if (strong) { row.classList.add(HILITE_CLASS); row.style.background = 'rgba(34,197,94,0.12)'; }
-      else { row.style.background = 'rgba(250,204,21,0.06)'; }
+      else { row.classList.add(HILITE_CLASS); row.style.background = 'rgba(250,204,21,0.06)'; }
       if (strong && profit > bestUnitProfit) { bestUnitProfit = profit; bestUnitRow = row; }
       if (strong) { const bs = profit * Math.min(qty||1, 500); if (bs > bestBulkScore) { bestBulkScore = bs; bestBulkRow = row; } }
     }
@@ -471,10 +492,16 @@
   }
 
   function runMarketPage() {
+    if (!isCorrectMarketPage()) { removeOldMarketUI(); lastMarketSig = ''; return; }
+    const h4 = getHeader(); if (!h4) { removeOldMarketUI(); return; }
+    const listings = getListings();
+    if (listings.length < 5) { removeOldMarketUI(); lastMarketSig = ''; return; }
+    // Skip the redraw when the view hasn't changed — avoids flicker when
+    // unrelated DOM churn (chat, timers) retriggers the observer.
+    const sig = location.href + '|' + listings.map(l => l.price + 'x' + l.qty).join(',');
+    if (sig === lastMarketSig && document.getElementById(BOX_ID)) return;
+    lastMarketSig = sig;
     removeOldMarketUI();
-    if (!isCorrectMarketPage()) return;
-    const h4 = getHeader(); if (!h4) return;
-    const listings = getListings(); if (listings.length < 5) return;
     const { baseline, wall } = calcBaseline(listings);
     const itemName = getMarketItemName();
     const itemId   = getMarketItemId();
@@ -721,28 +748,57 @@
   //  UNIFIED BOOT
   // ─────────────────────────────────────────────
 
-  let sellObserver = null, sellObserverDebounce = null, sellRunning = false;
+  let domObserver = null, domDebounce = null, uiRunning = false;
 
-  function runSellHelperSafe() {
-    if(sellRunning) return; sellRunning=true;
-    if(sellObserver) sellObserver.disconnect();
-    try { runSellHelper(); }
+  // Ignore mutation bursts that are entirely inside chat — they fire constantly
+  function mutationsRelevant(muts) {
+    for (const m of muts) {
+      let t = m.target;
+      if (t && t.nodeType === 3) t = t.parentElement;
+      if (t && t.nodeType === 1 && t.closest && t.closest('[id*="chat"],[class*="chat"]')) continue;
+      return true;
+    }
+    return false;
+  }
+
+  // Disconnect the observer while we mutate the DOM so our own inserts
+  // can't retrigger us in a loop.
+  function runSafe() {
+    if (uiRunning) return;
+    uiRunning = true;
+    if (domObserver) domObserver.disconnect();
+    try { runMarketPage(); runSellHelper(); }
     finally {
-      sellRunning=false;
-      if(sellObserver&&isLikelySellPage()) sellObserver.observe(document.body,{childList:true,subtree:true});
+      uiRunning = false;
+      if (domObserver && !document.hidden) domObserver.observe(document.body, { childList: true, subtree: true });
     }
   }
 
-  function run() { runMarketPage(); runSellHelper(); }
+  // Settings save/reset land here — force a full market redraw
+  function run() { lastMarketSig = ''; runSafe(); }
 
-  function startSellObserver() {
-    if(sellObserver) return;
-    sellObserver=new MutationObserver(()=>{
-      clearTimeout(sellObserverDebounce);
-      sellObserverDebounce=setTimeout(()=>{ if(isLikelySellPage()) runSellHelperSafe(); },300);
+  function startDomObserver() {
+    if (domObserver) return;
+    domObserver = new MutationObserver(muts => {
+      if (!mutationsRelevant(muts)) return;
+      clearTimeout(domDebounce);
+      domDebounce = setTimeout(runSafe, 300);
     });
-    sellObserver.observe(document.body,{childList:true,subtree:true});
+    domObserver.observe(document.body, { childList: true, subtree: true });
   }
+
+  // Torn's item market is a SPA — the URL (incl. hash) changes without a page
+  // load. Re-run on navigation so the box/badges follow the item being viewed
+  // and every browsed item gets its baseline recorded for the sell helper.
+  let lastHref = location.href;
+  setInterval(() => {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    lastMarketSig = '';
+    setTimeout(runSafe, 600);
+    setTimeout(runSafe, 1500);
+    setTimeout(runSafe, 3000);
+  }, 500);
 
   function trackerBoot() {
     pruneLowest(); scan();
@@ -753,15 +809,15 @@
   }
 
   document.addEventListener('visibilitychange',()=>{
-    if(document.hidden){ if(sellObserver) sellObserver.disconnect(); }
-    else { if(isLikelySellPage()){ runSellHelperSafe(); if(sellObserver) sellObserver.observe(document.body,{childList:true,subtree:true}); } }
+    if(document.hidden){ if(domObserver) domObserver.disconnect(); }
+    else runSafe(); // re-runs both helpers and reconnects the observer
   });
 
-  setTimeout(run,              1200);
-  setTimeout(runSellHelperSafe,2200);
-  setTimeout(runSellHelperSafe,3500);
-  setTimeout(runSellHelperSafe,5000);
-  startSellObserver();
+  setTimeout(runSafe, 1200);
+  setTimeout(runSafe, 2200);
+  setTimeout(runSafe, 3500);
+  setTimeout(runSafe, 5000);
+  startDomObserver();
 
   if(document.readyState==='loading'){
     document.addEventListener('DOMContentLoaded',function(){ setTimeout(trackerBoot,900); });
