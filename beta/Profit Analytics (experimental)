@@ -1,0 +1,1433 @@
+// ==UserScript==
+// @name         Torn Profit Analytics
+// @namespace    https://github.com/nolan2600/torn-scripts
+// @version      1.1.0
+// @description  Track daily/weekly/monthly profits from muggings and bounties — with source breakdown, top events, and trend charts.
+// @author       DieselBlade + nolan2600
+// @match        https://www.torn.com/*
+// @match        https://torn.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      api.torn.com
+// @license      GPL-3.0-or-later
+// ==/UserScript==
+
+/* eslint-disable no-undef */
+
+(function () {
+    "use strict";
+
+    const PDA_API_KEY     = "###PDA-APIKEY###";
+    const PDA_PLACEHOLDER = "###" + "PDA-APIKEY" + "###";
+    const VERSION         = "1.1.0";
+    const API_BASE        = "https://api.torn.com/v2";
+    const API_DELAY_MS    = 750;
+    const SPA_LS_APIKEY   = "spa_apiKey";
+
+    const LS = {
+        apiKey:        "ta_apiKey",
+        settings:      "ta_settings_v1",
+        events:        "ta_events_v1",
+        snapshots:     "ta_snapshots_v1",
+        lastAttackTs:  "ta_last_attack_ts",
+        lastLogTs:     "ta_last_log_ts",
+        lastSnapTs:    "ta_last_snap_ts",
+        myId:          "ta_my_id",
+        statsCache:    "ta_stats_cache_v1",
+        access:        "ta_access_v1",
+    };
+
+    const EVENT_TYPES = { MUGGING:"mugging", BOUNTY:"bounty", ATTACK:"attack" };
+
+    const TYPE_CONFIG = {
+        mugging: { label:"Mugging",    color:"#ef5350", icon:"💰" },
+        bounty:  { label:"Bounty",     color:"#ffd700", icon:"🎯" },
+        attack:  { label:"Attack Win", color:"#4fc3f7", icon:"⚔️"  },
+    };
+
+    const DEFAULT_SETTINGS = {
+        includeMuggings:  true,
+        includeBounties:  true,
+        includeAttacks:   true,
+        refreshSec:       600,
+        retentionDays:    90,
+        maxEvents:        5000,
+        snapEvery:        3600, // personalstats snapshot interval (seconds)
+    };
+
+    const SNAP_FIELDS = [
+        "attackswon","attackslost","moneymugged","defendslost",
+        "criminaloffenses","nerverefills","bazaarsales","bazaarprofit",
+        "networth","useractivity",
+    ];
+
+    // Attack results that count as a win for the attacker
+    const WIN_RESULTS = new Set(["Attacked","Mugged","Hospitalized","Arrested","Looted","Special"]);
+
+    const IS_PDA      = typeof PDA_httpGet === "function";
+    const HAS_PDA_KEY = PDA_API_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_API_KEY);
+    const GM_XHR      = (typeof GM_xmlhttpRequest !== "undefined") ? GM_xmlhttpRequest : null;
+
+    // ── Utilities ──────────────────────────────────────────────
+    function escHtml(s) {
+        return String(s == null ? "" : s)
+            .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+            .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    const fmt = {
+        money(n) {
+            if (n == null) return "$0";
+            const a = Math.abs(n);
+            const s = a >= 1e9 ? (a/1e9).toFixed(2)+"B"
+                    : a >= 1e6 ? (a/1e6).toFixed(2)+"M"
+                    : a >= 1e3 ? (a/1e3).toFixed(1)+"K"
+                    : a.toLocaleString();
+            return (n < 0 ? "-$" : "$") + s;
+        },
+        moneyFull(n) { return (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(); },
+        date(ts)     { return new Date(ts * 1000).toLocaleDateString(); },
+        relTime(ts)  {
+            const d = Math.floor(Date.now()/1000) - ts;
+            if (d < 60)    return `${d}s ago`;
+            if (d < 3600)  return `${Math.floor(d/60)}m ago`;
+            if (d < 86400) return `${Math.floor(d/3600)}h ago`;
+            return `${Math.floor(d/86400)}d ago`;
+        },
+        pct(n) { return (n == null ? 0 : n).toFixed(1) + "%"; },
+    };
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // ── Storage ────────────────────────────────────────────────
+    function loadSettings()   { try { const r = localStorage.getItem(LS.settings); return {...DEFAULT_SETTINGS,...(r?JSON.parse(r):{})}; } catch { return {...DEFAULT_SETTINGS}; } }
+    function saveSettings(s)  { localStorage.setItem(LS.settings, JSON.stringify(s)); }
+    function loadEvents()     { try { const r = localStorage.getItem(LS.events); return r ? JSON.parse(r) : []; } catch { return []; } }
+    function loadSnapshots()  { try { const r = localStorage.getItem(LS.snapshots); return r ? JSON.parse(r) : []; } catch { return []; } }
+
+    function saveEvents(events) {
+        try { localStorage.setItem(LS.events, JSON.stringify(events)); }
+        catch { try { localStorage.setItem(LS.events, JSON.stringify(events.slice(-1000))); } catch {} }
+    }
+    function saveSnapshots(snaps) {
+        try { localStorage.setItem(LS.snapshots, JSON.stringify(snaps.slice(-1000))); } catch {}
+    }
+    function getTs(key)     { try { return parseInt(localStorage.getItem(key)||"0",10); } catch { return 0; } }
+    function setTs(key, ts) { try { localStorage.setItem(key, String(ts)); } catch {} }
+
+    function loadStatsCache() { try { const c = JSON.parse(localStorage.getItem(LS.statsCache)||"null"); return c && c.stats ? c.stats : null; } catch { return null; } }
+    function saveStatsCache(stats) { try { localStorage.setItem(LS.statsCache, JSON.stringify({ ts: Math.floor(Date.now()/1000), stats })); } catch {} }
+    function loadAccess() { try { const a = JSON.parse(localStorage.getItem(LS.access)||"null"); return a && typeof a === "object" ? { attacks:a.attacks!==false, log:a.log!==false } : { attacks:true, log:true }; } catch { return { attacks:true, log:true }; } }
+    function saveAccess(a) { try { localStorage.setItem(LS.access, JSON.stringify(a)); } catch {} }
+
+    // ── Key Resolver ───────────────────────────────────────────
+    const KeyResolver = {
+        resolveTornKey() {
+            if (HAS_PDA_KEY) return PDA_API_KEY;
+            const k = localStorage.getItem(LS.apiKey);
+            if (k) return k;
+            return localStorage.getItem(SPA_LS_APIKEY) || null;
+        },
+        saveKey(k)   { localStorage.setItem(LS.apiKey, k); },
+        clearKey()   { localStorage.removeItem(LS.apiKey); },
+        isPDAKey()   { return HAS_PDA_KEY; },
+    };
+
+    // ── HTTP ───────────────────────────────────────────────────
+    function _gmGet(url) {
+        return new Promise((resolve, reject) => {
+            GM_XHR({ method:"GET", url, timeout:25_000,
+                onload:   r => resolve({status:r.status, text:r.responseText}),
+                onerror:  () => reject(new Error("network_error")),
+                ontimeout:() => reject(new Error("timeout")),
+            });
+        });
+    }
+
+    async function httpGetJson(url) {
+        if (IS_PDA) {
+            const res = await PDA_httpGet(url);
+            if (res.status < 200 || res.status >= 300) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+            return JSON.parse(res.responseText);
+        }
+        if (GM_XHR) {
+            const res = await _gmGet(url);
+            if (res.status < 200 || res.status >= 300) { const e = new Error(`HTTP ${res.status}`); e.status = res.status; throw e; }
+            return JSON.parse(res.text);
+        }
+        // Timeout stays armed until the body is fully read
+        return new Promise((resolve, reject) => {
+            const tid = setTimeout(() => reject(new Error("timeout")), 25_000);
+            fetch(url)
+                .then(r => { if (!r.ok) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; } return r.json(); })
+                .then(d => { clearTimeout(tid); resolve(d); })
+                .catch(e => { clearTimeout(tid); reject(e); });
+        });
+    }
+
+    // ── Torn API ───────────────────────────────────────────────
+    class TornAPI {
+        constructor(key) { this.key = key; this._lastReq = 0; }
+        setKey(key) { this.key = key; }
+
+        async _rateLimit() { const w = API_DELAY_MS - (Date.now() - this._lastReq); if (w > 0) await sleep(w); this._lastReq = Date.now(); }
+
+        async _get(path, params = {}) {
+            await this._rateLimit();
+            const url = new URL(/^https?:\/\//.test(path) ? path : API_BASE + path);
+            for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+            if (!url.searchParams.has("key")) url.searchParams.set("key", this.key);
+            const data = await httpGetJson(url.toString());
+            if (data && data.error) { const e = new Error(data.error.error || "Torn API error"); e.tornCode = data.error.code; throw e; }
+            return data;
+        }
+
+        async _getV1(params) {
+            await this._rateLimit();
+            const url = new URL("https://api.torn.com/user/");
+            for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+            url.searchParams.set("key", this.key);
+            const data = await httpGetJson(url.toString());
+            if (data && data.error) { const e = new Error(data.error.error || "Torn API error"); e.tornCode = data.error.code; throw e; }
+            return data;
+        }
+
+        async validateKey() {
+            const data = await this._get("/user/profile");
+            return (data && data.profile) || (data && data.id ? data : null);
+        }
+
+        // v1 attacks — the API returns at most 100 (newest first), so page
+        // backwards with `to` until the window is covered. Requires Limited key.
+        async fetchAttacks(fromTs = 0) {
+            const from = fromTs > 0 ? fromTs : Math.floor(Date.now()/1000) - 90*86400;
+            const out = [];
+            let to = Math.floor(Date.now()/1000) + 60;
+            for (let page = 0; page < 6; page++) {
+                const data = await this._getV1({ selections:"attacks", from, to });
+                const batch = Object.values(data.attacks || {});
+                if (!batch.length) break;
+                let oldest = Infinity;
+                for (const a of batch) {
+                    out.push(a);
+                    const ts = a.timestamp_ended || a.timestamp_started || 0;
+                    if (ts && ts < oldest) oldest = ts;
+                }
+                if (batch.length < 100 || !Number.isFinite(oldest) || oldest <= from) break;
+                to = oldest - 1;
+            }
+            return out;
+        }
+
+        // v1 activity log — the only API source with exact per-event money
+        // (money_mugged, bounty payouts). Requires a Full Access key; callers
+        // must handle tornCode 16 gracefully. Paged like attacks.
+        async fetchLog(fromTs = 0) {
+            const from = fromTs > 0 ? fromTs : Math.floor(Date.now()/1000) - 90*86400;
+            const out = [];
+            let to = Math.floor(Date.now()/1000) + 60;
+            for (let page = 0; page < 10; page++) {
+                const data = await this._getV1({ selections:"log", from, to });
+                const entries = Object.entries(data.log || {});
+                if (!entries.length) break;
+                let oldest = Infinity;
+                for (const [id, e] of entries) {
+                    out.push({ logId: id, ...e });
+                    const ts = e.timestamp || 0;
+                    if (ts && ts < oldest) oldest = ts;
+                }
+                if (entries.length < 100 || !Number.isFinite(oldest) || oldest <= from) break;
+                to = oldest - 1;
+            }
+            return out;
+        }
+
+        // v1 personalstats — works with any key level
+        async fetchPersonalStats() {
+            try {
+                const data = await this._getV1({ selections:"personalstats" });
+                return data.personalstats || null;
+            } catch { return null; }
+        }
+    }
+
+    // ── Data Normalizers ───────────────────────────────────────
+    function normalizeAttack(a) {
+        return {
+            id:           a.id || a.code || null,
+            code:         a.code || null,
+            ts:           a.timestamp_ended || a.ended || a.timestamp || 0,
+            attackerId:   a.attacker?.id || a.attacker_id || null,
+            defenderId:   a.defender?.id || a.defender_id || null,
+            defenderName: a.defender?.name || a.defender_name || "",
+            result:       a.result || "",
+            respect:      Number(a.respect ?? a.respect_gain ?? 0) || 0,
+        };
+    }
+
+    // ── Event Processors ───────────────────────────────────────
+    // Attacks carry NO money in the Torn API — they only provide wins,
+    // respect, and defender names (used to label mug events from the log).
+    function processAttacks(rawAttacks, myUserId) {
+        const events = [], nameMap = new Map();
+        for (const raw of rawAttacks) {
+            const a = normalizeAttack(raw);
+            if (!a.ts) continue;
+            if (a.defenderId && a.defenderName) nameMap.set(Number(a.defenderId), a.defenderName);
+            if (myUserId && a.attackerId && Number(a.attackerId) !== Number(myUserId)) continue;
+            if (!WIN_RESULTS.has(a.result)) continue;
+            const uid = a.code || a.id || `${a.ts}_${a.defenderId}`;
+            const respStr = a.respect > 0 ? ` (+${a.respect.toFixed(2)} resp)` : "";
+            events.push({
+                id:     `atk_${uid}`,
+                type:   EVENT_TYPES.ATTACK,
+                amount: 0,
+                ts:     a.ts,
+                label:  `${a.result} — ${a.defenderName || "Player"}${respStr}`,
+                meta:   { targetId: a.defenderId, targetName: a.defenderName, respect: a.respect, result: a.result },
+            });
+        }
+        return { events, nameMap };
+    }
+
+    // Money comes from the activity log: mug entries carry data.money_mugged,
+    // bounty collections carry the payout. Parsed defensively by field/title
+    // so exact log type IDs don't matter.
+    function processLog(entries, nameMap) {
+        const events = [];
+        for (const e of entries) {
+            const ts = e.timestamp || 0;
+            if (!ts || !e.logId) continue;
+            const d     = (e.data && typeof e.data === "object") ? e.data : {};
+            const title = String(e.title || "");
+
+            const mug = Number(d.money_mugged || 0);
+            if (mug > 0) {
+                const tid  = d.defender || d.defender_id || null;
+                const name = (tid && nameMap.get(Number(tid))) || (tid ? `Player ${tid}` : "Player");
+                events.push({
+                    id:     `mug_${e.logId}`,
+                    type:   EVENT_TYPES.MUGGING,
+                    amount: Math.round(mug),
+                    ts,
+                    label:  `Mugged ${name}`,
+                    meta:   { targetId: tid, targetName: name, title },
+                });
+                continue;
+            }
+
+            if (/bounty/i.test(title) && /collect|reward/i.test(title) && !/place/i.test(title)) {
+                const amt = Number(d.money ?? d.money_gained ?? d.amount ?? 0);
+                if (amt > 0) {
+                    events.push({
+                        id:     `bnty_${e.logId}`,
+                        type:   EVENT_TYPES.BOUNTY,
+                        amount: Math.round(amt),
+                        ts,
+                        label:  title,
+                        meta:   { title },
+                    });
+                }
+            }
+        }
+        return events;
+    }
+
+    function mergeEvents(existing, incoming) {
+        const seen = new Set(existing.map(e => e.id));
+        const added = incoming.filter(e => e.id && !seen.has(e.id));
+        return [...existing, ...added].sort((a, b) => b.ts - a.ts);
+    }
+
+    function pruneEvents(events, settings) {
+        const cutoff = Math.floor(Date.now()/1000) - settings.retentionDays * 86400;
+        return events.filter(e => e.ts >= cutoff).slice(0, settings.maxEvents);
+    }
+
+    // ── Analytics ──────────────────────────────────────────────
+    function getRange(period) {
+        const now = Math.floor(Date.now()/1000);
+        switch (period) {
+            case "today": {
+                const d = new Date(); d.setHours(0,0,0,0);
+                return { from: Math.floor(d.getTime()/1000), to: now, label:"Today", days:1 };
+            }
+            case "week":   return { from: now - 7*86400,  to: now, label:"Last 7 Days",  days:7  };
+            case "month":  return { from: now - 30*86400, to: now, label:"Last 30 Days", days:30 };
+            case "3month": return { from: now - 90*86400, to: now, label:"Last 90 Days", days:90 };
+            default:       return { from: 0,              to: now, label:"All Time",     days:0  };
+        }
+    }
+
+    function filterByPeriod(events, period, settings) {
+        const { from, to } = getRange(period);
+        return events.filter(e => {
+            if (e.ts < from || e.ts > to) return false;
+            if (e.type === EVENT_TYPES.MUGGING && !settings.includeMuggings) return false;
+            if (e.type === EVENT_TYPES.BOUNTY  && !settings.includeBounties) return false;
+            if (e.type === EVENT_TYPES.ATTACK  && !settings.includeAttacks)  return false;
+            return true;
+        });
+    }
+
+    function groupByType(events) {
+        const g = {};
+        for (const e of events) {
+            if ((e.amount||0) <= 0) continue;
+            if (!g[e.type]) g[e.type] = { total:0, count:0 };
+            g[e.type].total += e.amount;
+            g[e.type].count++;
+        }
+        return g;
+    }
+
+    function groupByDay(events, days) {
+        const now = Math.floor(Date.now()/1000);
+        const buckets = Array.from({length: days}, (_, i) => {
+            const dayEnd   = now - i*86400;
+            const dayStart = dayEnd - 86400;
+            const dayEvts  = events.filter(e => e.ts >= dayStart && e.ts < dayEnd);
+            const total    = dayEvts.reduce((s,e) => s + (e.amount||0), 0);
+            const mid      = new Date((dayStart + 43200)*1000);
+            return {
+                label: mid.toLocaleDateString([], {month:"short", day:"numeric"}),
+                total, count: dayEvts.length,
+            };
+        }).reverse();
+        const hasValue = buckets.some(b => b.total > 0);
+        return buckets.map(b => ({ ...b, displayVal: hasValue ? b.total : b.count, isCounts: !hasValue }));
+    }
+
+    function groupByTarget(events) {
+        const t = {};
+        for (const e of events) {
+            if (!e.meta?.targetId || (e.amount||0) <= 0) continue;
+            const id = e.meta.targetId;
+            if (!t[id]) t[id] = { id, name: e.meta.targetName || `Player ${id}`, total:0, count:0 };
+            t[id].total += e.amount;
+            t[id].count++;
+        }
+        return Object.values(t).sort((a,b) => b.total - a.total);
+    }
+
+    function rankByCount(events) {
+        const t = {};
+        for (const e of events) {
+            if (!e.meta?.targetId) continue;
+            const id = e.meta.targetId;
+            if (!t[id]) t[id] = { id, name: e.meta.targetName || `Player ${id}`, total:0, count:0 };
+            t[id].total += e.amount || 0;
+            t[id].count++;
+        }
+        return Object.values(t).sort((a,b) => b.count - a.count);
+    }
+
+    function buildWeeklyComparison(events) {
+        const now   = Math.floor(Date.now()/1000);
+        const weeks = [];
+        for (let w = 0; w < 4; w++) {
+            const from  = now - (w+1)*7*86400;
+            const to    = now - w*7*86400;
+            const evts  = events.filter(e => e.ts >= from && e.ts < to);
+            const total = evts.reduce((s,e) => s + (e.amount||0), 0);
+            const lbl   = w === 0 ? "This Week" : w === 1 ? "Last Week" : `${w+1} Weeks Ago`;
+            weeks.push({ label: lbl, total, count: evts.length });
+        }
+        return weeks;
+    }
+
+    function computeSnapDelta(snaps, periodSec) {
+        if (snaps.length < 2) return null;
+        const now     = Math.floor(Date.now()/1000);
+        const recent  = snaps[snaps.length - 1];
+        const cutoff  = now - periodSec;
+        const earlier = [...snaps].reverse().find(s => s.ts <= cutoff);
+        if (!earlier) return null;
+        const delta = {};
+        for (const f of SNAP_FIELDS) {
+            if (recent[f] != null && earlier[f] != null) {
+                delta[f] = recent[f] - earlier[f];
+            }
+        }
+        return delta;
+    }
+
+    // ── CSS ────────────────────────────────────────────────────
+    function injectCSS() {
+        if (document.getElementById("ta-style")) return;
+        const s = document.createElement("style");
+        s.id = "ta-style";
+        s.textContent = `
+#ta-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.7)}
+#ta-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#1a1a1a;border:1px solid #444;border-radius:10px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#ddd;font-size:14px;width:680px;max-width:98vw;max-height:90vh;min-width:320px;flex-direction:column}
+#ta-panel.ta-open{display:flex}#ta-overlay.ta-open{display:block}
+#ta-panel *{box-sizing:border-box;color:inherit}
+#ta-panel ::-webkit-scrollbar{width:6px}#ta-panel ::-webkit-scrollbar-track{background:#1a1a1a}#ta-panel ::-webkit-scrollbar-thumb{background:#444;border-radius:3px}
+#ta-header{display:flex;align-items:center;gap:8px;padding:10px 16px;background:#222;border-bottom:1px solid #444;flex-shrink:0}
+#ta-header h2{margin:0;font-size:17px;color:#fff}
+.ta-ver{color:#666;font-size:11px;margin-left:4px}
+#ta-close{background:none;border:none;color:#999;font-size:22px;cursor:pointer;padding:2px 8px;margin-left:auto}#ta-close:hover{color:#fff}
+#ta-tabs{display:flex;background:#252525;border-bottom:1px solid #444;overflow-x:auto;flex-shrink:0}
+.ta-tab{padding:10px 16px;cursor:pointer;color:#999!important;border-bottom:2px solid transparent;white-space:nowrap;font-size:13px;transition:all .15s;background:none;border-top:none;border-left:none;border-right:none}.ta-tab:hover{color:#ccc!important;background:#2a2a2a}.ta-tab.active{color:#4fc3f7!important;border-bottom-color:#4fc3f7}
+#ta-body{padding:14px 16px;overflow-y:auto;flex:1;min-height:0}
+#ta-footer{display:flex;align-items:center;justify-content:space-between;padding:6px 14px;border-top:1px solid #2a2a2a;flex-shrink:0;font-size:11px;color:#666}
+.ta-btn{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;transition:background .15s}
+.ta-btn-primary{background:#1565c0;color:#fff}.ta-btn-primary:hover{background:#1976d2}
+.ta-btn-danger{background:#c62828;color:#fff}.ta-btn-danger:hover{background:#d32f2f}
+.ta-btn-muted{background:#2a2a2a;border:1px solid #444;color:#ccc}.ta-btn-muted:hover{background:#333}
+.ta-btn-sm{padding:3px 8px;font-size:11px}
+.ta-btn:disabled{opacity:.5;cursor:not-allowed}
+.ta-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}
+.ta-card{background:#242424;border-radius:6px;padding:10px 12px;border:1px solid #2e2e2e}
+.ta-card-lbl{font-size:10px;color:#777;text-transform:uppercase;letter-spacing:.5px}
+.ta-card-val{font-size:20px;font-weight:700;color:#4fc3f7;margin-top:2px}
+.ta-card-sub{font-size:11px;color:#666;margin-top:2px}
+.ta-period-row{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
+.ta-period-btn{padding:4px 10px;border-radius:12px;border:1px solid #3a3a3a;background:#242424;color:#888;font-size:11px;cursor:pointer;transition:all .15s}
+.ta-period-btn:hover{border-color:#555;color:#bbb}.ta-period-btn.active{background:#1565c0;border-color:#1976d2;color:#fff}
+.ta-notice{background:rgba(255,193,7,.08);border:1px solid rgba(255,193,7,.35);border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:11px;color:#fde68a;line-height:1.5}
+.ta-chart{margin-bottom:14px}
+.ta-chart-lbl{font-size:11px;color:#777;margin-bottom:6px}
+.ta-bars{display:flex;align-items:flex-end;gap:2px;height:72px}
+.ta-bar-col{flex:1;min-width:6px;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.ta-bar-fill{width:100%;background:#1565c0;border-radius:2px 2px 0 0;min-height:2px;cursor:default;transition:background .1s}
+.ta-bar-fill:hover{background:#42a5f5}.ta-bar-fill.ta-bar-zero{background:#2a2a2a;min-height:2px}
+.ta-chart-axis{display:flex;justify-content:space-between;font-size:9px;color:#555;margin-top:3px}
+.ta-section-hd{font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px;padding-bottom:4px;border-bottom:1px solid #252525}
+.ta-event-list{}
+.ta-event-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #242424;font-size:12px}
+.ta-event-row:last-child{border-bottom:none}
+.ta-event-icon{font-size:13px;flex-shrink:0;width:18px;text-align:center}
+.ta-event-lbl{flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ta-event-amt{font-weight:700;flex-shrink:0}.ta-event-amt.pos{color:#66bb6a}.ta-event-amt.zero{color:#666}
+.ta-event-time{font-size:10px;color:#555;flex-shrink:0}
+table.ta-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.ta-tbl th{text-align:left;padding:5px 8px;border-bottom:1px solid #333;font-size:10px;text-transform:uppercase;color:#666;position:sticky;top:0;background:#1a1a1a;white-space:nowrap}
+.ta-tbl td{padding:6px 8px;border-bottom:1px solid #252525;vertical-align:middle}
+.ta-tbl tr:hover td{background:#1f1f1f}
+.ta-tbl th.num,.ta-tbl td.num{text-align:right}
+.ta-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:3px;font-size:11px;font-weight:600}
+.ta-pbar-bg{background:#242424;border-radius:3px;height:5px;width:80px;overflow:hidden;display:inline-block}
+.ta-pbar-fill{height:100%;border-radius:3px}
+.ta-top-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:4px;margin-bottom:4px;background:#1f1f1f}
+.ta-top-rank{font-size:12px;font-weight:700;color:#555;width:22px;flex-shrink:0;text-align:center}
+.ta-top-lbl{flex:1;font-size:12px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ta-top-amt{font-size:13px;font-weight:700;color:#66bb6a;flex-shrink:0}
+.ta-top-meta{font-size:10px;color:#555;flex-shrink:0}
+.ta-cmp-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #242424;font-size:12px}
+.ta-cmp-lbl{width:110px;flex-shrink:0;color:#aaa}.ta-cmp-bar-wrap{flex:1}
+.ta-cmp-bar-bg{background:#242424;border-radius:3px;height:8px;overflow:hidden}
+.ta-cmp-bar-fill{height:100%;border-radius:3px;background:#1565c0;transition:width .3s}
+.ta-cmp-amt{width:80px;text-align:right;font-weight:700;color:#4fc3f7;flex-shrink:0}
+.ta-snap-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #252525;font-size:12px}
+.ta-snap-key{color:#999}.ta-snap-val{color:#ccc;font-weight:600}
+.ta-field{margin-bottom:10px}
+.ta-field label{display:block;font-size:11px;color:#888;margin-bottom:3px}
+.ta-input{width:100%;padding:6px 8px;background:#242424;border:1px solid #3a3a3a;border-radius:4px;color:#ddd;font-size:13px}
+.ta-input:focus{border-color:#4fc3f7;outline:none}
+.ta-check-row{display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer}
+.ta-check-row input{accent-color:#4fc3f7;width:14px;height:14px}
+.ta-check-row label{font-size:12px;color:#ccc;cursor:pointer}
+.ta-key-row{display:flex;gap:6px}.ta-key-row .ta-input{flex:1}
+.ta-settings-hd{font-size:13px;font-weight:700;color:#aaa;margin:14px 0 8px}
+.ta-save-status{font-size:11px;margin-top:6px;min-height:1em}
+.ta-save-ok{color:#66bb6a}.ta-save-err{color:#ef5350}.ta-save-info{color:#aaa}
+.ta-empty{text-align:center;padding:24px 8px;color:#666;font-size:13px}
+.ta-empty-icon{font-size:26px;margin-bottom:6px}
+.ta-link{color:#4fc3f7!important;text-decoration:none}.ta-link:hover{text-decoration:underline}
+@media(max-width:768px){#ta-panel{width:100vw!important;max-width:100vw;min-width:0;border-radius:0;top:0;left:0;transform:none;max-height:100vh;height:100vh}.ta-cards{grid-template-columns:1fr 1fr}}
+`;
+        document.head.appendChild(s);
+    }
+
+    // ── UI ─────────────────────────────────────────────────────
+    class AnalyticsUI {
+        constructor() {
+            this._panel      = null;
+            this._overlay    = null;
+            this.tab         = "overview";
+            this.period      = "week";
+            this.settings    = loadSettings();
+            this.syncing     = false;
+            this.lastSync    = 0;
+            this.lastErr     = null;
+            this.myId        = parseInt(localStorage.getItem(LS.myId) || "0", 10) || null;
+            this._ticker     = null;
+            this._syncTmr    = null;
+            this.syncReport  = null;
+            this.cachedStats = loadStatsCache(); // survives page reloads
+            this.access      = loadAccess();     // which API selections this key can read
+        }
+
+        init() { injectCSS(); }
+
+        toggle(open) {
+            const isOpen = open != null ? open : !(this._panel && this._panel.classList.contains("ta-open"));
+            if (isOpen) this._open(); else this._close();
+        }
+
+        _open() {
+            injectCSS();
+            if (!this._panel) this._build();
+            this._panel.classList.add("ta-open");
+            this._overlay.classList.add("ta-open");
+            this._renderBody();
+            this._startTicker();
+            // Auto-sync on open if stale
+            const key = KeyResolver.resolveTornKey();
+            if (key && (Date.now() - this.lastSync) > this.settings.refreshSec * 1000) {
+                this.syncData();
+            }
+        }
+
+        _close() {
+            if (this._panel)   this._panel.classList.remove("ta-open");
+            if (this._overlay) this._overlay.classList.remove("ta-open");
+            this._stopTicker();
+        }
+
+        _build() {
+            const overlay = document.createElement("div");
+            overlay.id = "ta-overlay";
+            overlay.addEventListener("click", () => this._close());
+            document.body.appendChild(overlay);
+            this._overlay = overlay;
+
+            const panel = document.createElement("div");
+            panel.id = "ta-panel";
+            panel.innerHTML = `
+                <div id="ta-header">
+                    <h2>📊 Profit Analytics <span class="ta-ver">v${VERSION}</span></h2>
+                    <button id="ta-close" title="Close">✕</button>
+                </div>
+                <div id="ta-tabs">
+                    <button class="ta-tab active" data-tab="overview">Overview</button>
+                    <button class="ta-tab" data-tab="sources">By Source</button>
+                    <button class="ta-tab" data-tab="top">Top Events</button>
+                    <button class="ta-tab" data-tab="trends">Trends</button>
+                    <button class="ta-tab" data-tab="settings">Settings</button>
+                </div>
+                <div id="ta-body"></div>
+                <div id="ta-footer">
+                    <span id="ta-status-txt">—</span>
+                    <button class="ta-btn ta-btn-primary ta-btn-sm" id="ta-sync-btn">⟳ Sync</button>
+                </div>`;
+            document.body.appendChild(panel);
+            this._panel = panel;
+
+            panel.querySelector("#ta-close").addEventListener("click", () => this._close());
+            panel.querySelectorAll(".ta-tab").forEach(t =>
+                t.addEventListener("click", () => { this.tab = t.dataset.tab; this._syncTabs(); this._renderBody(); })
+            );
+            panel.querySelector("#ta-sync-btn").addEventListener("click", () => this.syncData());
+        }
+
+        _syncTabs() {
+            this._panel.querySelectorAll(".ta-tab").forEach(t =>
+                t.classList.toggle("active", t.dataset.tab === this.tab)
+            );
+        }
+
+        _startTicker() {
+            if (this._ticker) return;
+            this._ticker = setInterval(() => this._tickFooter(), 5000);
+        }
+        _stopTicker() { if (this._ticker) { clearInterval(this._ticker); this._ticker = null; } }
+
+        _tickFooter() {
+            const el = this._panel && this._panel.querySelector("#ta-status-txt");
+            if (!el) return;
+            if (this.syncing) { el.textContent = "⟳ Syncing…"; return; }
+            if (this.lastErr) { el.textContent = `❌ ${this.lastErr}`; return; }
+            if (this.lastSync > 0) {
+                const events = loadEvents();
+                const r = this.syncReport;
+                const detail = r ? ` · +${r.mugs} mug${r.mugs===1?"":"s"}, +${r.bounties} bount${r.bounties===1?"y":"ies"}` : "";
+                el.textContent = `${events.length} events · synced ${fmt.relTime(Math.floor(this.lastSync/1000))}${detail}`;
+            } else {
+                el.textContent = "No data yet — click ⟳ Sync";
+            }
+        }
+
+        _renderBody() {
+            const body = this._panel && this._panel.querySelector("#ta-body");
+            if (!body) return;
+            const key = KeyResolver.resolveTornKey();
+            if (!key) { body.innerHTML = this._authHTML(); this._wireAuth(body); this._tickFooter(); return; }
+            switch (this.tab) {
+                case "overview": body.innerHTML = this._overviewHTML(); this._wirePeriod(body); break;
+                case "sources":  body.innerHTML = this._sourcesHTML(); this._wirePeriod(body); break;
+                case "top":      body.innerHTML = this._topHTML();     this._wirePeriod(body); break;
+                case "trends":   body.innerHTML = this._trendsHTML();  break;
+                case "settings": body.innerHTML = this._settingsHTML(); this._wireSettings(body); break;
+            }
+            this._tickFooter();
+        }
+
+        // ── Auth ──────────────────────────────────────────────
+        _authHTML() {
+            return `<div style="padding:8px 0">
+                <div style="font-size:14px;font-weight:700;margin-bottom:10px">API Key Required</div>
+                <div class="ta-field">
+                    <label>Torn API Key (16 characters)</label>
+                    <div class="ta-key-row">
+                        <input type="text" class="ta-input" id="ta-auth-inp" maxlength="16" placeholder="Paste your key here" autocomplete="off" data-lpignore="true" />
+                        <button class="ta-btn ta-btn-primary" id="ta-auth-save">Save</button>
+                    </div>
+                    <div id="ta-auth-msg" class="ta-save-status"></div>
+                </div>
+                <p style="font-size:11px;color:#666;margin-top:6px">
+                    Get your key at <a class="ta-link" href="https://www.torn.com/preferences.php#tab=api" target="_blank">Torn → Preferences → API Key</a>.
+                </p>
+                <p style="font-size:11px;color:#888;margin-top:8px;line-height:1.5">
+                    <b>Key access levels:</b> a <b>Full Access</b> key is recommended — it unlocks exact per-mug money
+                    from your activity log. A Limited key tracks attack wins only; a Public key falls back to
+                    approximate money from hourly stat snapshots.
+                </p>
+            </div>`;
+        }
+
+        _wireAuth(body) {
+            const inp = body.querySelector("#ta-auth-inp");
+            const btn = body.querySelector("#ta-auth-save");
+            const msg = body.querySelector("#ta-auth-msg");
+            const save = async () => {
+                const k = inp.value.trim();
+                if (!/^[A-Za-z0-9]{16}$/.test(k)) { msg.className = "ta-save-status ta-save-err"; msg.textContent = "Must be exactly 16 alphanumeric characters."; return; }
+                btn.disabled = true;
+                msg.className = "ta-save-status ta-save-info"; msg.textContent = "Validating…";
+                try {
+                    const api  = new TornAPI(k);
+                    const prof = await api.validateKey();
+                    if (!prof) throw new Error("Key rejected or insufficient access.");
+                    KeyResolver.saveKey(k);
+                    this.myId = prof.id || prof.player_id;
+                    try { localStorage.setItem(LS.myId, String(this.myId)); } catch {}
+                    // New key — reset access flags so sync re-probes what it can read
+                    this.access = { attacks:true, log:true };
+                    saveAccess(this.access);
+                    msg.className = "ta-save-status ta-save-ok";
+                    msg.textContent = `✓ Valid — ${prof.name || "Player"} [${this.myId}]`;
+                    setTimeout(() => { this._renderBody(); this.syncData(); }, 1200);
+                } catch (e) {
+                    msg.className = "ta-save-status ta-save-err"; msg.textContent = e.message || "Validation failed.";
+                } finally { btn.disabled = false; }
+            };
+            btn.addEventListener("click", save);
+            inp.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+        }
+
+        // ── Period selector ───────────────────────────────────
+        _periodRow() {
+            const periods = [
+                {id:"today",label:"Today"},{id:"week",label:"7 Days"},
+                {id:"month",label:"30 Days"},{id:"3month",label:"90 Days"},{id:"all",label:"All Time"},
+            ];
+            return `<div class="ta-period-row">${periods.map(p =>
+                `<button class="ta-period-btn${p.id===this.period?" active":""}" data-period="${p.id}">${p.label}</button>`
+            ).join("")}</div>`;
+        }
+
+        _wirePeriod(container) {
+            container.querySelectorAll(".ta-period-btn").forEach(btn =>
+                btn.addEventListener("click", () => { this.period = btn.dataset.period; this._renderBody(); })
+            );
+        }
+
+        _events() { return filterByPeriod(loadEvents(), this.period, this.settings); }
+
+        // Delta of a personalstats field since a timestamp, using the snapshot
+        // taken closest before that time. Fallback when the log isn't readable.
+        _snapDeltaSince(fromTs, field) {
+            const s = this.cachedStats;
+            if (!s || s[field] == null || !fromTs) return null;
+            const snaps = loadSnapshots();
+            const base = [...snaps].reverse().find(x => x.ts <= fromTs && x[field] != null);
+            if (!base) return null;
+            return s[field] - base[field];
+        }
+
+        // ── Overview ──────────────────────────────────────────
+        _overviewHTML() {
+            const range  = getRange(this.period);
+            const events = this._events();
+            const s      = this.cachedStats;
+
+            if (!s && loadEvents().length === 0) {
+                return `${this._periodRow()}<div class="ta-empty"><div class="ta-empty-icon">📊</div>No data yet.<br>Click ⟳ Sync to load your stats.</div>`;
+            }
+
+            const mugs    = events.filter(e => e.type === EVENT_TYPES.MUGGING);
+            const bnts    = events.filter(e => e.type === EVENT_TYPES.BOUNTY);
+            const atks    = events.filter(e => e.type === EVENT_TYPES.ATTACK);
+            const mugTot  = mugs.reduce((t,e) => t + e.amount, 0);
+            const bntTot  = bnts.reduce((t,e) => t + e.amount, 0);
+            const respect = atks.reduce((t,e) => t + (e.meta?.respect || 0), 0);
+            const best    = Math.max(0, ...mugs.map(e => e.amount), ...bnts.map(e => e.amount));
+
+            let notice = "";
+            if (!this.access.log) {
+                notice = `<div class="ta-notice">⚠️ Your API key can't read the activity log (needs a <b>Full Access</b> key), so exact per-mug money isn't available. Money below is estimated from hourly stat snapshots — paste a Full Access key in Settings for precise per-event tracking.</div>`;
+            } else if (!this.access.attacks) {
+                notice = `<div class="ta-notice">⚠️ Your API key can't read attack history (needs a <b>Limited</b> key or higher) — attack wins and respect are unavailable.</div>`;
+            }
+
+            // Money cards: exact from log events, or snapshot-delta estimate
+            let mugVal = fmt.money(mugTot), mugSub = `${mugs.length} mug${mugs.length===1?"":"s"}`;
+            let bntVal = fmt.money(bntTot), bntSub = `${bnts.length} bount${bnts.length===1?"y":"ies"} collected`;
+            if (!this.access.log) {
+                if (this.period === "all") {
+                    mugVal = s && s.moneymugged != null ? fmt.money(s.moneymugged) : "—";
+                    mugSub = "lifetime (personal stats)";
+                } else {
+                    const d = this._snapDeltaSince(range.from, "moneymugged");
+                    mugVal = d == null ? "—" : "≈ " + fmt.money(d);
+                    mugSub = d == null ? "need snapshots spanning this period" : "estimated from stat snapshots";
+                }
+                bntVal = "—"; bntSub = "needs Full Access key";
+            }
+
+            const cardsHTML = `<div class="ta-cards">
+                <div class="ta-card">
+                    <div class="ta-card-lbl">💰 Mugged — ${escHtml(range.label)}</div>
+                    <div class="ta-card-val">${escHtml(mugVal)}</div>
+                    <div class="ta-card-sub">${escHtml(mugSub)}</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">🎯 Bounties — ${escHtml(range.label)}</div>
+                    <div class="ta-card-val">${escHtml(bntVal)}</div>
+                    <div class="ta-card-sub">${escHtml(bntSub)}</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">⚔️ Attack Wins — ${escHtml(range.label)}</div>
+                    <div class="ta-card-val">${atks.length.toLocaleString()}</div>
+                    <div class="ta-card-sub">${respect.toFixed(2)} respect</div>
+                </div>
+                <div class="ta-card">
+                    <div class="ta-card-lbl">🏆 Best Single Hit</div>
+                    <div class="ta-card-val">${escHtml(best > 0 ? fmt.money(best) : "—")}</div>
+                    <div class="ta-card-sub">${escHtml(range.label)}</div>
+                </div>
+            </div>`;
+
+            // Lifetime tiles from personalstats
+            let lifeHTML = "";
+            if (s) {
+                const xtra = [
+                    ["Mugged (lifetime)", s.moneymugged  != null ? fmt.money(s.moneymugged)      : null],
+                    ["Networth",          s.networth     != null ? fmt.money(s.networth)         : null],
+                    ["Attacks Won",       s.attackswon   != null ? s.attackswon.toLocaleString() : null],
+                    ["Bazaar Profit",     s.bazaarprofit != null ? fmt.money(s.bazaarprofit)     : null],
+                ].filter(([, v]) => v != null);
+                if (xtra.length) {
+                    lifeHTML = `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                        ${xtra.map(([k, v]) => `<div style="flex:1;min-width:90px;background:#1f1f1f;border-radius:5px;padding:6px 10px;border:1px solid #2a2a2a">
+                            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.5px">${escHtml(k)}</div>
+                            <div style="font-size:14px;font-weight:700;color:#bbb;margin-top:2px">${escHtml(v)}</div>
+                        </div>`).join("")}
+                    </div>`;
+                }
+            }
+
+            const { days } = range;
+            const chartDays   = days <= 1 ? 7 : Math.min(days, 30);
+            const chartPeriod = chartDays <= 7 ? "week" : "month";
+            const chart  = this._barChart(filterByPeriod(loadEvents(), chartPeriod, this.settings), chartDays);
+            const recent = loadEvents().filter(e => (e.amount||0) > 0).slice(0, 12);
+
+            const topMugged = groupByTarget(loadEvents().filter(e => e.type === EVENT_TYPES.MUGGING)).slice(0, 10);
+            const mugRankHTML = topMugged.length > 0
+                ? `<div class="ta-section-hd">Top Mugged Targets</div>
+                    <div class="ta-event-list">${topMugged.map((t, i) => `<div class="ta-event-row">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
+                        <div class="ta-event-amt pos">${escHtml(fmt.money(t.total))}</div>
+                        <div class="ta-event-time">${t.count}×</div>
+                    </div>`).join("")}</div>`
+                : "";
+
+            return `${this._periodRow()}${notice}${cardsHTML}${lifeHTML}
+                <div class="ta-section-hd">Money per Day</div>
+                ${chart}
+                ${mugRankHTML}
+                <div class="ta-section-hd">Recent Money Events</div>
+                ${this._eventListHTML(recent)}`;
+        }
+
+        _barChart(events, days) {
+            const buckets  = groupByDay(events, days);
+            const isCounts = buckets.some(b => b.isCounts);
+            const maxVal   = Math.max(...buckets.map(b => b.displayVal), 1);
+            const bars     = buckets.map(b => {
+                const h   = Math.max(2, Math.round((b.displayVal / maxVal) * 100));
+                const tip = isCounts
+                    ? `${b.label}: ${b.count} event${b.count===1?"":"s"}`
+                    : `${b.label}: ${fmt.money(b.total)} (${b.count} events)`;
+                return `<div class="ta-bar-col" title="${escHtml(tip)}">
+                    <div class="ta-bar-fill${b.displayVal===0?" ta-bar-zero":""}" style="height:${h}%"></div>
+                </div>`;
+            }).join("");
+            const lbl = isCounts ? `<div class="ta-chart-lbl">Activity per day (events — no money recorded yet)</div>` : "";
+            return `<div class="ta-chart">
+                ${lbl}
+                <div class="ta-bars">${bars}</div>
+                <div class="ta-chart-axis">
+                    <span>${escHtml(buckets[0]?.label||"")}</span>
+                    <span>Today</span>
+                </div>
+            </div>`;
+        }
+
+        _eventListHTML(events) {
+            if (events.length === 0) return `<div class="ta-empty"><div class="ta-empty-icon">📭</div>No money events recorded yet.<br>${this.access.log ? "Click ⟳ Sync to fetch data." : "A Full Access API key is required for per-event money tracking."}</div>`;
+            return `<div class="ta-event-list">${events.map(e => {
+                const tc   = TYPE_CONFIG[e.type] || {icon:"•"};
+                const pos  = (e.amount||0) > 0;
+                const amtS = pos ? "+" + fmt.money(e.amount)
+                           : e.type === EVENT_TYPES.ATTACK ? (+(e.meta?.respect||0)).toFixed(2) + " resp"
+                           : fmt.money(0);
+                return `<div class="ta-event-row">
+                    <div class="ta-event-icon">${tc.icon}</div>
+                    <div class="ta-event-lbl" title="${escHtml(e.label)}">${escHtml(e.label)}</div>
+                    <div class="ta-event-amt ${pos?"pos":"zero"}">${escHtml(amtS)}</div>
+                    <div class="ta-event-time">${fmt.relTime(e.ts)}</div>
+                </div>`;
+            }).join("")}</div>`;
+        }
+
+        // ── Sources ───────────────────────────────────────────
+        _sourcesHTML() {
+            const events   = this._events().filter(e => (e.amount||0) > 0);
+            const groups   = groupByType(events);
+            const grandTot = events.reduce((t,e) => t + e.amount, 0);
+
+            if (Object.keys(groups).length === 0) {
+                const s = this.cachedStats;
+                if (s) {
+                    const rows = [
+                        { icon:"💰", label:"Muggings",      val: fmt.money(s.moneymugged ?? 0),                  sub: "lifetime total" },
+                        { icon:"⚔️",  label:"Attacks",       val: `${(s.attackswon ?? 0).toLocaleString()} wins`, sub: `${(s.attackslost ?? 0).toLocaleString()} losses` },
+                        { icon:"🛒", label:"Bazaar Profit",  val: fmt.money(s.bazaarprofit ?? 0),                 sub: `${(s.bazaarsales ?? 0).toLocaleString()} items sold` },
+                    ];
+                    return `${this._periodRow()}
+                        <div style="font-size:11px;color:#555;margin-bottom:12px">No per-event money in this period — showing lifetime totals from your personal stats.${this.access.log ? "" : " (A Full Access key unlocks per-event tracking.)"}</div>
+                        <div style="display:flex;flex-direction:column;gap:8px">
+                            ${rows.map(r => `<div style="display:flex;align-items:center;gap:12px;background:#1f1f1f;border-radius:6px;padding:10px 14px;border:1px solid #2a2a2a">
+                                <div style="font-size:22px;flex-shrink:0">${r.icon}</div>
+                                <div style="flex:1">
+                                    <div style="font-size:13px;font-weight:700;color:#ccc">${escHtml(r.label)}</div>
+                                    <div style="font-size:10px;color:#555;margin-top:2px">${escHtml(r.sub)}</div>
+                                </div>
+                                <div style="font-size:16px;font-weight:700;color:#4fc3f7">${escHtml(r.val)}</div>
+                            </div>`).join("")}
+                        </div>`;
+                }
+                return `${this._periodRow()}<div class="ta-empty"><div class="ta-empty-icon">📊</div>No data yet. Click ⟳ Sync to load your stats.</div>`;
+            }
+
+            const rows = Object.entries(groups)
+                .sort((a,b) => b[1].total - a[1].total)
+                .map(([type, g]) => {
+                    const tc  = TYPE_CONFIG[type] || {icon:"•", label:type, color:"#888"};
+                    const pct = grandTot > 0 ? g.total/grandTot*100 : 0;
+                    const avg = g.count > 0 ? g.total/g.count : 0;
+                    return `<tr>
+                        <td><span class="ta-badge" style="background:${tc.color}1a;color:${tc.color}">${tc.icon} ${tc.label}</span></td>
+                        <td class="num" style="color:#aaa">${g.count}</td>
+                        <td class="num" style="color:#66bb6a;font-weight:700">${escHtml(fmt.money(g.total))}</td>
+                        <td>
+                            <span class="ta-pbar-bg"><span class="ta-pbar-fill" style="width:${pct.toFixed(1)}%;background:${tc.color};display:block;height:100%;border-radius:3px"></span></span>
+                            <span style="font-size:10px;color:#777;margin-left:5px">${fmt.pct(pct)}</span>
+                        </td>
+                        <td class="num" style="color:#888">${escHtml(fmt.money(avg))}</td>
+                    </tr>`;
+                }).join("");
+
+            return `${this._periodRow()}
+                <table class="ta-tbl">
+                    <thead><tr>
+                        <th>Source</th><th class="num">Events</th>
+                        <th class="num">Total Profit</th><th>Share</th>
+                        <th class="num">Avg / Event</th>
+                    </tr></thead>
+                    <tbody>${rows}</tbody>
+                    <tfoot>
+                        <tr style="border-top:1px solid #333">
+                            <td style="color:#777;font-weight:700;font-size:11px">TOTAL</td>
+                            <td class="num" style="color:#777">${events.length}</td>
+                            <td class="num" style="color:#4fc3f7;font-weight:700">${escHtml(fmt.money(grandTot))}</td>
+                            <td></td>
+                            <td class="num" style="color:#777">${escHtml(fmt.money(grandTot/(events.length||1)))}</td>
+                        </tr>
+                    </tfoot>
+                </table>`;
+        }
+
+        // ── Top Events ────────────────────────────────────────
+        _topHTML() {
+            const events      = this._events().filter(e => (e.amount||0) > 0);
+            const topEvents   = [...events].sort((a,b) => b.amount - a.amount).slice(0, 15);
+            const topTargets  = groupByTarget(this._events()).slice(0, 10);
+
+            const evtHTML = topEvents.length === 0
+                ? `<div class="ta-empty"><div class="ta-empty-icon">🏆</div>No money events yet for this period.</div>`
+                : topEvents.map((e, i) => {
+                    const tc = TYPE_CONFIG[e.type] || {icon:"•"};
+                    return `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">${tc.icon}</div>
+                        <div class="ta-top-lbl" title="${escHtml(e.label)}">${escHtml(e.label)}</div>
+                        <div class="ta-top-amt">${escHtml(fmt.money(e.amount))}</div>
+                        <div class="ta-top-meta">${fmt.relTime(e.ts)}</div>
+                    </div>`;
+                }).join("");
+
+            const tgtHTML = topTargets.length > 0
+                ? topTargets.map((t, i) =>
+                    `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">💰</div>
+                        <div class="ta-top-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
+                        <div class="ta-top-amt">${escHtml(fmt.money(t.total))}</div>
+                        <div class="ta-top-meta">${t.count} hit${t.count===1?"":"s"}</div>
+                    </div>`).join("")
+                : "";
+
+            const atkEvents = this._events().filter(e => e.type === EVENT_TYPES.ATTACK);
+            const topAtkTargets = rankByCount(atkEvents).slice(0, 10);
+            const atkTgtHTML = topAtkTargets.length > 0
+                ? topAtkTargets.map((t, i) =>
+                    `<div class="ta-top-item">
+                        <div class="ta-top-rank">#${i+1}</div>
+                        <div class="ta-event-icon">⚔️</div>
+                        <div class="ta-top-lbl"><a class="ta-link" href="https://www.torn.com/profiles.php?XID=${t.id}" target="_blank" rel="noopener">${escHtml(t.name)}</a></div>
+                        <div class="ta-top-amt" style="color:#4fc3f7">${t.count} win${t.count===1?"":"s"}</div>
+                        <div class="ta-top-meta">${t.total > 0 ? escHtml(fmt.money(t.total)) : "—"}</div>
+                    </div>`).join("")
+                : `<div style="padding:6px;color:#666;font-size:12px">${this.access.attacks ? "No attack data — click ⟳ Sync to fetch." : "Attack history needs a Limited key or higher."}</div>`;
+
+            return `${this._periodRow()}
+                <div class="ta-section-hd">Top Individual Events</div>
+                ${evtHTML}
+                ${tgtHTML ? `<div class="ta-section-hd">Most Profitable Targets</div>${tgtHTML}` : ""}
+                <div class="ta-section-hd">Most Attacked Targets</div>
+                ${atkTgtHTML}`;
+        }
+
+        // ── Trends ────────────────────────────────────────────
+        _trendsHTML() {
+            const allEvts = loadEvents().filter(e =>
+                (this.settings.includeMuggings && e.type===EVENT_TYPES.MUGGING ||
+                 this.settings.includeBounties && e.type===EVENT_TYPES.BOUNTY  ||
+                 this.settings.includeAttacks  && e.type===EVENT_TYPES.ATTACK));
+
+            const weeks        = buildWeeklyComparison(allEvts);
+            const hasWeekMoney = weeks.some(w => w.total > 0);
+            const maxWeek      = Math.max(...weeks.map(w => hasWeekMoney ? w.total : w.count), 1);
+            const weekRows = weeks.map(w => {
+                const barVal = hasWeekMoney ? w.total : w.count;
+                const dispAmt = hasWeekMoney ? fmt.money(w.total) : `${w.count} events`;
+                return `<div class="ta-cmp-row">
+                    <div class="ta-cmp-lbl">${escHtml(w.label)}</div>
+                    <div class="ta-cmp-bar-wrap">
+                        <div class="ta-cmp-bar-bg">
+                            <div class="ta-cmp-bar-fill" style="width:${(barVal/maxWeek*100).toFixed(1)}%"></div>
+                        </div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${w.count} event${w.count===1?"":"s"}</div>
+                    </div>
+                    <div class="ta-cmp-amt">${escHtml(dispAmt)}</div>
+                </div>`;
+            }).join("");
+
+            // Monthly bars (last 6 months)
+            const now = Math.floor(Date.now()/1000);
+            const months = Array.from({length:6}, (_,i) => {
+                const to   = now - i*30*86400;
+                const from = to - 30*86400;
+                const evts = allEvts.filter(e => e.ts >= from && e.ts < to);
+                const tot  = evts.reduce((s,e) => s + (e.amount||0), 0);
+                const d    = new Date((from + 15*86400)*1000);
+                return { label: d.toLocaleDateString([], {month:"short", year:"2-digit"}), total: tot, count: evts.length };
+            }).reverse();
+            const hasMoMoney = months.some(m => m.total > 0);
+            const maxMo      = Math.max(...months.map(m => hasMoMoney ? m.total : m.count), 1);
+            const moRows = months.map(m => {
+                const barVal  = hasMoMoney ? m.total : m.count;
+                const dispAmt = hasMoMoney ? fmt.money(m.total) : `${m.count} events`;
+                return `<div class="ta-cmp-row">
+                    <div class="ta-cmp-lbl">${escHtml(m.label)}</div>
+                    <div class="ta-cmp-bar-wrap">
+                        <div class="ta-cmp-bar-bg">
+                            <div class="ta-cmp-bar-fill" style="width:${(barVal/maxMo*100).toFixed(1)}%"></div>
+                        </div>
+                        <div style="font-size:10px;color:#555;margin-top:1px">${m.count} event${m.count===1?"":"s"}</div>
+                    </div>
+                    <div class="ta-cmp-amt">${escHtml(dispAmt)}</div>
+                </div>`;
+            }).join("");
+
+            const snaps   = loadSnapshots();
+            const delta7  = computeSnapDelta(snaps, 7*86400);
+            const delta30 = computeSnapDelta(snaps, 30*86400);
+
+            const snapField = (label, key, d7, d30, money) => {
+                const v7  = d7  && d7[key]  != null ? d7[key]  : null;
+                const v30 = d30 && d30[key] != null ? d30[key] : null;
+                if (v7 == null && v30 == null) return "";
+                const fmtN = (n) => n == null ? "—" : (money ? fmt.money(n) : n.toLocaleString());
+                return `<div class="ta-snap-row">
+                    <div class="ta-snap-key">${escHtml(label)}</div>
+                    <div style="display:flex;gap:16px">
+                        <div class="ta-snap-val" title="7-day change">${escHtml(fmtN(v7))} <span style="color:#555;font-size:10px">7d</span></div>
+                        <div class="ta-snap-val" title="30-day change">${escHtml(fmtN(v30))} <span style="color:#555;font-size:10px">30d</span></div>
+                    </div>
+                </div>`;
+            };
+
+            const s = this.cachedStats;
+            let snapHTML;
+            if (s && snaps.length >= 1) {
+                const first    = snaps[0];
+                const since    = fmt.date(first.ts);
+                const dSince   = (key, money) => {
+                    if (first[key] == null || s[key] == null) return "—";
+                    const v = s[key] - first[key];
+                    return (v >= 0 ? "+" : "") + (money ? fmt.money(v) : v.toLocaleString());
+                };
+                const sinceRows = [
+                    ["Money Mugged",    "moneymugged",  true],
+                    ["Bazaar Profit",   "bazaarprofit", true],
+                    ["Networth Change", "networth",     true],
+                    ["Attacks Won",     "attackswon",   false],
+                    ["Items Sold",      "bazaarsales",  false],
+                    ["Nerve Refills",   "nerverefills", false],
+                ].map(([lbl, key, money]) => `<div class="ta-snap-row">
+                    <div class="ta-snap-key">${escHtml(lbl)}</div>
+                    <div class="ta-snap-val">${escHtml(dSince(key, money))}</div>
+                </div>`).join("");
+
+                const recentDeltaRows = snaps.length >= 2 ? [
+                    ["Money Mugged",  "moneymugged",  true],
+                    ["Bazaar Profit", "bazaarprofit", true],
+                    ["Networth",      "networth",     true],
+                    ["Attacks Won",   "attackswon",   false],
+                ].map(([lbl, key, money]) => snapField(lbl, key, delta7, delta30, money)).join("") : "";
+
+                snapHTML = `<div class="ta-section-hd">Changes Since ${escHtml(since)}</div>
+                    <div style="font-size:10px;color:#555;margin-bottom:8px">${snaps.length} snapshot${snaps.length===1?"":"s"} · tracking started ${escHtml(since)}</div>
+                    ${sinceRows}
+                    ${snaps.length >= 2 ? `<div class="ta-section-hd" style="margin-top:8px">Recent Deltas <span style="font-weight:400;text-transform:none;font-size:10px">(7d · 30d)</span></div>${recentDeltaRows}` : ""}`;
+            } else {
+                snapHTML = `<div class="ta-section-hd">Personal Stats Deltas</div>
+                    <div style="font-size:11px;color:#666;padding:8px 0">Click ⟳ Sync to start tracking stat changes over time.</div>`;
+            }
+
+            return `<div class="ta-section-hd">Weekly Comparison</div>
+                ${weekRows}
+                <div class="ta-section-hd">Monthly Comparison (6 months)</div>
+                ${moRows}
+                ${snapHTML}`;
+        }
+
+        // ── Settings ──────────────────────────────────────────
+        _settingsHTML() {
+            const s   = this.settings;
+            const key = !KeyResolver.isPDAKey() ? (KeyResolver.resolveTornKey() || "") : "";
+            const pdaNote = KeyResolver.isPDAKey() ? `<div class="ta-save-status ta-save-ok">✓ API key provided by Torn PDA</div>` : "";
+            const accessNote = `<div style="font-size:11px;color:#888;margin-top:4px;line-height:1.5">
+                Log access (exact mug money): <b style="color:${this.access.log?"#66bb6a":"#ef5350"}">${this.access.log?"OK":"unavailable"}</b> ·
+                Attacks access (wins/respect): <b style="color:${this.access.attacks?"#66bb6a":"#ef5350"}">${this.access.attacks?"OK":"unavailable"}</b><br>
+                A <b>Full Access</b> key unlocks everything; Limited adds attacks; Public gives stat snapshots only.
+            </div>`;
+
+            return `
+                <div class="ta-settings-hd">🔑 API Key</div>
+                ${pdaNote}
+                ${!KeyResolver.isPDAKey() ? `
+                <div class="ta-field">
+                    <label>Torn API Key</label>
+                    <div class="ta-key-row">
+                        <input type="text" class="ta-input" id="ta-s-key" value="${escHtml(key)}" maxlength="16" autocomplete="off" data-lpignore="true" />
+                        <button class="ta-btn ta-btn-primary ta-btn-sm" id="ta-s-key-save">Save</button>
+                    </div>
+                    <div id="ta-s-key-msg" class="ta-save-status"></div>
+                </div>` : ""}
+                ${accessNote}
+
+                <div class="ta-settings-hd">📊 Track Sources</div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-mug"  ${s.includeMuggings?"checked":""} />
+                    <label for="ta-s-mug">💰 <strong>Muggings</strong> — money stolen from attacks (from activity log)</label>
+                </div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-bty"  ${s.includeBounties?"checked":""} />
+                    <label for="ta-s-bty">🎯 <strong>Bounties</strong> — payouts collected for killing bounty targets</label>
+                </div>
+                <div class="ta-check-row">
+                    <input type="checkbox" id="ta-s-atk"  ${s.includeAttacks?"checked":""} />
+                    <label for="ta-s-atk">⚔️ <strong>Attack Wins</strong> — wins &amp; respect (no cash value)</label>
+                </div>
+
+                <div class="ta-settings-hd">⚙️ Sync & Data</div>
+                <div class="ta-field">
+                    <label>Auto-sync every (seconds, min 60)</label>
+                    <input type="number" class="ta-input" id="ta-s-refresh" value="${s.refreshSec}" min="60" max="3600" style="width:120px" />
+                </div>
+                <div class="ta-field">
+                    <label>Keep data for (days, max 365)</label>
+                    <input type="number" class="ta-input" id="ta-s-retain" value="${s.retentionDays}" min="7" max="365" style="width:120px" />
+                </div>
+
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                    <button class="ta-btn ta-btn-primary" id="ta-s-save">Save Settings</button>
+                    <button class="ta-btn ta-btn-muted ta-btn-sm" id="ta-s-refetch">🔄 Re-fetch History</button>
+                    <button class="ta-btn ta-btn-muted ta-btn-sm" id="ta-s-export">⬇ Export CSV</button>
+                    <button class="ta-btn ta-btn-danger ta-btn-sm" id="ta-s-clear">🗑 Clear All Data</button>
+                </div>
+                <div id="ta-s-msg" class="ta-save-status"></div>
+                <div style="font-size:10px;color:#555;margin-top:10px">
+                    Version ${VERSION} · Platform: ${IS_PDA ? "Torn PDA" : "Desktop"} · ${loadEvents().length} events stored · ${loadSnapshots().length} snapshots
+                </div>`;
+        }
+
+        _wireSettings(body) {
+            const msg = body.querySelector("#ta-s-msg");
+
+            const keySave = body.querySelector("#ta-s-key-save");
+            if (keySave) {
+                keySave.addEventListener("click", async () => {
+                    const k    = body.querySelector("#ta-s-key").value.trim();
+                    const kMsg = body.querySelector("#ta-s-key-msg");
+                    if (!/^[A-Za-z0-9]{16}$/.test(k)) { kMsg.className = "ta-save-status ta-save-err"; kMsg.textContent = "Must be 16 alphanumeric characters."; return; }
+                    keySave.disabled = true;
+                    kMsg.className = "ta-save-status ta-save-info"; kMsg.textContent = "Validating…";
+                    try {
+                        const api  = new TornAPI(k);
+                        const prof = await api.validateKey();
+                        if (!prof) throw new Error("Key rejected.");
+                        KeyResolver.saveKey(k);
+                        this.myId = prof.id || prof.player_id;
+                        try { localStorage.setItem(LS.myId, String(this.myId)); } catch {}
+                        // New key — re-probe what it can read on next sync
+                        this.access = { attacks:true, log:true };
+                        saveAccess(this.access);
+                        kMsg.className = "ta-save-status ta-save-ok";
+                        kMsg.textContent = `✓ Valid — ${prof.name || "Player"} [${this.myId}] — syncing…`;
+                        this.syncData();
+                    } catch (e) {
+                        kMsg.className = "ta-save-status ta-save-err"; kMsg.textContent = e.message || "Validation failed.";
+                    } finally { keySave.disabled = false; }
+                });
+            }
+
+            body.querySelector("#ta-s-save").addEventListener("click", () => {
+                this.settings = {
+                    ...this.settings,
+                    includeMuggings: body.querySelector("#ta-s-mug").checked,
+                    includeBounties: body.querySelector("#ta-s-bty").checked,
+                    includeAttacks:  body.querySelector("#ta-s-atk").checked,
+                    refreshSec:      Math.max(60, parseInt(body.querySelector("#ta-s-refresh").value, 10) || 300),
+                    retentionDays:   Math.min(365, Math.max(7, parseInt(body.querySelector("#ta-s-retain").value, 10) || 90)),
+                };
+                saveSettings(this.settings);
+                msg.className = "ta-save-status ta-save-ok";
+                msg.textContent = "✓ Settings saved.";
+                setTimeout(() => { msg.textContent = ""; }, 2000);
+            });
+
+            // Re-fetch history (reset cursors so next sync pulls 90 days)
+            body.querySelector("#ta-s-refetch").addEventListener("click", () => {
+                [LS.lastAttackTs, LS.lastLogTs].forEach(k => { try { localStorage.removeItem(k); } catch {} });
+                // Re-probe access too, in case the key was upgraded
+                this.access = { attacks:true, log:true };
+                saveAccess(this.access);
+                msg.className = "ta-save-status ta-save-ok";
+                msg.textContent = "✓ Cursors reset — click ⟳ Sync to re-fetch 90 days of history.";
+                setTimeout(() => { msg.textContent = ""; }, 4000);
+            });
+
+            body.querySelector("#ta-s-export").addEventListener("click", () => {
+                const events = loadEvents();
+                const csv    = ["type,amount,label,timestamp,date"].concat(
+                    events.map(e => `${e.type},${e.amount||0},"${(e.label||"").replace(/"/g,'""')}",${new Date(e.ts*1000).toISOString()},${fmt.date(e.ts)}`)
+                ).join("\n");
+                const blob = new Blob([csv], {type:"text/csv"});
+                const url  = URL.createObjectURL(blob);
+                const a    = document.createElement("a");
+                a.href = url; a.download = `torn-analytics-${Date.now()}.csv`; a.click();
+                URL.revokeObjectURL(url);
+            });
+
+            body.querySelector("#ta-s-clear").addEventListener("click", () => {
+                if (!confirm("Clear ALL tracked profit data? This cannot be undone.")) return;
+                [LS.events, LS.snapshots, LS.lastAttackTs, LS.lastLogTs, LS.lastSnapTs, LS.myId, LS.statsCache, LS.access].forEach(k => {
+                    try { localStorage.removeItem(k); } catch {}
+                });
+                this.myId = null;
+                this.cachedStats = null;
+                this.syncReport = null;
+                this.lastSync = 0;
+                this.access = { attacks:true, log:true };
+                msg.className = "ta-save-status ta-save-err";
+                msg.textContent = "All data cleared.";
+                this._tickFooter();
+                setTimeout(() => this._renderBody(), 1500);
+            });
+        }
+
+        // ── Sync ──────────────────────────────────────────────
+        _friendlyErr(e) {
+            if (e.tornCode === 2)  return "Invalid API key — check it in Settings.";
+            if (e.tornCode === 5)  return "Rate limited by Torn — will retry later.";
+            if (e.tornCode === 16) return "API key access level too low.";
+            return e.message || "Sync failed";
+        }
+
+        async syncData() {
+            if (this.syncing) return;
+            const key = KeyResolver.resolveTornKey();
+            if (!key) return;
+            const api = new TornAPI(key);
+
+            this.syncing = true; this.lastErr = null;
+            this._tickFooter();
+
+            try {
+                if (!this.myId) {
+                    const prof = await api.validateKey();
+                    if (!prof) throw new Error("API key invalid or expired.");
+                    this.myId = prof.id || prof.player_id;
+                    try { localStorage.setItem(LS.myId, String(this.myId)); } catch {}
+                }
+
+                const report = { attacks: 0, mugs: 0, bounties: 0 };
+                const newEvents = [];
+                let nameMap = new Map();
+
+                // ── Attacks (needs Limited key) — wins, respect, target names
+                const lastAtkTs = getTs(LS.lastAttackTs);
+                try {
+                    const attacks = await api.fetchAttacks(lastAtkTs > 0 ? lastAtkTs + 1 : 0);
+                    report.attacks = attacks.length;
+                    const r = processAttacks(attacks, this.myId);
+                    newEvents.push(...r.events);
+                    nameMap = r.nameMap;
+                    const maxTs = Math.max(0, ...attacks.map(a => a.timestamp_ended || 0));
+                    if (maxTs > lastAtkTs) setTs(LS.lastAttackTs, maxTs);
+                    if (!this.access.attacks) { this.access.attacks = true; saveAccess(this.access); }
+                } catch (e) {
+                    if (e.tornCode === 16 || e.tornCode === 7) { this.access.attacks = false; saveAccess(this.access); }
+                    else throw e;
+                }
+
+                // ── Activity log (needs Full Access key) — THE money source
+                const lastLogTs = getTs(LS.lastLogTs);
+                try {
+                    const entries = await api.fetchLog(lastLogTs > 0 ? lastLogTs + 1 : 0);
+                    const logEvents = processLog(entries, nameMap);
+                    report.mugs     = logEvents.filter(e => e.type === EVENT_TYPES.MUGGING).length;
+                    report.bounties = logEvents.filter(e => e.type === EVENT_TYPES.BOUNTY).length;
+                    newEvents.push(...logEvents);
+                    const maxTs = Math.max(0, ...entries.map(e => e.timestamp || 0));
+                    if (maxTs > lastLogTs) setTs(LS.lastLogTs, maxTs);
+                    if (!this.access.log) { this.access.log = true; saveAccess(this.access); }
+                } catch (e) {
+                    if (e.tornCode === 16 || e.tornCode === 7) { this.access.log = false; saveAccess(this.access); }
+                    else throw e;
+                }
+
+                this.syncReport = report;
+
+                // ── Merge, enrich names, save ──────────────────
+                const merged = mergeEvents(loadEvents(), newEvents);
+                if (nameMap.size > 0) {
+                    for (const ev of merged) {
+                        const tid = ev.meta && ev.meta.targetId;
+                        if (!tid) continue;
+                        const nm = nameMap.get(Number(tid));
+                        if (nm && ev.meta.targetName !== nm) {
+                            ev.meta.targetName = nm;
+                            if (ev.type === EVENT_TYPES.MUGGING) ev.label = `Mugged ${nm}`;
+                        }
+                    }
+                }
+                saveEvents(pruneEvents(merged, this.settings));
+
+                // ── PersonalStats snapshot (works with any key) ─
+                const now = Math.floor(Date.now()/1000);
+                const stats = await api.fetchPersonalStats();
+                if (stats) {
+                    this.cachedStats = stats;
+                    saveStatsCache(stats);
+                    const lastSnapTs = getTs(LS.lastSnapTs);
+                    if ((now - lastSnapTs) >= this.settings.snapEvery) {
+                        const snap = { ts: now };
+                        for (const f of SNAP_FIELDS) { if (stats[f] != null) snap[f] = stats[f]; }
+                        const snaps = loadSnapshots();
+                        snaps.push(snap);
+                        saveSnapshots(snaps);
+                        setTs(LS.lastSnapTs, now);
+                    }
+                }
+
+                this.lastSync = Date.now();
+                if (this._panel && this._panel.classList.contains("ta-open")) this._renderBody();
+
+            } catch (e) {
+                this.lastErr = this._friendlyErr(e);
+            } finally {
+                this.syncing = false;
+                this._tickFooter();
+                if (this._syncTmr) clearTimeout(this._syncTmr);
+                this._syncTmr = setTimeout(() => {
+                    if (this._panel && this._panel.classList.contains("ta-open")) this.syncData();
+                }, this.settings.refreshSec * 1000);
+            }
+        }
+    }
+
+    // ── Shared Eugene Footer Menu ──────────────────────────────
+    // (Initialises the shared footer button system — same pattern as Bounty Hunter)
+    (function setupEugFooterMenu() {
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        if (W.__eugFooterMenuLoaded) return;
+        W.__eugFooterMenuLoaded = true;
+        W.__eugeneScripts = W.__eugeneScripts || [];
+        const ROW_ID = "eug-footer-row";
+        function injectFMCSS() { if (document.getElementById("eug-footer-style")) return; const s = document.createElement("style"); s.id = "eug-footer-style"; s.textContent = `[data-eug="menu"]{background:linear-gradient(to bottom,#444,#2a2a2a)!important}[data-eug="menu"]:hover{background:linear-gradient(to bottom,#555,#333)!important}#${ROW_ID}{display:none;position:fixed;padding:4px;background:rgba(20,20,20,0.96);border:1px solid #444;border-radius:6px;gap:4px;z-index:2147483647;white-space:nowrap;pointer-events:auto}#${ROW_ID}.eug-open{display:flex;flex-direction:row}`; document.head.appendChild(s); }
+        function injectEntryCSS(entry) { if (!entry.color) return; const id = `eug-color-${entry.id}`, dark = entry.colorDark || "#222", hover = entry.hoverColor || entry.color, css = `[data-eug-id="${entry.id}"]{background:linear-gradient(to bottom,${entry.color},${dark})!important}[data-eug-id="${entry.id}"]:hover{background:linear-gradient(to bottom,${hover},${entry.color})!important}`; const ex = document.getElementById(id); if (ex) { ex.textContent = css; return; } const el = document.createElement("style"); el.id = id; el.textContent = css; document.head.appendChild(el); }
+        const findRefBtn = () => document.getElementById("notes_panel_button") || document.getElementById("people_panel_button"), getRow = () => document.getElementById(ROW_ID), closeRow = () => { const r = getRow(); if (r) r.classList.remove("eug-open"); };
+        const openRow = (btn) => { const row = getRow(); if (!row) return; const rect = btn.getBoundingClientRect(); row.classList.add("eug-open"); const rr = row.getBoundingClientRect(); let left = Math.max(4, Math.min(rect.left + rect.width / 2 - rr.width / 2, window.innerWidth - rr.width - 4)); row.style.left = left + "px"; row.style.bottom = (window.innerHeight - rect.top + 6) + "px"; };
+        function makeScriptBtn(entry, refBtn, role) { const ic = refBtn.querySelector("svg")?.className?.baseVal || "", btn = document.createElement("button"); btn.type = "button"; btn.className = refBtn.className; btn.title = entry.name; btn.setAttribute("data-eug", role); btn.setAttribute("data-eug-id", entry.id); btn.innerHTML = (entry.iconSVG || "").replace(/<svg\b([^>]*)>/, (m, a) => /\sclass\s*=/.test(a) ? m : `<svg${a} class="${ic}">`); btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); closeRow(); try { entry.onClick(); } catch {} }); injectEntryCSS(entry); return btn; }
+        function makeMenuBtn(refBtn) { const ic = refBtn.querySelector("svg")?.className?.baseVal || "", btn = document.createElement("button"); btn.type = "button"; btn.className = refBtn.className; btn.title = "My userscripts"; btn.setAttribute("data-eug", "menu"); btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" class="${ic}"><defs><linearGradient id="eug_mg" x1="0.5" x2="0.5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#eug_mg)"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></g></svg>`; btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); const row = getRow(); if (row && row.classList.contains("eug-open")) closeRow(); else openRow(btn); }); return btn; }
+        const LEGACY = ["tat-footer-btn", "spa-footer-btn"];
+        function render() { const refBtn = findRefBtn(); if (!refBtn) return false; injectFMCSS(); const parent = refBtn.parentNode; parent.querySelectorAll("[data-eug]").forEach(el => el.remove()); LEGACY.forEach(id => { const el = document.getElementById(id); if (el) el.remove(); }); const oldRow = getRow(); if (oldRow) oldRow.remove(); const scripts = W.__eugeneScripts || []; if (scripts.length === 0) return true; if (scripts.length === 1) { parent.insertBefore(makeScriptBtn(scripts[0], refBtn, "solo"), refBtn); } else { const mb = makeMenuBtn(refBtn); parent.insertBefore(mb, refBtn); const row = document.createElement("div"); row.id = ROW_ID; row.setAttribute("data-eug-row", ""); for (const s of scripts) row.appendChild(makeScriptBtn(s, refBtn, "item")); document.body.appendChild(row); } return true; }
+        function mount() { render(); let pending = false; const obs = new MutationObserver(() => { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; const r = findRefBtn(); if (r && !r.parentNode.querySelector("[data-eug]")) render(); }); }); obs.observe(document.body, { childList: true, subtree: true }); }
+        W.addEventListener("eugene-scripts-updated", render);
+        document.addEventListener("click", (e) => { const row = getRow(); if (!row || !row.classList.contains("eug-open")) return; const mb = document.querySelector('[data-eug="menu"]'); if (mb && mb.contains(e.target)) return; if (row.contains(e.target)) return; closeRow(); });
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeRow(); });
+        W.addEventListener("scroll", closeRow, { passive: true }); W.addEventListener("resize", closeRow);
+        W.registerEugeneScript = function (entry) { const list = W.__eugeneScripts, i = list.findIndex(s => s.id === entry.id); if (i >= 0) list[i] = entry; else list.push(entry); W.dispatchEvent(new CustomEvent("eugene-scripts-updated")); };
+        W.mountEugeneFooterMenu = mount;
+    })();
+
+    // ── Main ───────────────────────────────────────────────────
+    const ANALYTICS_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><defs><linearGradient id="ta_ig" x1=".5" x2=".5" y2="1" gradientUnits="objectBoundingBox"><stop offset="0" stop-color="#ddd"/><stop offset="1" stop-color="#999"/></linearGradient></defs><g fill="url(#ta_ig)"><path d="M5 20h2v-8H5v8zm4 0h2V4H9v16zm4 0h2v-5h-2v5zm4 0h2V9h-2v11z"/></g></svg>`;
+
+    function main() {
+        const ui = new AnalyticsUI();
+        ui.init();
+        const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+        W.registerEugeneScript({
+            id: "torn-analytics", name: "Analytics",
+            color: "#1565c0", colorDark: "#0d3a6e", hoverColor: "#1976d2",
+            iconSVG: ANALYTICS_ICON,
+            onClick: () => ui.toggle(true),
+        });
+        W.mountEugeneFooterMenu();
+    }
+
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+    else main();
+
+})();
